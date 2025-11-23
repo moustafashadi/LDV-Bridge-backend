@@ -12,6 +12,7 @@ import { OnboardingModule } from './onboarding/onboarding.module';
 import { LoggerModule } from './common/logger/logger.module';
 import { AuditModule } from './common/audit/audit.module';
 import { HealthModule } from './health/health.module';
+import { ConnectorsModule } from './connectors/connectors.module';
 import { LoggingInterceptor } from './common/interceptors/logging.interceptor';
 
 @Module({
@@ -29,6 +30,7 @@ import { LoggingInterceptor } from './common/interceptors/logging.interceptor';
     OnboardingModule,
     UsersModule,
     OrganizationsModule,
+    ConnectorsModule, // Platform connectors (PowerApps & Mendix)
   ],
   controllers: [AppController],
   providers: [
