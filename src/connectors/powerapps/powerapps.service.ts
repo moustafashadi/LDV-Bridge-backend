@@ -10,6 +10,7 @@ import {
 } from '../interfaces/base-connector.interface';
 import { TokenManagerService } from '../services/token-manager.service';
 import { OAuthService } from '../services/oauth.service';
+import { ConnectorsWebSocketGateway } from '../../websocket/websocket.gateway';
 
 /**
  * PowerApps environment info
@@ -77,17 +78,20 @@ export class PowerAppsService implements IBaseConnector {
     private config: ConfigService,
     private tokenManager: TokenManagerService,
     private oauthService: OAuthService,
+    private websocketGateway: ConnectorsWebSocketGateway,
   ) {
     // Initialize OAuth config after constructor injection
+    // Multi-tenant: works with any Azure AD organization
     this.oauth2Config = {
       authorizationUrl: 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize',
       tokenUrl: 'https://login.microsoftonline.com/common/oauth2/v2.0/token',
       clientId: this.config.get<string>('POWERAPP_CLIENT_ID') || '',
       clientSecret: this.config.get<string>('POWERAPP_CLIENT_SECRET') || '',
       redirectUri: this.config.get<string>('POWERAPP_REDIRECT_URI') || '',
-      scope: 'https://service.powerapps.com/.default offline_access openid profile email',
+      // Use Microsoft Graph scopes - available in all Azure AD tenants
+      scope: 'User.Read offline_access openid profile email',
     };
-    
+
     this.validateConfig();
   }
 
@@ -150,7 +154,7 @@ export class PowerAppsService implements IBaseConnector {
     this.logger.log(`Initiating PowerApps OAuth for user ${userId}`);
 
     const state = this.oauthService.generateState(userId, organizationId);
-    
+
     const authUrl = this.oauthService.generateAuthUrl(
       this.oauth2Config,
       state,
@@ -193,6 +197,13 @@ export class PowerAppsService implements IBaseConnector {
       ConnectionStatus.CONNECTED,
     );
 
+    // Emit WebSocket event
+    this.websocketGateway.emitConnectionStatusChanged({
+      platform: this.platform,
+      userId,
+      status: ConnectionStatus.CONNECTED,
+    });
+
     this.logger.log(`PowerApps connection established for user ${userId}`);
 
     return token;
@@ -225,7 +236,25 @@ export class PowerAppsService implements IBaseConnector {
         organizationId,
       );
 
-      // Try to fetch user's environments as a connection test
+      // First, try to validate token with Microsoft Graph /me endpoint
+      // (works when app requested Graph scopes like User.Read)
+      try {
+        const graphResponse = await client.get('https://graph.microsoft.com/v1.0/me');
+        if (graphResponse.status === 200) {
+          await this.tokenManager.updateConnectionStatus(
+            userId,
+            this.platform,
+            ConnectionStatus.CONNECTED,
+          );
+
+          return true;
+        }
+      } catch (graphErr) {
+        // Graph validation failed - fall back to Power Platform BAP API
+        this.logger.debug('Graph /me token validation failed, falling back to BAP API');
+      }
+
+      // Try to fetch user's environments as a connection test (PowerApps BAP API)
       const response = await client.get(
         `${this.bapApiUrl}/environments?api-version=2020-10-01`,
       );
@@ -445,7 +474,7 @@ export class PowerAppsService implements IBaseConnector {
       };
     } catch (error) {
       this.logger.error(`Failed to sync PowerApp: ${error.message}`, error.stack);
-      
+
       return {
         success: false,
         appId,

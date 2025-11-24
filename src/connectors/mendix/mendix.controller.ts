@@ -10,18 +10,28 @@ import {
   HttpStatus,
   Logger,
   UnauthorizedException,
+  UseGuards,
 } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth, ApiBody } from '@nestjs/swagger';
+import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth, ApiBody, ApiProperty } from '@nestjs/swagger';
+import { IsString, IsNotEmpty } from 'class-validator';
 import type { Response } from 'express';
 import { MendixService } from './mendix.service';
 import { CurrentUser } from '../../auth/decorators/current-user.decorator';
 import type { AuthenticatedUser } from '../../auth/interfaces/authenticated-user.interface';
+import { Public } from 'src/auth/decorators/public.decorator';
 
 /**
  * Mendix API Credentials DTO
  */
 class MendixCredentialsDto {
+  @ApiProperty({ description: 'Mendix Personal Access Token', example: 'your-pat-token-here' })
+  @IsString()
+  @IsNotEmpty()
   apiKey: string;
+
+  @ApiProperty({ description: 'Mendix username/email', example: 'user@example.com' })
+  @IsString()
+  @IsNotEmpty()
   username: string;
 }
 
@@ -32,25 +42,23 @@ export class MendixController {
 
   constructor(private readonly mendixService: MendixService) {}
 
+  @Public() // Allow unauthenticated access to setup instructions
   @Get('setup-instructions')
   @ApiOperation({ summary: 'Get instructions for obtaining Mendix API credentials' })
   @ApiResponse({ status: 200, description: 'Returns setup instructions' })
   async getSetupInstructions() {
     return {
-      success: true,
-      instructions: {
-        title: 'Mendix Personal Access Token Setup',
-        steps: [
-          '1. Log in to your Mendix account at https://sprintr.home.mendix.com/',
-          '2. Go to your profile settings',
-          '3. Navigate to "API Keys" or "Personal Access Tokens"',
-          '4. Click "Create New API Key"',
-          '5. Give your API key a descriptive name (e.g., "LDV-Bridge Integration")',
-          '6. Copy the generated API key immediately (you won\'t be able to see it again)',
-          '7. Use your Mendix username and the API key to connect below',
-        ],
-        documentationUrl: 'https://docs.mendix.com/developerportal/community-tools/mendix-profile/#pat',
-      },
+      steps: [
+        ' Log in to your Mendix account at https://sprintr.home.mendix.com/',
+        ' Go to your profile settings',
+        ' Navigate to "API Keys" or "Personal Access Tokens"',
+        ' Click "Create New API Key"',
+        ' Give your API key a descriptive name (e.g., "LDV-Bridge Integration")',
+        ' Copy the generated API key immediately (you won\'t be able to see it again)',
+        ' Use your Mendix username and the API key to connect below',
+      ],
+      tokenUrl: 'https://sprintr.home.mendix.com/',
+      scopes: [], // Mendix PAT doesn't use OAuth scopes
     };
   }
 

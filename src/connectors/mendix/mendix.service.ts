@@ -9,6 +9,7 @@ import {
   ISyncResult,
 } from '../interfaces/base-connector.interface';
 import { TokenManagerService } from '../services/token-manager.service';
+import { ConnectorsWebSocketGateway } from '../../websocket/websocket.gateway';
 
 /**
  * Mendix Connector Service
@@ -44,6 +45,7 @@ export class MendixService implements IBaseConnector {
   constructor(
     private config: ConfigService,
     private tokenManager: TokenManagerService,
+    private websocketGateway: ConnectorsWebSocketGateway,
   ) {
     // Initialize Mendix API URLs
     this.mendixConfig = {
@@ -99,11 +101,12 @@ export class MendixService implements IBaseConnector {
       throw new UnauthorizedException('Mendix connection expired. Please reconnect.');
     }
 
-    // Mendix uses Basic Auth with PAT as username
+    // Mendix uses API Key authentication with username and API key headers
     const client = axios.create({
       headers: {
         'Content-Type': 'application/json',
-        'Mendix-Username': token.accessToken, // PAT stored as accessToken
+        'Mendix-Username': token.refreshToken, // Username stored in refreshToken field
+        'Mendix-ApiKey': token.accessToken,    // API key stored in accessToken field
       },
     });
 
@@ -516,6 +519,13 @@ export class MendixService implements IBaseConnector {
       this.platform,
       ConnectionStatus.CONNECTED,
     );
+
+    // Emit WebSocket event
+    this.websocketGateway.emitConnectionStatusChanged({
+      platform: this.platform,
+      userId,
+      status: ConnectionStatus.CONNECTED,
+    });
 
     this.logger.log(`Mendix connection established for user ${userId}`);
   }

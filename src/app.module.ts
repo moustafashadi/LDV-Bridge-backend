@@ -14,6 +14,7 @@ import { AuditModule } from './common/audit/audit.module';
 import { HealthModule } from './health/health.module';
 import { ConnectorsModule } from './connectors/connectors.module';
 import { LoggingInterceptor } from './common/interceptors/logging.interceptor';
+import { WebSocketModule } from './websocket/websocket.module';
 
 @Module({
   imports: [
@@ -31,6 +32,7 @@ import { LoggingInterceptor } from './common/interceptors/logging.interceptor';
     UsersModule,
     OrganizationsModule,
     ConnectorsModule, // Platform connectors (PowerApps & Mendix)
+    WebSocketModule, // Real-time updates via Socket.IO
   ],
   controllers: [AppController],
   providers: [

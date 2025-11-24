@@ -18,13 +18,15 @@ import type { Response } from 'express';
 import { PowerAppsService } from './powerapps.service';
 import { CurrentUser } from '../../auth/decorators/current-user.decorator';
 import type { AuthenticatedUser } from '../../auth/interfaces/authenticated-user.interface';
+import { OnboardedGuard } from 'src/auth/guards/onboarded.guard';
+import { Public } from 'src/auth/decorators/public.decorator';
 
 @ApiTags('PowerApps Connector')
 @Controller('connectors/powerapps')
 export class PowerAppsController {
   private readonly logger = new Logger(PowerAppsController.name);
 
-  constructor(private readonly powerAppsService: PowerAppsService) {}
+  constructor(private readonly powerAppsService: PowerAppsService) { }
 
   @Post('connect')
   @ApiOperation({ summary: 'Initiate PowerApps OAuth connection' })
@@ -32,14 +34,14 @@ export class PowerAppsController {
   @ApiBearerAuth()
   async initiateConnection(@CurrentUser() user: AuthenticatedUser) {
     this.logger.log(`User ${user.id} (${user.email}) initiating PowerApps connection for organization ${user.organizationId}`);
-    
+
     // Ensure user has completed onboarding and belongs to an organization
     if (!user.id || !user.organizationId) {
       throw new UnauthorizedException('User must complete onboarding before connecting platforms');
     }
-    
+
     const authorizationUrl = await this.powerAppsService.initiateOAuth(user.id, user.organizationId);
-    
+
     return {
       success: true,
       authorizationUrl,
@@ -48,6 +50,7 @@ export class PowerAppsController {
   }
 
   @Get('callback')
+  @Public() // OAuth callback must be public - no authentication required
   @ApiOperation({ summary: 'Handle OAuth callback from Microsoft' })
   @ApiQuery({ name: 'code', required: true, description: 'Authorization code' })
   @ApiQuery({ name: 'state', required: true, description: 'State parameter' })
@@ -59,9 +62,9 @@ export class PowerAppsController {
   ) {
     try {
       this.logger.log('Processing PowerApps OAuth callback');
-      
+
       const token = await this.powerAppsService.completeOAuth(code, state);
-      
+
       if (token) {
         // Redirect to frontend success page
         return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/admin/connectors?status=success&platform=powerapps`);
@@ -80,13 +83,13 @@ export class PowerAppsController {
   @ApiBearerAuth()
   async disconnect(@CurrentUser() user: AuthenticatedUser) {
     this.logger.log(`User ${user.id} disconnecting PowerApps for organization ${user.organizationId}`);
-    
+
     if (!user.id || !user.organizationId) {
       throw new UnauthorizedException('User must complete onboarding before managing connections');
     }
-    
+
     const result = await this.powerAppsService.disconnect(user.id, user.organizationId);
-    
+
     return result;
   }
 
@@ -96,13 +99,13 @@ export class PowerAppsController {
   @ApiBearerAuth()
   async testConnection(@CurrentUser() user: AuthenticatedUser) {
     this.logger.log(`User ${user.id} testing PowerApps connection for organization ${user.organizationId}`);
-    
+
     if (!user.id || !user.organizationId) {
       throw new UnauthorizedException('User must complete onboarding before testing connections');
     }
-    
+
     const result = await this.powerAppsService.testConnection(user.id, user.organizationId);
-    
+
     return result;
   }
 
@@ -114,9 +117,9 @@ export class PowerAppsController {
     if (!user.id || !user.organizationId) {
       throw new UnauthorizedException('User must complete onboarding before checking connection status');
     }
-    
+
     const status = await this.powerAppsService.getConnectionStatus(user.id, user.organizationId);
-    
+
     return {
       success: true,
       platform: 'POWERAPPS',
@@ -130,13 +133,13 @@ export class PowerAppsController {
   @ApiBearerAuth()
   async listEnvironments(@CurrentUser() user: AuthenticatedUser) {
     this.logger.log(`User ${user.id} listing PowerApps environments for organization ${user.organizationId}`);
-    
+
     if (!user.id || !user.organizationId) {
       throw new UnauthorizedException('User must complete onboarding before accessing PowerApps resources');
     }
-    
+
     const environments = await this.powerAppsService.listEnvironments(user.id, user.organizationId);
-    
+
     return {
       success: true,
       count: environments.length,
@@ -154,13 +157,13 @@ export class PowerAppsController {
     @Query('environmentId') environmentId?: string,
   ) {
     this.logger.log(`User ${user.id} listing PowerApps (environment: ${environmentId || 'all'}) for organization ${user.organizationId}`);
-    
+
     if (!user.id || !user.organizationId) {
       throw new UnauthorizedException('User must complete onboarding before accessing PowerApps resources');
     }
-    
+
     const apps = await this.powerAppsService.listApps(user.id, user.organizationId, environmentId);
-    
+
     return {
       success: true,
       count: apps.length,
@@ -178,13 +181,13 @@ export class PowerAppsController {
     @Param('id') appId: string,
   ) {
     this.logger.log(`User ${user.id} fetching PowerApp: ${appId} for organization ${user.organizationId}`);
-    
+
     if (!user.id || !user.organizationId) {
       throw new UnauthorizedException('User must complete onboarding before accessing PowerApps resources');
     }
-    
+
     const app = await this.powerAppsService.getApp(user.id, user.organizationId, appId);
-    
+
     return {
       success: true,
       app,
@@ -200,13 +203,13 @@ export class PowerAppsController {
     @Param('id') appId: string,
   ) {
     this.logger.log(`User ${user.id} syncing PowerApp: ${appId} for organization ${user.organizationId}`);
-    
+
     if (!user.id || !user.organizationId) {
       throw new UnauthorizedException('User must complete onboarding before syncing PowerApps');
     }
-    
+
     const result = await this.powerAppsService.syncApp(user.id, user.organizationId, appId);
-    
+
     return result;
   }
 
@@ -220,7 +223,7 @@ export class PowerAppsController {
     @Res() res: Response,
   ) {
     this.logger.log(`User ${user.id} exporting PowerApp: ${appId} for organization ${user.organizationId}`);
-    
+
     try {
       if (!user.id || !user.organizationId) {
         return res.status(HttpStatus.UNAUTHORIZED).json({
@@ -228,16 +231,16 @@ export class PowerAppsController {
           message: 'User must complete onboarding before exporting PowerApps',
         });
       }
-      
+
       const packageData = await this.powerAppsService.exportApp(user.id, user.organizationId, appId);
-      
+
       // Set response headers for file download
       res.set({
         'Content-Type': 'application/zip',
         'Content-Disposition': `attachment; filename="${appId}.msapp"`,
         'Content-Length': packageData.length,
       });
-      
+
       res.send(packageData);
     } catch (error) {
       this.logger.error('Export error:', error);

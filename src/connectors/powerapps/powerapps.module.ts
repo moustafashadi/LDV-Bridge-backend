@@ -5,11 +5,13 @@ import { PowerAppsService } from './powerapps.service';
 import { OAuthService } from '../services/oauth.service';
 import { TokenManagerService } from '../services/token-manager.service';
 import { PrismaModule } from '../../prisma/prisma.module';
+import { WebSocketModule } from '../../websocket/websocket.module';
 
 @Module({
   imports: [
     ConfigModule,
     PrismaModule,
+    WebSocketModule,
   ],
   controllers: [PowerAppsController],
   providers: [
