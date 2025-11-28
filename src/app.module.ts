@@ -20,6 +20,7 @@ import { PoliciesModule } from './policies/policies.module';
 import { NotificationsModule } from './notifications/notifications.module';
 import { SyncModule } from './sync/sync.module';
 import { ComponentsModule } from './components/components.module';
+import { ChangesModule } from './changes/changes.module';
 
 @Module({
   imports: [
@@ -54,6 +55,7 @@ import { ComponentsModule } from './components/components.module';
     NotificationsModule, // Multi-channel notification system
     SyncModule, // App sync service (manual & automatic)
     ComponentsModule, // Component management & reusable library
+    ChangesModule, // Change detection engine with diff & impact analysis
   ],
   controllers: [AppController],
   providers: [

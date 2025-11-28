@@ -9,12 +9,16 @@ import { SyncProcessor } from './processors/sync.processor';
 import { PrismaModule } from '../prisma/prisma.module';
 import { PowerAppsModule } from '../connectors/powerapps/powerapps.module';
 import { MendixModule } from '../connectors/mendix/mendix.module';
+import { ComponentsModule } from '../components/components.module';
+import { ChangesModule } from '../changes/changes.module';
 
 @Module({
   imports: [
     PrismaModule,
     PowerAppsModule,
     MendixModule,
+    ComponentsModule, // For component extraction after sync
+    ChangesModule, // For change detection after sync
     ScheduleModule.forRoot(), // Enable cron jobs
     BullModule.registerQueue({
       name: 'app-sync',

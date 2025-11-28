@@ -11,6 +11,8 @@ import { Cron, CronExpression } from '@nestjs/schedule';
 import { PrismaService } from '../prisma/prisma.service';
 import { PowerAppsService } from '../connectors/powerapps/powerapps.service';
 import { MendixService } from '../connectors/mendix/mendix.service';
+import { ComponentsService } from '../components/components.service';
+import { ChangesService } from '../changes/changes.service';
 import {
   PlatformType,
   SyncStatus,
@@ -34,6 +36,8 @@ export class SyncService {
     private readonly prisma: PrismaService,
     private readonly powerAppsService: PowerAppsService,
     private readonly mendixService: MendixService,
+    private readonly componentsService: ComponentsService,
+    private readonly changesService: ChangesService,
     @InjectQueue('app-sync') private readonly syncQueue: Queue,
   ) {}
 
@@ -208,6 +212,38 @@ export class SyncService {
       });
 
       this.logger.log(`Successfully synced app ${app.name} (${app.id})`);
+
+      // Extract components from synced metadata (Task 10)
+      try {
+        await this.componentsService.extractFromApp(
+          app.id,
+          'system',
+          app.organizationId,
+        );
+        this.logger.log(`Extracted components for app ${app.id}`);
+      } catch (error) {
+        this.logger.warn(
+          `Failed to extract components for app ${app.id}: ${error.message}`,
+        );
+      }
+
+      // Detect changes after sync (Task 11)
+      try {
+        const changeDetection = await this.changesService.detectChanges(
+          app.id,
+          'system',
+          app.organizationId,
+        );
+        if (changeDetection.totalChanges > 0) {
+          this.logger.log(
+            `Detected ${changeDetection.totalChanges} changes in app ${app.id}`,
+          );
+        }
+      } catch (error) {
+        this.logger.warn(
+          `Failed to detect changes for app ${app.id}: ${error.message}`,
+        );
+      }
 
       return { itemsSynced };
     } catch (error) {
