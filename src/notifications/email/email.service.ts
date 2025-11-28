@@ -97,6 +97,7 @@ export class EmailService {
       CHANGE_REQUESTED: '🔄',
       DEPLOYMENT_SUCCESS: '🚀',
       DEPLOYMENT_FAILED: '⚠️',
+      COMMENT_ADDED: '💬',
       COMMENT_MENTION: '💬',
       SYSTEM: 'ℹ️',
     };
@@ -108,6 +109,7 @@ export class EmailService {
       CHANGE_REQUESTED: '#f59e0b', // amber
       DEPLOYMENT_SUCCESS: '#10b981', // green
       DEPLOYMENT_FAILED: '#ef4444', // red
+      COMMENT_ADDED: '#8b5cf6', // purple
       COMMENT_MENTION: '#8b5cf6', // purple
       SYSTEM: '#6b7280', // gray
     };

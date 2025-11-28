@@ -21,6 +21,7 @@ import { NotificationsModule } from './notifications/notifications.module';
 import { SyncModule } from './sync/sync.module';
 import { ComponentsModule } from './components/components.module';
 import { ChangesModule } from './changes/changes.module';
+import { ReviewsModule } from './reviews/reviews.module';
 
 @Module({
   imports: [
@@ -56,6 +57,7 @@ import { ChangesModule } from './changes/changes.module';
     SyncModule, // App sync service (manual & automatic)
     ComponentsModule, // Component management & reusable library
     ChangesModule, // Change detection engine with diff & impact analysis
+    ReviewsModule, // Review workflow system with comments & approval
   ],
   controllers: [AppController],
   providers: [
