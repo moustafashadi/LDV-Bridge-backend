@@ -230,6 +230,7 @@ model App {
   components      Component[]
   changes         Change[]
   sandboxes       Sandbox[]
+  syncHistory     SyncHistory[]
 
   @@unique([organizationId, externalId, platform])
   @@index([organizationId])
@@ -266,6 +267,51 @@ model Component {
 
   @@index([appId])
   @@map("components")
+}
+
+// ========================================
+// APP SYNC & BACKGROUND JOBS
+// ========================================
+
+enum SyncStatus {
+  QUEUED
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum SyncTriggerType {
+  MANUAL
+  AUTOMATIC
+  WEBHOOK
+}
+
+model SyncHistory {
+  id              String          @id @default(uuid())
+  organizationId  String
+  appId           String
+  platform        PlatformType
+  status          SyncStatus      @default(QUEUED)
+  jobId           String?         // Bull job ID
+  triggeredBy     String          // userId or 'system' for auto-sync
+  triggerType     SyncTriggerType @default(MANUAL)
+  startedAt       DateTime?
+  completedAt     DateTime?
+  duration        Int?            // milliseconds
+  itemsSynced     Int?            // number of items updated
+  errorMessage    String?         @db.Text
+  errorStack      String?         @db.Text
+  metadata        Json?           // Additional sync metadata
+  createdAt       DateTime        @default(now())
+
+  app             App             @relation(fields: [appId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+  @@index([appId])
+  @@index([status])
+  @@index([createdAt])
+  @@map("sync_history")
 }
 
 // ========================================

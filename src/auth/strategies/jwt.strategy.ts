@@ -39,7 +39,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
    * This method is called automatically by Passport after JWT verification
    */
   async validate(payload: JwtPayload): Promise<AuthenticatedUser> {
-    console.log('JWT Payload received:', JSON.stringify(payload, null, 2));
+
     
     // Extract email - it might be in payload.email or we need to fetch from userinfo
     const email = payload.email || `${payload.sub}@temp.auth0`; // Temporary fallback

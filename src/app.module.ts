@@ -1,6 +1,7 @@
 import { Module, MiddlewareConsumer, NestModule } from '@nestjs/common';
-import { ConfigModule } from '@nestjs/config';
+import { ConfigModule, ConfigService } from '@nestjs/config';
 import { APP_INTERCEPTOR } from '@nestjs/core';
+import { BullModule } from '@nestjs/bull';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { AuthModule } from './auth/auth.module';
@@ -15,6 +16,10 @@ import { HealthModule } from './health/health.module';
 import { ConnectorsModule } from './connectors/connectors.module';
 import { LoggingInterceptor } from './common/interceptors/logging.interceptor';
 import { WebSocketModule } from './websocket/websocket.module';
+import { PoliciesModule } from './policies/policies.module';
+import { NotificationsModule } from './notifications/notifications.module';
+import { SyncModule } from './sync/sync.module';
+import { ComponentsModule } from './components/components.module';
 
 @Module({
   imports: [
@@ -22,6 +27,18 @@ import { WebSocketModule } from './websocket/websocket.module';
     ConfigModule.forRoot({
       isGlobal: true,
       envFilePath: ['.env.development', '.env'],
+    }),
+    // Bull Queue Configuration (for background jobs)
+    BullModule.forRootAsync({
+      imports: [ConfigModule],
+      useFactory: async (configService: ConfigService) => ({
+        redis: {
+          host: configService.get<string>('REDIS_HOST', 'localhost'),
+          port: configService.get<number>('REDIS_PORT', 6379),
+          password: configService.get<string>('REDIS_PASSWORD'),
+        },
+      }),
+      inject: [ConfigService],
     }),
     PrismaModule,
     LoggerModule, // Global logger
@@ -33,6 +50,10 @@ import { WebSocketModule } from './websocket/websocket.module';
     OrganizationsModule,
     ConnectorsModule, // Platform connectors (PowerApps & Mendix)
     WebSocketModule, // Real-time updates via Socket.IO
+    PoliciesModule, // Policy Engine for governance
+    NotificationsModule, // Multi-channel notification system
+    SyncModule, // App sync service (manual & automatic)
+    ComponentsModule, // Component management & reusable library
   ],
   controllers: [AppController],
   providers: [
