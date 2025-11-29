@@ -73,6 +73,8 @@ model User {
   // Relations
   organization    Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   ownedApps       App[]        @relation("AppOwner")
+  appPermissions  AppPermission[] @relation("UserAppAccess")
+  grantedPermissions AppPermission[] @relation("GrantedBy")
   changes         Change[]     @relation("ChangeAuthor")
   reviews         Review[]     @relation("Reviewer")
   comments        Comment[]
@@ -229,6 +231,7 @@ model App {
   organization    Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   connector       PlatformConnector @relation(fields: [connectorId], references: [id])
   owner           User             @relation("AppOwner", fields: [ownerId], references: [id])
+  permissions     AppPermission[]
   components      Component[]
   changes         Change[]
   syncHistory     SyncHistory[]
@@ -238,6 +241,42 @@ model App {
   @@index([ownerId])
   @@map("apps")
 }
+
+// ============================================
+// APP ACCESS CONTROL
+// ============================================
+
+enum AppAccessLevel {
+  VIEWER      // Can view app details and components
+  EDITOR      // Can edit and sync app
+  OWNER       // Full control (same privileges as ownerId)
+}
+
+model AppPermission {
+  id             String         @id @default(uuid())
+  appId          String
+  userId         String
+  accessLevel    AppAccessLevel @default(VIEWER)
+  grantedBy      String         // User ID who granted access
+  grantedAt      DateTime       @default(now())
+  expiresAt      DateTime?      // Optional expiration date
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  // Relations
+  app            App            @relation(fields: [appId], references: [id], onDelete: Cascade)
+  user           User           @relation("UserAppAccess", fields: [userId], references: [id], onDelete: Cascade)
+  grantedByUser  User           @relation("GrantedBy", fields: [grantedBy], references: [id])
+
+  @@unique([appId, userId])
+  @@index([userId])
+  @@index([appId])
+  @@map("app_permissions")
+}
+
+// ============================================
+// COMPONENTS
+// ============================================
 
 enum ComponentType {
   SCREEN

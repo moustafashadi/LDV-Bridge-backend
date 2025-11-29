@@ -23,6 +23,7 @@ import { ComponentsModule } from './components/components.module';
 import { ChangesModule } from './changes/changes.module';
 import { ReviewsModule } from './reviews/reviews.module';
 import { SandboxesModule } from './sandboxes/sandboxes.module';
+import { AppsModule } from './apps/apps.module';
 
 @Module({
   imports: [
@@ -58,6 +59,9 @@ import { SandboxesModule } from './sandboxes/sandboxes.module';
     SyncModule, // App sync service (manual & automatic)
     ComponentsModule, // Component management & reusable library
     ChangesModule, // Change detection engine with diff & impact analysis
+    ReviewsModule, // Code review workflow with approval system
+    SandboxesModule, // Sandbox environments for testing
+    AppsModule, // App access control and permissions
     ReviewsModule, // Review workflow system with comments & approval
     SandboxesModule, // Sandbox management with environment provisioning
   ],

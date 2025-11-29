@@ -51,25 +51,28 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       }
     });
     
-    // Extract email from JWT payload
-    // Auth0 includes email in standard 'email' claim, but also check namespace claims
+    // Extract email from JWT payload - try multiple claim locations
     let email = payload.email || 
                 payload['https://ldv-bridge.com/email'] || 
                 payload['http://ldv-bridge.com/email'];
     
-    // If email is not in JWT, fetch it from Auth0 userinfo endpoint
+    // If email is not in JWT, try to fetch it from Auth0 userinfo endpoint (with caching)
     if (!email) {
       console.log('[JwtStrategy] Email not in JWT, fetching from Auth0 userinfo...');
       const authHeader = request.headers.authorization;
       if (authHeader) {
         const token = authHeader.replace('Bearer ', '');
-        email = await this.authService.getUserEmailFromAuth0(token);
+        try {
+          email = await this.authService.getUserEmailFromAuth0(token);
+        } catch (error) {
+          console.error('[JwtStrategy] Error fetching email from Auth0:', error.message);
+        }
       }
     }
     
     if (!email) {
       console.error('[JwtStrategy] No email found in JWT payload or userinfo for user:', payload.sub);
-      throw new UnauthorizedException('Email not found in token');
+      throw new UnauthorizedException('Email not found in token. Please configure Auth0 to include email in JWT claims.');
     }
     
     console.log('[JwtStrategy] Email resolved:', email);

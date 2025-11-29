@@ -10,6 +10,8 @@ import {
 } from '../interfaces/base-connector.interface';
 import { TokenManagerService } from '../services/token-manager.service';
 import { ConnectorsWebSocketGateway } from '../../websocket/websocket.gateway';
+import { AppStatus } from '@prisma/client';
+import { AppsService } from '../../apps/apps.service';
 
 /**
  * Mendix Connector Service
@@ -46,6 +48,7 @@ export class MendixService implements IBaseConnector {
     private config: ConfigService,
     private tokenManager: TokenManagerService,
     private websocketGateway: ConnectorsWebSocketGateway,
+    private appsService: AppsService,
   ) {
     // Initialize Mendix API URLs
     this.mendixConfig = {
@@ -431,19 +434,82 @@ export class MendixService implements IBaseConnector {
   ): Promise<ISyncResult> {
     this.logger.log(`Syncing Mendix app ${appId} for user ${userId}`);
 
-    // Get app details
-    const app = await this.getApp(userId, organizationId, appId);
+    try {
+      // Get app details from Mendix
+      const appDetails = await this.getApp(userId, organizationId, appId);
 
-    // TODO: Task 9 will implement actual database sync
-    // For now, return a placeholder response
-    return {
-      success: true,
-      appId: app.id,
-      componentsCount: 0,
-      changesDetected: 0,
-      syncedAt: new Date(),
-      errors: ['Sync functionality will be implemented in Task 9'],
-    };
+      // Get the connector for this organization
+      const connections = await this.tokenManager['prisma'].platformConnector.findMany({
+        where: {
+          organizationId,
+          platform: 'MENDIX',
+          isActive: true,
+        },
+        take: 1,
+      });
+      
+      const connection = connections[0];
+      if (!connection) {
+        throw new BadRequestException('No active Mendix connection found');
+      }
+
+      // Create or update app in database
+      const existingApp = await this.appsService['prisma'].app.findUnique({
+        where: {
+          organizationId_externalId_platform: {
+            organizationId,
+            externalId: appId,
+            platform: 'MENDIX',
+          },
+        },
+      });
+
+      let app;
+      if (existingApp) {
+        // Update existing app
+        app = await this.appsService['prisma'].app.update({
+          where: { id: existingApp.id },
+          data: {
+            name: appDetails.name,
+            description: appDetails.description,
+            metadata: appDetails as any,
+            lastSyncedAt: new Date(),
+            status: AppStatus.LIVE,
+          },
+        });
+        this.logger.log(`Updated existing app ${app.name} (${app.id})`);
+      } else {
+        // Create new app
+        app = await this.appsService.createApp(userId, organizationId, {
+          name: appDetails.name,
+          description: appDetails.description,
+          platform: 'MENDIX' as any,
+          externalId: appId,
+          connectorId: connection.id,
+          status: AppStatus.LIVE as any,
+          metadata: appDetails as any,
+        });
+        this.logger.log(`Created new app ${app.name} (${app.id})`);
+      }
+
+      return {
+        success: true,
+        appId: app.id,
+        componentsCount: 0,
+        changesDetected: 0,
+        syncedAt: new Date(),
+      };
+    } catch (error) {
+      this.logger.error(`Failed to sync Mendix app ${appId}:`, error.message);
+      return {
+        success: false,
+        appId,
+        componentsCount: 0,
+        changesDetected: 0,
+        syncedAt: new Date(),
+        errors: [error.message],
+      };
+    }
   }
 
   /**

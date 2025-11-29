@@ -11,6 +11,8 @@ import axios from 'axios';
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
+  private readonly emailCache = new Map<string, { email: string; timestamp: number }>();
+  private readonly CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
   constructor(
     private prisma: PrismaService,
@@ -123,20 +125,44 @@ export class AuthService {
   /**
    * Fetch user email from Auth0 using the access token
    * This is used when the JWT doesn't include email claim
+   * Implements caching to avoid rate limiting
    */
   async getUserEmailFromAuth0(accessToken: string): Promise<string | null> {
     try {
+      // Check cache first
+      const cached = this.emailCache.get(accessToken);
+      if (cached && Date.now() - cached.timestamp < this.CACHE_TTL) {
+        this.logger.log(`Using cached email for token`);
+        return cached.email;
+      }
+
       const auth0Domain = this.configService.get<string>('AUTH0_DOMAIN');
       const response = await axios.get(`https://${auth0Domain}/userinfo`, {
         headers: {
           Authorization: `Bearer ${accessToken}`,
         },
+        timeout: 5000, // 5 second timeout
       });
 
-      this.logger.log(`Fetched user info from Auth0: ${response.data.email}`);
-      return response.data.email || null;
+      const email = response.data.email || null;
+      
+      // Cache the result
+      if (email) {
+        this.emailCache.set(accessToken, { email, timestamp: Date.now() });
+        this.logger.log(`Fetched and cached user info from Auth0: ${email}`);
+      }
+      
+      return email;
     } catch (error) {
       this.logger.error('Error fetching user info from Auth0:', error.message);
+      
+      // If rate limited, try to use expired cache as fallback
+      const cached = this.emailCache.get(accessToken);
+      if (cached && error.response?.status === 429) {
+        this.logger.warn('Rate limited by Auth0, using expired cache');
+        return cached.email;
+      }
+      
       return null;
     }
   }

@@ -11,6 +11,8 @@ import {
 import { TokenManagerService } from '../services/token-manager.service';
 import { OAuthService } from '../services/oauth.service';
 import { ConnectorsWebSocketGateway } from '../../websocket/websocket.gateway';
+import { AppStatus } from '@prisma/client';
+import { AppsService } from '../../apps/apps.service';
 
 /**
  * PowerApps environment info
@@ -79,6 +81,7 @@ export class PowerAppsService implements IBaseConnector {
     private tokenManager: TokenManagerService,
     private oauthService: OAuthService,
     private websocketGateway: ConnectorsWebSocketGateway,
+    private appsService: AppsService,
   ) {
     // Initialize OAuth config after constructor injection
     // Multi-tenant: works with any Azure AD organization
@@ -460,16 +463,65 @@ export class PowerAppsService implements IBaseConnector {
       // Get app details from PowerApps
       const appDetails = await this.getApp(userId, organizationId, appId);
 
-      // TODO: Task 9 - Integrate with sync service
-      // TODO: Task 10 - Extract and store components
-      // TODO: Task 11 - Detect changes
+      // Get the connector for this user
+      const connections = await this.tokenManager['prisma'].platformConnector.findMany({
+        where: {
+          organizationId,
+          platform: 'POWERAPPS',
+          isActive: true,
+        },
+        take: 1,
+      });
+      
+      const connection = connections[0];
+      if (!connection) {
+        throw new BadRequestException('No active PowerApps connection found');
+      }
 
-      // Placeholder response
+      // Create or update app in database
+      const existingApp = await this.appsService['prisma'].app.findUnique({
+        where: {
+          organizationId_externalId_platform: {
+            organizationId,
+            externalId: appId,
+            platform: 'POWERAPPS',
+          },
+        },
+      });
+
+      let app;
+      if (existingApp) {
+        // Update existing app
+        app = await this.appsService['prisma'].app.update({
+          where: { id: existingApp.id },
+          data: {
+            name: appDetails.properties.displayName,
+            description: appDetails.properties.description,
+            metadata: appDetails as any,
+            lastSyncedAt: new Date(),
+            status: AppStatus.LIVE,
+          },
+        });
+        this.logger.log(`Updated existing app ${app.name} (${app.id})`);
+      } else {
+        // Create new app
+        app = await this.appsService.createApp(userId, organizationId, {
+          name: appDetails.properties.displayName,
+          description: appDetails.properties.description,
+          platform: 'POWERAPPS' as any,
+          externalId: appId,
+          connectorId: connection.id,
+          status: AppStatus.LIVE as any,
+          metadata: appDetails as any,
+        });
+        this.logger.log(`Created new app ${app.name} (${app.id})`);
+      }
+
       return {
         success: true,
-        appId,
-        componentsCount: 0,
-        changesDetected: 0,
+        appId: app.id,
+        componentsCount: 0, // Will be populated by component extraction
+        changesDetected: 0, // Will be populated by change detection
         syncedAt: new Date(),
       };
     } catch (error) {
