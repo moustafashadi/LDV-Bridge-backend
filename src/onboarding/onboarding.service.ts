@@ -327,6 +327,8 @@ export class OnboardingService {
    * Get user's onboarding status
    */
   async getOnboardingStatus(auth0Id: string) {
+    console.log(`[OnboardingService] Checking status for auth0Id: ${auth0Id}`);
+    
     // Check if user exists
     const user = await this.prisma.user.findUnique({
       where: { auth0Id },
@@ -336,6 +338,7 @@ export class OnboardingService {
     });
 
     if (user) {
+      console.log(`[OnboardingService] User found: ${user.email}, org: ${user.organizationId}, role: ${user.role}`);
       return {
         onboarded: true,
         status: user.status,
@@ -344,6 +347,8 @@ export class OnboardingService {
       };
     }
 
+    console.log(`[OnboardingService] No user found for auth0Id: ${auth0Id}`);
+    
     // Check if there are any pending join requests
     const pendingRequests = await this.prisma.organizationRequest.findMany({
       where: {
@@ -356,6 +361,7 @@ export class OnboardingService {
     });
 
     if (pendingRequests.length > 0) {
+      console.log(`[OnboardingService] Found ${pendingRequests.length} pending requests`);
       return {
         onboarded: false,
         status: 'pending_approval',
@@ -368,6 +374,7 @@ export class OnboardingService {
       };
     }
 
+    console.log(`[OnboardingService] User needs onboarding`);
     return {
       onboarded: false,
       status: 'needs_onboarding',

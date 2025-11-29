@@ -22,6 +22,7 @@ import { SyncModule } from './sync/sync.module';
 import { ComponentsModule } from './components/components.module';
 import { ChangesModule } from './changes/changes.module';
 import { ReviewsModule } from './reviews/reviews.module';
+import { SandboxesModule } from './sandboxes/sandboxes.module';
 
 @Module({
   imports: [
@@ -58,6 +59,7 @@ import { ReviewsModule } from './reviews/reviews.module';
     ComponentsModule, // Component management & reusable library
     ChangesModule, // Change detection engine with diff & impact analysis
     ReviewsModule, // Review workflow system with comments & approval
+    SandboxesModule, // Sandbox management with environment provisioning
   ],
   controllers: [AppController],
   providers: [

@@ -34,6 +34,7 @@ model Organization {
   invitationCodes InvitationCode[]
   joinRequests    OrganizationRequest[]
   auditLogs       AuditLog[]
+  sandboxes       Sandbox[]
 
   @@map("organizations")
 }
@@ -78,6 +79,7 @@ model User {
   notifications   Notification[]
   connections     UserConnection[]
   auditLogs       AuditLog[]
+  sandboxes       Sandbox[]
 
   @@unique([organizationId, email])
   @@index([organizationId])
@@ -229,7 +231,6 @@ model App {
   owner           User             @relation("AppOwner", fields: [ownerId], references: [id])
   components      Component[]
   changes         Change[]
-  sandboxes       Sandbox[]
   syncHistory     SyncHistory[]
 
   @@unique([organizationId, externalId, platform])
@@ -426,19 +427,23 @@ model Comment {
 
 model Sandbox {
   id              String    @id @default(uuid())
-  appId           String
+  organizationId  String
+  createdById     String
   name            String
   description     String?
-  externalId      String?   // If real sandbox created in platform
-  snapshot        Json?     // Current sandbox state
-  isActive        Boolean   @default(true)
+  status          String    @default("PROVISIONING") // PROVISIONING, ACTIVE, SUSPENDED, EXPIRED, FAILED, DELETED
+  environment     Json      // Platform-specific environment details
   expiresAt       DateTime?
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
 
-  app             App       @relation(fields: [appId], references: [id], onDelete: Cascade)
+  organization    Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  createdBy       User         @relation(fields: [createdById], references: [id])
 
-  @@index([appId])
+  @@index([organizationId])
+  @@index([createdById])
+  @@index([status])
+  @@index([expiresAt])
   @@map("sandboxes")
 }
 

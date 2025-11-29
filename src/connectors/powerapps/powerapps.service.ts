@@ -531,4 +531,220 @@ export class PowerAppsService implements IBaseConnector {
       );
     }
   }
+
+  // ==================== SANDBOX MANAGEMENT METHODS ====================
+
+  /**
+   * Create a new PowerApps Developer Environment
+   * @param userId User ID
+   * @param organizationId Organization ID
+   * @param config Environment configuration
+   */
+  async createEnvironment(
+    userId: string,
+    organizationId: string,
+    config: {
+      name: string;
+      description?: string;
+      region?: string;
+      type?: 'Developer' | 'Production' | 'Sandbox' | 'Trial';
+    },
+  ): Promise<{
+    environmentId: string;
+    environmentUrl: string;
+    status: string;
+  }> {
+    try {
+      this.logger.log(`Creating PowerApps environment: ${config.name}`);
+
+      const client = await this.getAuthenticatedClient(userId, organizationId);
+
+      // Create environment via BAP API
+      const response = await client.post(
+        `${this.bapApiUrl}/environments?api-version=2021-04-01`,
+        {
+          location: config.region || 'unitedstates',
+          properties: {
+            displayName: config.name,
+            description: config.description || '',
+            environmentSku: config.type || 'Developer',
+            azureRegion: config.region || 'unitedstates',
+          },
+        },
+      );
+
+      const environment = response.data;
+
+      return {
+        environmentId: environment.name,
+        environmentUrl: `https://admin.powerplatform.microsoft.com/environments/${environment.name}`,
+        status: environment.properties?.provisioningState || 'Succeeded',
+      };
+    } catch (error) {
+      this.logger.error(`Failed to create environment: ${error.message}`, error.stack);
+      throw new BadRequestException(`Failed to create environment: ${error.message}`);
+    }
+  }
+
+  /**
+   * Delete a PowerApps environment
+   * @param userId User ID
+   * @param organizationId Organization ID
+   * @param environmentId Environment ID to delete
+   */
+  async deleteEnvironment(
+    userId: string,
+    organizationId: string,
+    environmentId: string,
+  ): Promise<void> {
+    try {
+      this.logger.log(`Deleting PowerApps environment: ${environmentId}`);
+
+      const client = await this.getAuthenticatedClient(userId, organizationId);
+
+      await client.delete(
+        `${this.bapApiUrl}/environments/${environmentId}?api-version=2021-04-01`,
+      );
+
+      this.logger.log(`Environment ${environmentId} deleted successfully`);
+    } catch (error) {
+      this.logger.error(`Failed to delete environment: ${error.message}`, error.stack);
+      throw new BadRequestException(`Failed to delete environment: ${error.message}`);
+    }
+  }
+
+  /**
+   * Get environment details
+   * @param userId User ID
+   * @param organizationId Organization ID
+   * @param environmentId Environment ID
+   */
+  async getEnvironment(
+    userId: string,
+    organizationId: string,
+    environmentId: string,
+  ): Promise<PowerAppsEnvironment> {
+    try {
+      this.logger.log(`Getting PowerApps environment: ${environmentId}`);
+
+      const client = await this.getAuthenticatedClient(userId, organizationId);
+
+      const response = await client.get(
+        `${this.bapApiUrl}/environments/${environmentId}?api-version=2021-04-01`,
+      );
+
+      return response.data;
+    } catch (error) {
+      this.logger.error(`Failed to get environment: ${error.message}`, error.stack);
+      throw new BadRequestException(`Failed to get environment: ${error.message}`);
+    }
+  }
+
+  /**
+   * Get all apps in a specific environment
+   * @param userId User ID
+   * @param organizationId Organization ID
+   * @param environmentId Environment ID to filter apps
+   */
+  async getAppsInEnvironment(
+    userId: string,
+    organizationId: string,
+    environmentId: string,
+  ): Promise<PowerAppsApp[]> {
+    try {
+      this.logger.log(`Getting apps in environment: ${environmentId}`);
+
+      const client = await this.getAuthenticatedClient(userId, organizationId);
+
+      const response = await client.get(
+        `${this.powerAppsApiUrl}/apps?api-version=2016-11-01&$filter=environment eq '${environmentId}'`,
+      );
+
+      return response.data?.value || [];
+    } catch (error) {
+      this.logger.error(`Failed to get apps in environment: ${error.message}`, error.stack);
+      throw new BadRequestException(`Failed to get apps: ${error.message}`);
+    }
+  }
+
+  /**
+   * Delete a PowerApp
+   * @param userId User ID
+   * @param organizationId Organization ID
+   * @param appId App ID to delete
+   */
+  async deleteApp(
+    userId: string,
+    organizationId: string,
+    appId: string,
+  ): Promise<void> {
+    try {
+      this.logger.log(`Deleting PowerApp: ${appId}`);
+
+      const client = await this.getAuthenticatedClient(userId, organizationId);
+
+      await client.delete(
+        `${this.powerAppsApiUrl}/apps/${appId}?api-version=2016-11-01`,
+      );
+
+      this.logger.log(`App ${appId} deleted successfully`);
+    } catch (error) {
+      this.logger.error(`Failed to delete app: ${error.message}`, error.stack);
+      throw new BadRequestException(`Failed to delete app: ${error.message}`);
+    }
+  }
+
+  /**
+   * Get environment provisioning status
+   * @param userId User ID
+   * @param organizationId Organization ID
+   * @param environmentId Environment ID
+   */
+  async getEnvironmentStatus(
+    userId: string,
+    organizationId: string,
+    environmentId: string,
+  ): Promise<'Succeeded' | 'Failed' | 'Provisioning' | 'Deleting'> {
+    try {
+      const environment = await this.getEnvironment(userId, organizationId, environmentId);
+      return (environment.properties as any)?.provisioningState || 'Succeeded';
+    } catch (error) {
+      this.logger.error(`Failed to get environment status: ${error.message}`);
+      throw new BadRequestException(`Failed to get status: ${error.message}`);
+    }
+  }
+
+  /**
+   * Get environment resource usage statistics
+   * @param userId User ID
+   * @param organizationId Organization ID
+   * @param environmentId Environment ID
+   */
+  async getEnvironmentResourceUsage(
+    userId: string,
+    organizationId: string,
+    environmentId: string,
+  ): Promise<{
+    appsCount: number;
+    apiCallsUsed: number;
+    storageUsed: number;
+  }> {
+    try {
+      this.logger.log(`Getting resource usage for environment: ${environmentId}`);
+
+      // Get apps count
+      const apps = await this.getAppsInEnvironment(userId, organizationId, environmentId);
+
+      // PowerApps doesn't provide direct API for storage/API calls via public APIs
+      // Return apps count as the main metric
+      return {
+        appsCount: apps.length,
+        apiCallsUsed: 0, // Not available via API
+        storageUsed: 0, // Not available via API
+      };
+    } catch (error) {
+      this.logger.error(`Failed to get resource usage: ${error.message}`, error.stack);
+      throw new BadRequestException(`Failed to get resource usage: ${error.message}`);
+    }
+  }
 }

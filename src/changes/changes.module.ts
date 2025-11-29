@@ -7,6 +7,10 @@ import { PrismaModule } from '../prisma/prisma.module';
 import { AuditModule } from '../common/audit/audit.module';
 import { JwtModule } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
+import { PolicyRiskEvaluatorService } from 'src/risk/policy-risk-evaluator.service';
+import { FormulaAnalyzerService } from 'src/risk/formula-analyzer.service';
+import { RiskScorerService } from 'src/risk/risk-scorer.service';
+import { PoliciesService } from 'src/policies/policies.service';
 
 @Module({
   imports: [
@@ -19,8 +23,15 @@ import { ConfigService } from '@nestjs/config';
       }),
     }),
   ],
-  providers: [ChangesService, JsonDiffService, ImpactAnalyzerService],
+  providers: [ChangesService, 
+    JsonDiffService, 
+    ImpactAnalyzerService, 
+    PolicyRiskEvaluatorService, 
+    FormulaAnalyzerService, 
+    RiskScorerService,
+    PoliciesService
+  ],
   controllers: [ChangesController],
   exports: [ChangesService], // Export for SyncService to use
 })
-export class ChangesModule {}
+export class ChangesModule { }

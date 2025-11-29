@@ -43,6 +43,7 @@
     "class-transformer": "^0.5.1",
     "class-validator": "^0.14.1",
     "crypto-js": "^4.2.0",
+    "date-fns": "^4.1.0",
     "diff": "^7.0.0",
     "fast-json-patch": "^3.1.1",
     "gray-matter": "^4.0.3",

@@ -529,4 +529,330 @@ export class MendixService implements IBaseConnector {
 
     this.logger.log(`Mendix connection established for user ${userId}`);
   }
+
+  // ==================== SANDBOX MANAGEMENT METHODS ====================
+
+  /**
+   * Create a new Mendix Free Sandbox
+   * @param userId User ID
+   * @param organizationId Organization ID
+   * @param config Sandbox configuration
+   */
+  async createSandbox(
+    userId: string,
+    organizationId: string,
+    config: {
+      name: string;
+      appId?: string;
+      template?: string;
+      mendixVersion?: string;
+    },
+  ): Promise<{
+    environmentId: string;
+    environmentUrl: string;
+    status: string;
+  }> {
+    try {
+      this.logger.log(`Creating Mendix sandbox: ${config.name}`);
+
+      const client = await this.getAuthenticatedClient(userId, organizationId);
+
+      // Create a new app (which includes a free sandbox environment)
+      const response = await client.post(
+        `${this.mendixConfig.buildApiUrl}/apps`,
+        {
+          name: config.name,
+          projectId: config.appId || null,
+          templateId: config.template || null,
+          mendixVersion: config.mendixVersion || null,
+        },
+      );
+
+      const app = response.data;
+
+      // Get the default environment (sandbox)
+      const envResponse = await client.get(
+        `${this.mendixConfig.deploymentsApiUrl}/apps/${app.appId}/environments`,
+      );
+
+      const sandboxEnv = envResponse.data?.find((env: any) => env.type === 'Free');
+
+      if (!sandboxEnv) {
+        throw new BadRequestException('No sandbox environment found for app');
+      }
+
+      return {
+        environmentId: sandboxEnv.environmentId,
+        environmentUrl: sandboxEnv.url || '',
+        status: sandboxEnv.status || 'Stopped',
+      };
+    } catch (error) {
+      this.logger.error(`Failed to create sandbox: ${error.message}`, error.stack);
+      throw new BadRequestException(`Failed to create sandbox: ${error.message}`);
+    }
+  }
+
+  /**
+   * Delete a Mendix sandbox
+   * @param userId User ID
+   * @param organizationId Organization ID
+   * @param environmentId Environment ID to delete
+   */
+  async deleteSandbox(
+    userId: string,
+    organizationId: string,
+    environmentId: string,
+  ): Promise<void> {
+    try {
+      this.logger.log(`Deleting Mendix sandbox: ${environmentId}`);
+
+      const client = await this.getAuthenticatedClient(userId, organizationId);
+
+      // Stop the environment first
+      try {
+        await this.stopEnvironment(userId, organizationId, environmentId);
+      } catch (error) {
+        this.logger.warn(`Failed to stop environment before deletion: ${error.message}`);
+      }
+
+      // Delete the app (which includes the sandbox)
+      const appId = await this.getAppIdFromEnvironment(userId, organizationId, environmentId);
+      
+      await client.delete(
+        `${this.mendixConfig.buildApiUrl}/apps/${appId}`,
+      );
+
+      this.logger.log(`Sandbox ${environmentId} deleted successfully`);
+    } catch (error) {
+      this.logger.error(`Failed to delete sandbox: ${error.message}`, error.stack);
+      throw new BadRequestException(`Failed to delete sandbox: ${error.message}`);
+    }
+  }
+
+  /**
+   * Start a Mendix environment
+   * @param userId User ID
+   * @param organizationId Organization ID
+   * @param environmentId Environment ID
+   */
+  async startEnvironment(
+    userId: string,
+    organizationId: string,
+    environmentId: string,
+  ): Promise<void> {
+    try {
+      this.logger.log(`Starting Mendix environment: ${environmentId}`);
+
+      const client = await this.getAuthenticatedClient(userId, organizationId);
+
+      await client.post(
+        `${this.mendixConfig.deploymentsApiUrl}/apps/${environmentId}/environments/start`,
+        {},
+      );
+
+      this.logger.log(`Environment ${environmentId} started successfully`);
+    } catch (error) {
+      this.logger.error(`Failed to start environment: ${error.message}`, error.stack);
+      throw new BadRequestException(`Failed to start environment: ${error.message}`);
+    }
+  }
+
+  /**
+   * Stop a Mendix environment
+   * @param userId User ID
+   * @param organizationId Organization ID
+   * @param environmentId Environment ID
+   */
+  async stopEnvironment(
+    userId: string,
+    organizationId: string,
+    environmentId: string,
+  ): Promise<void> {
+    try {
+      this.logger.log(`Stopping Mendix environment: ${environmentId}`);
+
+      const client = await this.getAuthenticatedClient(userId, organizationId);
+
+      await client.post(
+        `${this.mendixConfig.deploymentsApiUrl}/apps/${environmentId}/environments/stop`,
+        {},
+      );
+
+      this.logger.log(`Environment ${environmentId} stopped successfully`);
+    } catch (error) {
+      this.logger.error(`Failed to stop environment: ${error.message}`, error.stack);
+      throw new BadRequestException(`Failed to stop environment: ${error.message}`);
+    }
+  }
+
+  /**
+   * Get environment status
+   * @param userId User ID
+   * @param organizationId Organization ID
+   * @param environmentId Environment ID
+   */
+  async getEnvironmentStatus(
+    userId: string,
+    organizationId: string,
+    environmentId: string,
+  ): Promise<'Running' | 'Stopped' | 'Starting' | 'Stopping'> {
+    try {
+      const details = await this.getEnvironmentDetails(userId, organizationId, environmentId);
+      return details.status || 'Stopped';
+    } catch (error) {
+      this.logger.error(`Failed to get environment status: ${error.message}`);
+      throw new BadRequestException(`Failed to get status: ${error.message}`);
+    }
+  }
+
+  /**
+   * Get detailed environment information
+   * @param userId User ID
+   * @param organizationId Organization ID
+   * @param environmentId Environment ID
+   */
+  async getEnvironmentDetails(
+    userId: string,
+    organizationId: string,
+    environmentId: string,
+  ): Promise<{
+    environmentId: string;
+    name: string;
+    url: string;
+    status: 'Running' | 'Stopped' | 'Starting' | 'Stopping';
+    modelVersion: string;
+    mendixVersion: string;
+    instances: number;
+  }> {
+    try {
+      this.logger.log(`Getting environment details: ${environmentId}`);
+
+      const client = await this.getAuthenticatedClient(userId, organizationId);
+
+      const response = await client.get(
+        `${this.mendixConfig.deploymentsApiUrl}/apps/${environmentId}/environments`,
+      );
+
+      const environment = response.data;
+
+      return {
+        environmentId: environment.environmentId,
+        name: environment.name || '',
+        url: environment.url || '',
+        status: environment.status || 'Stopped',
+        modelVersion: environment.modelVersion || '',
+        mendixVersion: environment.runtimeVersion || '',
+        instances: environment.instances || 1,
+      };
+    } catch (error) {
+      this.logger.error(`Failed to get environment details: ${error.message}`, error.stack);
+      throw new BadRequestException(`Failed to get environment details: ${error.message}`);
+    }
+  }
+
+  /**
+   * Clear environment data (reset sandbox)
+   * @param userId User ID
+   * @param organizationId Organization ID
+   * @param environmentId Environment ID
+   */
+  async clearEnvironmentData(
+    userId: string,
+    organizationId: string,
+    environmentId: string,
+  ): Promise<void> {
+    try {
+      this.logger.log(`Clearing environment data: ${environmentId}`);
+
+      const client = await this.getAuthenticatedClient(userId, organizationId);
+
+      // Stop environment
+      await this.stopEnvironment(userId, organizationId, environmentId);
+
+      // Clear database
+      await client.post(
+        `${this.mendixConfig.deploymentsApiUrl}/apps/${environmentId}/environments/clear-database`,
+        {},
+      );
+
+      // Restart environment
+      await this.startEnvironment(userId, organizationId, environmentId);
+
+      this.logger.log(`Environment ${environmentId} data cleared successfully`);
+    } catch (error) {
+      this.logger.error(`Failed to clear environment data: ${error.message}`, error.stack);
+      throw new BadRequestException(`Failed to clear environment data: ${error.message}`);
+    }
+  }
+
+  /**
+   * Get environment resource usage
+   * @param userId User ID
+   * @param organizationId Organization ID
+   * @param environmentId Environment ID
+   */
+  async getEnvironmentResourceUsage(
+    userId: string,
+    organizationId: string,
+    environmentId: string,
+  ): Promise<{
+    appsCount: number;
+    apiCallsUsed: number;
+    storageUsed: number;
+  }> {
+    try {
+      this.logger.log(`Getting resource usage for environment: ${environmentId}`);
+
+      const details = await this.getEnvironmentDetails(userId, organizationId, environmentId);
+
+      // Mendix free sandboxes have 1 app per environment
+      return {
+        appsCount: 1,
+        apiCallsUsed: 0, // Not tracked in free tier
+        storageUsed: 0, // Not available via API
+      };
+    } catch (error) {
+      this.logger.error(`Failed to get resource usage: ${error.message}`, error.stack);
+      throw new BadRequestException(`Failed to get resource usage: ${error.message}`);
+    }
+  }
+
+  /**
+   * Helper: Get app ID from environment ID
+   * @param userId User ID
+   * @param organizationId Organization ID
+   * @param environmentId Environment ID
+   */
+  private async getAppIdFromEnvironment(
+    userId: string,
+    organizationId: string,
+    environmentId: string,
+  ): Promise<string> {
+    try {
+      const client = await this.getAuthenticatedClient(userId, organizationId);
+
+      // Get all apps and find the one with this environment
+      const response = await client.get(`${this.mendixConfig.buildApiUrl}/apps`);
+      const apps = response.data;
+
+      for (const app of apps) {
+        const envResponse = await client.get(
+          `${this.mendixConfig.deploymentsApiUrl}/apps/${app.appId}/environments`,
+        );
+
+        const hasEnv = envResponse.data?.some(
+          (env: any) => env.environmentId === environmentId,
+        );
+
+        if (hasEnv) {
+          return app.appId;
+        }
+      }
+
+      throw new BadRequestException('App not found for environment');
+    } catch (error) {
+      this.logger.error(`Failed to get app ID: ${error.message}`);
+      throw error;
+    }
+  }
 }

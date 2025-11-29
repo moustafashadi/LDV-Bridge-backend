@@ -154,7 +154,22 @@ export class OrganizationsService {
       },
     });
 
-    return requests;
+    // Transform the data to match frontend expectations
+    // Frontend expects: { id, user: { email, name }, requestedRole, message, createdAt }
+    return requests.map(request => ({
+      id: request.id,
+      userId: request.auth0Id,
+      organizationId: request.organizationId,
+      requestedRole: request.requestedRole,
+      status: request.status,
+      message: request.message,
+      user: {
+        email: request.email,
+        name: request.name,
+      },
+      createdAt: request.createdAt,
+      updatedAt: request.updatedAt,
+    }));
   }
 
   /**
