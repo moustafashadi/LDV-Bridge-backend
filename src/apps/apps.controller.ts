@@ -9,6 +9,7 @@ import type { AuthenticatedUser } from '../auth/interfaces/authenticated-user.in
 import { GrantAppAccessDto, UpdateAppAccessDto } from './dto/grant-app-access.dto';
 import { CreateAppDto } from './dto/create-app.dto';
 import { AppPermissionResponseDto, UserAppAccessResponseDto } from './dto/app-access-response.dto';
+import { UserRole } from '@prisma/client';
 
 @ApiTags('Apps')
 @ApiBearerAuth()
@@ -22,7 +23,7 @@ export class AppsController {
   // ============================================
 
   @Post()
-  @Roles('ADMIN', 'PRO_DEVELOPER', 'CITIZEN_DEVELOPER')
+  @Roles(UserRole.ADMIN, UserRole.PRO_DEVELOPER, UserRole.CITIZEN_DEVELOPER )
   @ApiOperation({ summary: 'Create a new app' })
   @ApiResponse({ status: 201, description: 'App created successfully' })
   @ApiResponse({ status: 400, description: 'Bad request - validation failed or duplicate app' })
@@ -37,7 +38,7 @@ export class AppsController {
   }
 
   @Get()
-  @Roles('ADMIN', 'PRO_DEVELOPER')
+  @Roles(UserRole.ADMIN, UserRole.PRO_DEVELOPER)
   @ApiOperation({ summary: 'Get all apps in the organization' })
   @ApiResponse({ status: 200, description: 'List of all organization apps' })
   async getAllApps(@CurrentUser() user: AuthenticatedUser) {
@@ -52,7 +53,7 @@ export class AppsController {
   // ============================================
 
   @Post(':appId/access')
-  @Roles('ADMIN', 'PRO_DEVELOPER')
+  @Roles(UserRole.ADMIN, UserRole.PRO_DEVELOPER)
   @ApiOperation({ summary: 'Grant app access to users' })
   @ApiResponse({ status: 201, description: 'Access granted successfully', type: [AppPermissionResponseDto] })
   @ApiResponse({ status: 403, description: 'Forbidden - Insufficient permissions' })
@@ -69,7 +70,7 @@ export class AppsController {
   }
 
   @Get(':appId/access')
-  @Roles('ADMIN', 'PRO_DEVELOPER')
+  @Roles(UserRole.ADMIN, UserRole.PRO_DEVELOPER)
   @ApiOperation({ summary: 'Get all users with access to an app' })
   @ApiResponse({ status: 200, description: 'List of users with access', type: [AppPermissionResponseDto] })
   @ApiResponse({ status: 404, description: 'App not found' })
@@ -81,7 +82,7 @@ export class AppsController {
   }
 
   @Patch(':appId/access/:userId')
-  @Roles('ADMIN', 'PRO_DEVELOPER')
+  @Roles(UserRole.ADMIN, UserRole.PRO_DEVELOPER)
   @ApiOperation({ summary: 'Update app access level for a user' })
   @ApiResponse({ status: 200, description: 'Access updated successfully', type: AppPermissionResponseDto })
   @ApiResponse({ status: 403, description: 'Forbidden - Insufficient permissions' })
@@ -99,7 +100,7 @@ export class AppsController {
   }
 
   @Delete(':appId/access/:userId')
-  @Roles('ADMIN', 'PRO_DEVELOPER')
+  @Roles(UserRole.ADMIN, UserRole.PRO_DEVELOPER)
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiOperation({ summary: 'Revoke app access from a user' })
   @ApiResponse({ status: 204, description: 'Access revoked successfully' })
@@ -121,7 +122,7 @@ export class AppsController {
   // ============================================
 
   @Get('users/:userId/apps')
-  @Roles('ADMIN', 'PRO_DEVELOPER')
+  @Roles(UserRole.ADMIN, UserRole.PRO_DEVELOPER)
   @ApiOperation({ summary: 'Get all apps a user has access to' })
   @ApiResponse({ status: 200, description: 'List of apps user can access', type: [UserAppAccessResponseDto] })
   async getUserApps(@Param('userId') userId: string, @CurrentUser() user: AuthenticatedUser) {

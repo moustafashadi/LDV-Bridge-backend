@@ -74,6 +74,8 @@ export interface EnvironmentDetails {
   environmentUrl: string;             // Direct access URL for the environment
   region?: string;                    // Geographic region/datacenter
   metadata?: Record<string, any>;     // Platform-specific extra data
+  appId?: string;                     // External platform app ID (for cloned apps)
+  isCloned?: boolean;                 // Whether this was created via cloning
 }
 
 /**
@@ -89,6 +91,7 @@ export interface PowerAppsEnvironmentConfig {
   securityGroupId?: string;           // Optional Azure AD security group
   languageCode?: number;              // LCID language code (default: 1033 = English)
   currencyCode?: string;              // Currency code (default: 'USD')
+  sourceAppId?: string;               // Optional: LDV-Bridge app ID to clone from
 }
 
 /**
@@ -102,6 +105,7 @@ export interface MendixSandboxConfig {
   template?: string;                  // Optional template app to clone from
   mode: 'sandbox' | 'free';           // Sandbox mode (free tier)
   mendixVersion?: string;             // Mendix runtime version (e.g., '10.0')
+  sourceAppId?: string;               // Optional: LDV-Bridge app ID to clone from
 }
 
 /**

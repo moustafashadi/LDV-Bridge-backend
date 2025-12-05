@@ -82,6 +82,11 @@ export class SandboxesService {
       `Creating ${dto.platform} sandbox "${dto.name}" for org ${organizationId}`,
     );
 
+    // If sourceAppId is provided, validate and check clone limits
+    if (dto.sourceAppId) {
+      await this.validateCloneRequest(dto.sourceAppId, organizationId, userId);
+    }
+
     // Check quotas
     await this.checkQuotas(organizationId, dto.type);
 
@@ -183,10 +188,30 @@ export class SandboxesService {
             environmentId: envDetails.environmentId,
             environmentUrl: envDetails.environmentUrl,
             region: envDetails.region,
-            metadata: envDetails.metadata,
+            metadata: {
+              ...envDetails.metadata,
+              appId: envDetails.appId, // Store external app ID
+              isCloned: envDetails.isCloned || false,
+            },
           },
         },
       });
+
+      // If this was a clone, create a SandboxClone record
+      if (envDetails.isCloned && dto.sourceAppId && envDetails.appId) {
+        await this.prisma.sandboxClone.create({
+          data: {
+            sourceAppId: dto.sourceAppId,
+            sandboxId: sandboxId,
+            clonedAppId: envDetails.appId,
+            organizationId,
+            createdById: userId,
+          },
+        });
+        this.logger.log(
+          `Created clone tracking record for sandbox ${sandboxId} from app ${dto.sourceAppId}`,
+        );
+      }
 
       // Send notification
       const sandbox = await this.prisma.sandbox.findUnique({
@@ -676,6 +701,47 @@ export class SandboxesService {
   }
 
   /**
+   * Helper: Validate clone request and check clone limits
+   */
+  private async validateCloneRequest(
+    sourceAppId: string,
+    organizationId: string,
+    userId: string,
+  ): Promise<void> {
+    // Check if source app exists and is synced to LDV-Bridge
+    const sourceApp = await this.prisma.app.findFirst({
+      where: {
+        id: sourceAppId,
+        organizationId,
+      },
+    });
+
+    if (!sourceApp) {
+      throw new BadRequestException(
+        'Source app not found or not synced to LDV-Bridge. Please sync the app first.',
+      );
+    }
+
+    // Check clone limit (max 3 clones per source app)
+    const cloneCount = await this.prisma.sandboxClone.count({
+      where: {
+        sourceAppId,
+        organizationId,
+      },
+    });
+
+    if (cloneCount >= 3) {
+      throw new BadRequestException(
+        `Maximum clone limit reached for this app (3 clones). Please delete an existing sandbox clone before creating a new one.`,
+      );
+    }
+
+    this.logger.log(
+      `Clone validation passed for app ${sourceAppId}: ${cloneCount}/3 clones used`,
+    );
+  }
+
+  /**
    * Helper: Get sandbox environment JSON
    */
   private async getSandboxEnvironment(sandboxId: string): Promise<any> {
@@ -722,6 +788,7 @@ export class SandboxesService {
         displayName: `Sandbox: ${dto.name}`,
         environmentType: 'Developer',
         region: dto.platformConfig?.region || 'unitedstates',
+        sourceAppId: dto.sourceAppId, // Pass sourceAppId for cloning
         ...dto.platformConfig,
       };
     } else {
@@ -729,6 +796,7 @@ export class SandboxesService {
         name: dto.name,
         template: dto.platformConfig?.template || 'blank',
         mode: 'sandbox',
+        sourceAppId: dto.sourceAppId, // Pass sourceAppId for cloning
         ...dto.platformConfig,
       };
     }

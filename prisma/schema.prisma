@@ -15,15 +15,15 @@ datasource db {
 // ========================================
 
 model Organization {
-  id              String   @id @default(uuid())
-  name            String
-  slug            String   @unique
-  domain          String?
-  settings        Json?    // Organization-specific settings
-  subscriptionPlan String  @default("free") // free, pro, enterprise
-  isActive        Boolean  @default(true)
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  id               String   @id @default(uuid())
+  name             String
+  slug             String   @unique
+  domain           String?
+  settings         Json? // Organization-specific settings
+  subscriptionPlan String   @default("free") // free, pro, enterprise
+  isActive         Boolean  @default(true)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
 
   // Relations
   users           User[]
@@ -35,6 +35,7 @@ model Organization {
   joinRequests    OrganizationRequest[]
   auditLogs       AuditLog[]
   sandboxes       Sandbox[]
+  sandboxClones   SandboxClone[]
 
   @@map("organizations")
 }
@@ -53,35 +54,36 @@ enum UserStatus {
 }
 
 model User {
-  id              String      @id @default(uuid())
-  organizationId  String
-  auth0Id         String      @unique // Auth0 user ID
-  email           String
-  name            String?     // Full name from Auth0
-  displayName     String?     // User's chosen display name
-  avatarUrl       String?
-  role            UserRole    @default(CITIZEN_DEVELOPER)
-  status          UserStatus  @default(ACTIVE)
-  requestedRole   UserRole?   // Role requested when joining existing org
-  approvedBy      String?     // Admin user ID who approved this user
-  approvedAt      DateTime?   // When user was approved
-  settings        Json?       // User preferences/settings
-  lastLoginAt     DateTime?
-  createdAt       DateTime    @default(now())
-  updatedAt       DateTime    @updatedAt
+  id             String     @id @default(uuid())
+  organizationId String
+  auth0Id        String     @unique // Auth0 user ID
+  email          String
+  name           String? // Full name from Auth0
+  displayName    String? // User's chosen display name
+  avatarUrl      String?
+  role           UserRole   @default(CITIZEN_DEVELOPER)
+  status         UserStatus @default(ACTIVE)
+  requestedRole  UserRole? // Role requested when joining existing org
+  approvedBy     String? // Admin user ID who approved this user
+  approvedAt     DateTime? // When user was approved
+  settings       Json? // User preferences/settings
+  lastLoginAt    DateTime?
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
 
   // Relations
-  organization    Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  ownedApps       App[]        @relation("AppOwner")
-  appPermissions  AppPermission[] @relation("UserAppAccess")
-  grantedPermissions AppPermission[] @relation("GrantedBy")
-  changes         Change[]     @relation("ChangeAuthor")
-  reviews         Review[]     @relation("Reviewer")
-  comments        Comment[]
-  notifications   Notification[]
-  connections     UserConnection[]
-  auditLogs       AuditLog[]
-  sandboxes       Sandbox[]
+  organization       Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  ownedApps          App[]            @relation("AppOwner")
+  appPermissions     AppPermission[]  @relation("UserAppAccess")
+  grantedPermissions AppPermission[]  @relation("GrantedBy")
+  changes            Change[]         @relation("ChangeAuthor")
+  reviews            Review[]         @relation("Reviewer")
+  comments           Comment[]
+  notifications      Notification[]
+  connections        UserConnection[]
+  auditLogs          AuditLog[]
+  sandboxes          Sandbox[]
+  sandboxClones      SandboxClone[]
 
   @@unique([organizationId, email])
   @@index([organizationId])
@@ -90,18 +92,18 @@ model User {
 }
 
 model Invitation {
-  id              String   @id @default(uuid())
-  organizationId  String
-  email           String
-  role            UserRole @default(CITIZEN_DEVELOPER)
-  token           String   @unique
-  message         String?  // Optional welcome message
-  expiresAt       DateTime
-  acceptedAt      DateTime?
-  createdBy       String?  // Admin who created the invitation
-  createdAt       DateTime @default(now())
+  id             String    @id @default(uuid())
+  organizationId String
+  email          String
+  role           UserRole  @default(CITIZEN_DEVELOPER)
+  token          String    @unique
+  message        String? // Optional welcome message
+  expiresAt      DateTime
+  acceptedAt     DateTime?
+  createdBy      String? // Admin who created the invitation
+  createdAt      DateTime  @default(now())
 
-  organization    Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
 
   @@index([token])
   @@index([email])
@@ -110,19 +112,19 @@ model Invitation {
 
 // Invitation codes for team invitations (shareable codes)
 model InvitationCode {
-  id              String   @id @default(cuid())
-  organizationId  String
-  code            String   @unique // e.g., "ORG-ACME-A7X2Q"
-  role            UserRole @default(CITIZEN_DEVELOPER) // Pre-assigned role
-  maxUses         Int?     // Null = unlimited uses
-  usedCount       Int      @default(0)
-  expiresAt       DateTime?
-  isActive        Boolean  @default(true)
-  createdBy       String   // Admin user ID
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  id             String    @id @default(cuid())
+  organizationId String
+  code           String    @unique // e.g., "ORG-ACME-A7X2Q"
+  role           UserRole  @default(CITIZEN_DEVELOPER) // Pre-assigned role
+  maxUses        Int? // Null = unlimited uses
+  usedCount      Int       @default(0)
+  expiresAt      DateTime?
+  isActive       Boolean   @default(true)
+  createdBy      String // Admin user ID
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
 
-  organization    Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
 
   @@index([code])
   @@index([organizationId])
@@ -131,21 +133,21 @@ model InvitationCode {
 
 // Join requests for existing organizations (pending approval)
 model OrganizationRequest {
-  id              String   @id @default(uuid())
+  id              String    @id @default(uuid())
   organizationId  String
-  auth0Id         String   // Auth0 user ID (before User record created)
+  auth0Id         String // Auth0 user ID (before User record created)
   email           String
-  name            String?  // From Auth0 profile
-  requestedRole   UserRole @default(CITIZEN_DEVELOPER)
-  message         String?  @db.Text // User's message to admin
-  status          String   @default("pending") // pending, approved, rejected
-  reviewedBy      String?  // Admin user ID who reviewed
+  name            String? // From Auth0 profile
+  requestedRole   UserRole  @default(CITIZEN_DEVELOPER)
+  message         String?   @db.Text // User's message to admin
+  status          String    @default("pending") // pending, approved, rejected
+  reviewedBy      String? // Admin user ID who reviewed
   reviewedAt      DateTime?
-  rejectionReason String?  @db.Text
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  rejectionReason String?   @db.Text
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
 
-  organization    Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
 
   @@index([organizationId])
   @@index([auth0Id])
@@ -165,35 +167,35 @@ enum PlatformType {
 }
 
 model PlatformConnector {
-  id              String       @id @default(uuid())
-  organizationId  String
-  platform        PlatformType
-  name            String       // User-friendly name
-  isActive        Boolean      @default(true)
-  config          Json         // Platform-specific configuration
-  createdAt       DateTime     @default(now())
-  updatedAt       DateTime     @updatedAt
+  id             String       @id @default(uuid())
+  organizationId String
+  platform       PlatformType
+  name           String // User-friendly name
+  isActive       Boolean      @default(true)
+  config         Json // Platform-specific configuration
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
 
-  organization    Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  apps            App[]
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  apps         App[]
 
   @@index([organizationId])
   @@map("platform_connectors")
 }
 
 model UserConnection {
-  id              String       @id @default(uuid())
-  userId          String
-  platform        PlatformType
-  accessToken     String       // Encrypted
-  refreshToken    String?      // Encrypted
-  expiresAt       DateTime?
-  metadata        Json?        // Platform-specific user data
-  isActive        Boolean      @default(true)
-  createdAt       DateTime     @default(now())
-  updatedAt       DateTime     @updatedAt
+  id           String       @id @default(uuid())
+  userId       String
+  platform     PlatformType
+  accessToken  String // Encrypted
+  refreshToken String? // Encrypted
+  expiresAt    DateTime?
+  metadata     Json? // Platform-specific user data
+  isActive     Boolean      @default(true)
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
 
-  user            User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([userId, platform])
   @@index([userId])
@@ -213,28 +215,29 @@ enum AppStatus {
 }
 
 model App {
-  id              String       @id @default(uuid())
-  organizationId  String
-  connectorId     String
-  ownerId         String
-  externalId      String       // ID in the LCNC platform
-  name            String
-  description     String?
-  platform        PlatformType
-  status          AppStatus    @default(DRAFT)
-  version         String?
-  metadata        Json?        // Full app metadata from platform
-  lastSyncedAt    DateTime?
-  createdAt       DateTime     @default(now())
-  updatedAt       DateTime     @updatedAt
+  id             String       @id @default(uuid())
+  organizationId String
+  connectorId    String
+  ownerId        String
+  externalId     String // ID in the LCNC platform
+  name           String
+  description    String?
+  platform       PlatformType
+  status         AppStatus    @default(DRAFT)
+  version        String?
+  metadata       Json? // Full app metadata from platform
+  lastSyncedAt   DateTime?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
 
-  organization    Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  connector       PlatformConnector @relation(fields: [connectorId], references: [id])
-  owner           User             @relation("AppOwner", fields: [ownerId], references: [id])
-  permissions     AppPermission[]
-  components      Component[]
-  changes         Change[]
-  syncHistory     SyncHistory[]
+  organization  Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  connector     PlatformConnector @relation(fields: [connectorId], references: [id])
+  owner         User              @relation("AppOwner", fields: [ownerId], references: [id])
+  permissions   AppPermission[]
+  components    Component[]
+  changes       Change[]
+  syncHistory   SyncHistory[]
+  sandboxClones SandboxClone[]
 
   @@unique([organizationId, externalId, platform])
   @@index([organizationId])
@@ -247,26 +250,26 @@ model App {
 // ============================================
 
 enum AppAccessLevel {
-  VIEWER      // Can view app details and components
-  EDITOR      // Can edit and sync app
-  OWNER       // Full control (same privileges as ownerId)
+  VIEWER // Can view app details and components
+  EDITOR // Can edit and sync app
+  OWNER // Full control (same privileges as ownerId)
 }
 
 model AppPermission {
-  id             String         @id @default(uuid())
-  appId          String
-  userId         String
-  accessLevel    AppAccessLevel @default(VIEWER)
-  grantedBy      String         // User ID who granted access
-  grantedAt      DateTime       @default(now())
-  expiresAt      DateTime?      // Optional expiration date
-  createdAt      DateTime       @default(now())
-  updatedAt      DateTime       @updatedAt
+  id          String         @id @default(uuid())
+  appId       String
+  userId      String
+  accessLevel AppAccessLevel @default(VIEWER)
+  grantedBy   String // User ID who granted access
+  grantedAt   DateTime       @default(now())
+  expiresAt   DateTime? // Optional expiration date
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
 
   // Relations
-  app            App            @relation(fields: [appId], references: [id], onDelete: Cascade)
-  user           User           @relation("UserAppAccess", fields: [userId], references: [id], onDelete: Cascade)
-  grantedByUser  User           @relation("GrantedBy", fields: [grantedBy], references: [id])
+  app           App  @relation(fields: [appId], references: [id], onDelete: Cascade)
+  user          User @relation("UserAppAccess", fields: [userId], references: [id], onDelete: Cascade)
+  grantedByUser User @relation("GrantedBy", fields: [grantedBy], references: [id])
 
   @@unique([appId, userId])
   @@index([userId])
@@ -291,19 +294,19 @@ enum ComponentType {
 }
 
 model Component {
-  id              String        @id @default(uuid())
-  appId           String
-  externalId      String?       // Component ID in platform
-  name            String
-  type            ComponentType
-  path            String?       // Path in app hierarchy
-  properties      Json?         // Component properties
-  codeBlock       String?       @db.Text // PowerFx, microflow XML, etc.
-  metadata        Json?
-  createdAt       DateTime      @default(now())
-  updatedAt       DateTime      @updatedAt
+  id         String        @id @default(uuid())
+  appId      String
+  externalId String? // Component ID in platform
+  name       String
+  type       ComponentType
+  path       String? // Path in app hierarchy
+  properties Json? // Component properties
+  codeBlock  String?       @db.Text // PowerFx, microflow XML, etc.
+  metadata   Json?
+  createdAt  DateTime      @default(now())
+  updatedAt  DateTime      @updatedAt
 
-  app             App           @relation(fields: [appId], references: [id], onDelete: Cascade)
+  app App @relation(fields: [appId], references: [id], onDelete: Cascade)
 
   @@index([appId])
   @@map("components")
@@ -328,24 +331,24 @@ enum SyncTriggerType {
 }
 
 model SyncHistory {
-  id              String          @id @default(uuid())
-  organizationId  String
-  appId           String
-  platform        PlatformType
-  status          SyncStatus      @default(QUEUED)
-  jobId           String?         // Bull job ID
-  triggeredBy     String          // userId or 'system' for auto-sync
-  triggerType     SyncTriggerType @default(MANUAL)
-  startedAt       DateTime?
-  completedAt     DateTime?
-  duration        Int?            // milliseconds
-  itemsSynced     Int?            // number of items updated
-  errorMessage    String?         @db.Text
-  errorStack      String?         @db.Text
-  metadata        Json?           // Additional sync metadata
-  createdAt       DateTime        @default(now())
+  id             String          @id @default(uuid())
+  organizationId String
+  appId          String
+  platform       PlatformType
+  status         SyncStatus      @default(QUEUED)
+  jobId          String? // Bull job ID
+  triggeredBy    String // userId or 'system' for auto-sync
+  triggerType    SyncTriggerType @default(MANUAL)
+  startedAt      DateTime?
+  completedAt    DateTime?
+  duration       Int? // milliseconds
+  itemsSynced    Int? // number of items updated
+  errorMessage   String?         @db.Text
+  errorStack     String?         @db.Text
+  metadata       Json? // Additional sync metadata
+  createdAt      DateTime        @default(now())
 
-  app             App             @relation(fields: [appId], references: [id], onDelete: Cascade)
+  app App @relation(fields: [appId], references: [id], onDelete: Cascade)
 
   @@index([organizationId])
   @@index([appId])
@@ -373,31 +376,31 @@ enum ChangeType {
 }
 
 model Change {
-  id              String       @id @default(uuid())
-  organizationId  String
-  appId           String
-  authorId        String
-  title           String
-  description     String?      @db.Text
-  changeType      ChangeType
-  status          ChangeStatus @default(DRAFT)
-  beforeMetadata  Json?        // State before change
-  afterMetadata   Json?        // State after change
-  beforeCode      String?      @db.Text
-  afterCode       String?      @db.Text
-  diffSummary     Json?        // Parsed diff summary
-  riskScore       Int?         // 0-100
-  riskAssessment  Json?        // Risk analysis details
-  submittedAt     DateTime?
-  createdAt       DateTime     @default(now())
-  updatedAt       DateTime     @updatedAt
+  id             String       @id @default(uuid())
+  organizationId String
+  appId          String
+  authorId       String
+  title          String
+  description    String?      @db.Text
+  changeType     ChangeType
+  status         ChangeStatus @default(DRAFT)
+  beforeMetadata Json? // State before change
+  afterMetadata  Json? // State after change
+  beforeCode     String?      @db.Text
+  afterCode      String?      @db.Text
+  diffSummary    Json? // Parsed diff summary
+  riskScore      Int? // 0-100
+  riskAssessment Json? // Risk analysis details
+  submittedAt    DateTime?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
 
-  app             App          @relation(fields: [appId], references: [id], onDelete: Cascade)
-  author          User         @relation("ChangeAuthor", fields: [authorId], references: [id])
-  reviews         Review[]
-  comments        Comment[]
-  deployments     Deployment[]
-  gitCommits      GitCommit[]
+  app         App          @relation(fields: [appId], references: [id], onDelete: Cascade)
+  author      User         @relation("ChangeAuthor", fields: [authorId], references: [id])
+  reviews     Review[]
+  comments    Comment[]
+  deployments Deployment[]
+  gitCommits  GitCommit[]
 
   @@index([organizationId])
   @@index([appId])
@@ -419,19 +422,19 @@ enum ReviewStatus {
 }
 
 model Review {
-  id              String       @id @default(uuid())
-  changeId        String
-  reviewerId      String
-  status          ReviewStatus @default(PENDING)
-  decision        String?      // approve, reject, request_changes
-  feedback        String?      @db.Text
-  startedAt       DateTime?
-  completedAt     DateTime?
-  createdAt       DateTime     @default(now())
-  updatedAt       DateTime     @updatedAt
+  id          String       @id @default(uuid())
+  changeId    String
+  reviewerId  String
+  status      ReviewStatus @default(PENDING)
+  decision    String? // approve, reject, request_changes
+  feedback    String?      @db.Text
+  startedAt   DateTime?
+  completedAt DateTime?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
 
-  change          Change       @relation(fields: [changeId], references: [id], onDelete: Cascade)
-  reviewer        User         @relation("Reviewer", fields: [reviewerId], references: [id])
+  change   Change @relation(fields: [changeId], references: [id], onDelete: Cascade)
+  reviewer User   @relation("Reviewer", fields: [reviewerId], references: [id])
 
   @@index([changeId])
   @@index([reviewerId])
@@ -440,20 +443,20 @@ model Review {
 }
 
 model Comment {
-  id              String    @id @default(uuid())
-  changeId        String
-  userId          String
-  parentId        String?   // For nested comments
-  content         String    @db.Text
-  mentions        String[]  // User IDs mentioned
-  isResolved      Boolean   @default(false)
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
+  id         String   @id @default(uuid())
+  changeId   String
+  userId     String
+  parentId   String? // For nested comments
+  content    String   @db.Text
+  mentions   String[] // User IDs mentioned
+  isResolved Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
 
-  change          Change    @relation(fields: [changeId], references: [id], onDelete: Cascade)
-  user            User      @relation(fields: [userId], references: [id])
-  parent          Comment?  @relation("CommentThread", fields: [parentId], references: [id])
-  replies         Comment[] @relation("CommentThread")
+  change  Change    @relation(fields: [changeId], references: [id], onDelete: Cascade)
+  user    User      @relation(fields: [userId], references: [id])
+  parent  Comment?  @relation("CommentThread", fields: [parentId], references: [id])
+  replies Comment[] @relation("CommentThread")
 
   @@index([changeId])
   @@index([userId])
@@ -465,25 +468,47 @@ model Comment {
 // ========================================
 
 model Sandbox {
-  id              String    @id @default(uuid())
-  organizationId  String
-  createdById     String
-  name            String
-  description     String?
-  status          String    @default("PROVISIONING") // PROVISIONING, ACTIVE, SUSPENDED, EXPIRED, FAILED, DELETED
-  environment     Json      // Platform-specific environment details
-  expiresAt       DateTime?
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
+  id             String    @id @default(uuid())
+  organizationId String
+  createdById    String
+  name           String
+  description    String?
+  status         String    @default("PROVISIONING") // PROVISIONING, ACTIVE, SUSPENDED, EXPIRED, FAILED, DELETED
+  environment    Json // Platform-specific environment details
+  expiresAt      DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
 
-  organization    Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  createdBy       User         @relation(fields: [createdById], references: [id])
+  organization Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  createdBy    User           @relation(fields: [createdById], references: [id])
+  clones       SandboxClone[]
 
   @@index([organizationId])
   @@index([createdById])
   @@index([status])
   @@index([expiresAt])
   @@map("sandboxes")
+}
+
+// Track sandbox clones to enforce limits (max 3 clones per source app)
+model SandboxClone {
+  id             String   @id @default(uuid())
+  sourceAppId    String // ID of the original app in LDV-Bridge (from apps table)
+  sandboxId      String // ID of the sandbox containing the cloned app
+  clonedAppId    String // External platform app ID of the clone (e.g., Mendix app ID)
+  organizationId String
+  createdById    String
+  createdAt      DateTime @default(now())
+
+  sourceApp    App          @relation(fields: [sourceAppId], references: [id], onDelete: Cascade)
+  sandbox      Sandbox      @relation(fields: [sandboxId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  createdBy    User         @relation(fields: [createdById], references: [id])
+
+  @@index([sourceAppId])
+  @@index([sandboxId])
+  @@index([organizationId])
+  @@map("sandbox_clones")
 }
 
 // ========================================
@@ -499,19 +524,19 @@ enum DeploymentStatus {
 }
 
 model Deployment {
-  id              String           @id @default(uuid())
-  changeId        String
-  environment     String           // dev, staging, production
-  status          DeploymentStatus @default(PENDING)
-  triggeredBy     String?          // User ID or system
-  startedAt       DateTime?
-  completedAt     DateTime?
-  logs            String?          @db.Text
-  metadata        Json?
-  createdAt       DateTime         @default(now())
-  updatedAt       DateTime         @updatedAt
+  id          String           @id @default(uuid())
+  changeId    String
+  environment String // dev, staging, production
+  status      DeploymentStatus @default(PENDING)
+  triggeredBy String? // User ID or system
+  startedAt   DateTime?
+  completedAt DateTime?
+  logs        String?          @db.Text
+  metadata    Json?
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
 
-  change          Change           @relation(fields: [changeId], references: [id], onDelete: Cascade)
+  change Change @relation(fields: [changeId], references: [id], onDelete: Cascade)
 
   @@index([changeId])
   @@index([status])
@@ -519,16 +544,16 @@ model Deployment {
 }
 
 model GitCommit {
-  id              String    @id @default(uuid())
-  changeId        String
-  repository      String
-  branch          String
-  commitSha       String
-  commitMessage   String
-  commitUrl       String?
-  createdAt       DateTime  @default(now())
+  id            String   @id @default(uuid())
+  changeId      String
+  repository    String
+  branch        String
+  commitSha     String
+  commitMessage String
+  commitUrl     String?
+  createdAt     DateTime @default(now())
 
-  change          Change    @relation(fields: [changeId], references: [id], onDelete: Cascade)
+  change Change @relation(fields: [changeId], references: [id], onDelete: Cascade)
 
   @@index([changeId])
   @@map("git_commits")
@@ -539,17 +564,17 @@ model GitCommit {
 // ========================================
 
 model Policy {
-  id              String    @id @default(uuid())
-  organizationId  String
-  name            String
-  description     String?   @db.Text
-  rules           Json      // JSON rule definitions
-  isActive        Boolean   @default(true)
-  scope           String?   // app, team, organization
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
+  id             String   @id @default(uuid())
+  organizationId String
+  name           String
+  description    String?  @db.Text
+  rules          Json // JSON rule definitions
+  isActive       Boolean  @default(true)
+  scope          String? // app, team, organization
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
 
-  organization    Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
 
   @@index([organizationId])
   @@map("policies")
@@ -572,17 +597,17 @@ enum NotificationType {
 }
 
 model Notification {
-  id              String           @id @default(uuid())
-  userId          String
-  type            NotificationType
-  title           String
-  message         String           @db.Text
-  data            Json?            // Additional notification data
-  isRead          Boolean          @default(false)
-  readAt          DateTime?
-  createdAt       DateTime         @default(now())
+  id        String           @id @default(uuid())
+  userId    String
+  type      NotificationType
+  title     String
+  message   String           @db.Text
+  data      Json? // Additional notification data
+  isRead    Boolean          @default(false)
+  readAt    DateTime?
+  createdAt DateTime         @default(now())
 
-  user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
   @@index([isRead])
@@ -608,19 +633,19 @@ enum AuditAction {
 }
 
 model AuditLog {
-  id              String      @id @default(uuid())
-  organizationId  String
-  userId          String?
-  action          AuditAction
-  entityType      String      // app, change, user, etc.
-  entityId        String?
-  details         Json?       // Action details
-  ipAddress       String?
-  userAgent       String?
-  timestamp       DateTime    @default(now())
+  id             String      @id @default(uuid())
+  organizationId String
+  userId         String?
+  action         AuditAction
+  entityType     String // app, change, user, etc.
+  entityId       String?
+  details        Json? // Action details
+  ipAddress      String?
+  userAgent      String?
+  timestamp      DateTime    @default(now())
 
-  organization    Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  user            User?        @relation(fields: [userId], references: [id])
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User?        @relation(fields: [userId], references: [id])
 
   @@index([organizationId])
   @@index([userId])
@@ -634,12 +659,12 @@ model AuditLog {
 // ========================================
 
 model AnalyticsMetric {
-  id              String    @id @default(uuid())
-  organizationId  String?
-  metricType      String    // review_time, approval_rate, etc.
-  metricValue     Float
-  dimensions      Json?     // Additional dimensions
-  timestamp       DateTime  @default(now())
+  id             String   @id @default(uuid())
+  organizationId String?
+  metricType     String // review_time, approval_rate, etc.
+  metricValue    Float
+  dimensions     Json? // Additional dimensions
+  timestamp      DateTime @default(now())
 
   @@index([organizationId])
   @@index([metricType])
@@ -652,20 +677,19 @@ model AnalyticsMetric {
 // ========================================
 
 model Tutorial {
-  id              String    @id @default(uuid())
-  title           String
-  slug            String    @unique
-  content         String    @db.Text // Markdown content
-  category        String
-  tags            String[]
-  difficulty      String    // beginner, intermediate, advanced
-  estimatedTime   Int?      // minutes
-  isPublished     Boolean   @default(false)
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
+  id            String   @id @default(uuid())
+  title         String
+  slug          String   @unique
+  content       String   @db.Text // Markdown content
+  category      String
+  tags          String[]
+  difficulty    String // beginner, intermediate, advanced
+  estimatedTime Int? // minutes
+  isPublished   Boolean  @default(false)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
 
   @@index([category])
   @@index([isPublished])
   @@map("tutorials")
 }
-

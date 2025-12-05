@@ -22,7 +22,7 @@ export class PowerAppsProvisioner implements IEnvironmentProvisioner {
   private readonly MAX_PROVISION_WAIT_TIME = 10 * 60 * 1000; // 10 minutes
   private readonly POLL_INTERVAL = 30 * 1000; // 30 seconds
 
-  constructor(private readonly powerAppsService: PowerAppsService) {}
+  constructor(private readonly powerAppsService: PowerAppsService) { }
 
   /**
    * Provision a new PowerApps environment
@@ -34,7 +34,7 @@ export class PowerAppsProvisioner implements IEnvironmentProvisioner {
     config: PowerAppsEnvironmentConfig | MendixSandboxConfig,
   ): Promise<EnvironmentDetails> {
     const powerAppsConfig = config as PowerAppsEnvironmentConfig;
-    
+
     this.logger.log(
       `Provisioning PowerApps environment "${powerAppsConfig.displayName}" in ${powerAppsConfig.region}`,
     );
@@ -48,6 +48,7 @@ export class PowerAppsProvisioner implements IEnvironmentProvisioner {
           name: powerAppsConfig.displayName,
           region: powerAppsConfig.region,
           type: powerAppsConfig.environmentType || 'Sandbox',
+          sourceAppId: powerAppsConfig.sourceAppId, // Pass sourceAppId for cloning
         },
       );
 
@@ -73,6 +74,8 @@ export class PowerAppsProvisioner implements IEnvironmentProvisioner {
         environmentId,
         environmentUrl,
         region: powerAppsConfig.region,
+        appId: environment.appId, // Return cloned app ID if cloning occurred
+        isCloned: environment.isCloned, // Return whether this was a clone
         metadata: {
           sku: powerAppsConfig.environmentType || 'Sandbox',
           currency: powerAppsConfig.currencyCode || 'USD',
@@ -174,7 +177,7 @@ export class PowerAppsProvisioner implements IEnvironmentProvisioner {
         organizationId,
         environmentId,
       );
-      
+
       // Map PowerApps states to our provisioning statuses
       const stateMapping: Record<string, ProvisioningStatus> = {
         Provisioning: ProvisioningStatus.IN_PROGRESS,
@@ -218,7 +221,7 @@ export class PowerAppsProvisioner implements IEnvironmentProvisioner {
       this.logger.error(
         `Failed to get resource usage for ${environmentId}: ${error.message}`,
       );
-      
+
       // Return zeros if we can't get usage data
       return {
         appsCount: 0,
@@ -331,7 +334,7 @@ export class PowerAppsProvisioner implements IEnvironmentProvisioner {
         if (error.message === 'Environment provisioning failed') {
           throw error;
         }
-        
+
         // If we can't get status, continue polling
         this.logger.warn(
           `Failed to get status on attempt ${attempts + 1}: ${error.message}`,
@@ -352,12 +355,12 @@ export class PowerAppsProvisioner implements IEnvironmentProvisioner {
   private buildEnvironmentUrl(environmentId: string, region: string): string {
     // PowerApps maker portal URL format
     const regionPrefix = region.toLowerCase().replace(/\s+/g, '');
-    
+
     // Most regions use the standard format
     if (region === 'unitedstates' || region === 'preview') {
       return `https://make.powerapps.com/environments/${environmentId}`;
     }
-    
+
     // Regional URLs
     return `https://make.${regionPrefix}.powerapps.com/environments/${environmentId}`;
   }

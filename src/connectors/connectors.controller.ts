@@ -33,7 +33,7 @@ export class ConnectorsController {
   constructor(
     private tokenManager: TokenManagerService,
     private oauthService: OAuthService,
-  ) {}
+  ) { }
 
   @Post('initiate')
   @ApiOperation({

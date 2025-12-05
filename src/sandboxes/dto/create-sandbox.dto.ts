@@ -58,6 +58,14 @@ export class CreateSandboxDto {
   expiresAt?: string;
 
   @ApiPropertyOptional({
+    description: 'Source app ID to clone from (must be a synced app in LDV-Bridge). If provided, creates a clone of the existing app instead of a new app from template.',
+    example: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+  })
+  @IsString()
+  @IsOptional()
+  sourceAppId?: string;
+
+  @ApiPropertyOptional({
     description: 'Platform-specific configuration (PowerApps or Mendix specific settings)',
     example: {
       region: 'unitedstates',

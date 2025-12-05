@@ -584,6 +584,69 @@ export class PowerAppsService implements IBaseConnector {
     }
   }
 
+  /**
+   * Copy/Clone a PowerApps app
+   * Creates a copy of an existing app in a target environment
+   * @param userId User ID
+   * @param organizationId Organization ID
+   * @param sourceAppId Source app ID to clone
+   * @param targetEnvironmentId Target environment ID
+   * @param newDisplayName Display name for the cloned app
+   */
+  async copyApp(
+    userId: string,
+    organizationId: string,
+    sourceAppId: string,
+    targetEnvironmentId: string,
+    newDisplayName: string,
+  ): Promise<{
+    appId: string;
+    name: string;
+    displayName: string;
+  }> {
+    try {
+      this.logger.log(
+        `Copying PowerApp ${sourceAppId} to environment ${targetEnvironmentId}`,
+      );
+
+      const client = await this.getAuthenticatedClient(userId, organizationId);
+
+      // Use PowerApps Copy API
+      const response = await client.post(
+        `${this.powerAppsApiUrl}/apps/${sourceAppId}?api-version=2016-11-01`,
+        {
+          targetEnvironmentName: targetEnvironmentId,
+          displayName: newDisplayName,
+        },
+        {
+          headers: {
+            'Content-Type': 'application/json',
+          },
+        },
+      );
+
+      const copiedApp = response.data;
+
+      this.logger.log(
+        `Successfully copied app to ${copiedApp.name} in environment ${targetEnvironmentId}`,
+      );
+
+      return {
+        appId: copiedApp.name,
+        name: copiedApp.name,
+        displayName: copiedApp.properties?.displayName || newDisplayName,
+      };
+    } catch (error) {
+      this.logger.error(
+        `Failed to copy PowerApp: ${error.message}`,
+        error.stack,
+      );
+      throw new BadRequestException(
+        `Failed to copy app: ${error.message}`,
+      );
+    }
+  }
+
   // ==================== SANDBOX MANAGEMENT METHODS ====================
 
   /**
@@ -600,11 +663,14 @@ export class PowerAppsService implements IBaseConnector {
       description?: string;
       region?: string;
       type?: 'Developer' | 'Production' | 'Sandbox' | 'Trial';
+      sourceAppId?: string; // Optional: Clone an existing app into this environment
     },
   ): Promise<{
     environmentId: string;
     environmentUrl: string;
     status: string;
+    appId?: string; // If app was cloned, return the new app ID
+    isCloned?: boolean;
   }> {
     try {
       this.logger.log(`Creating PowerApps environment: ${config.name}`);
@@ -626,11 +692,52 @@ export class PowerAppsService implements IBaseConnector {
       );
 
       const environment = response.data;
+      const environmentId = environment.name;
+
+      // If sourceAppId is provided, clone the app into the new environment
+      let clonedAppId: string | undefined;
+      let isCloned = false;
+
+      if (config.sourceAppId) {
+        this.logger.log(
+          `Cloning app ${config.sourceAppId} into new environment ${environmentId}`,
+        );
+
+        // Auto-prefix the app name with "Sandbox - "
+        const clonedAppName = config.name.startsWith('Sandbox - ')
+          ? config.name
+          : `Sandbox - ${config.name}`;
+
+        try {
+          const copiedApp = await this.copyApp(
+            userId,
+            organizationId,
+            config.sourceAppId,
+            environmentId,
+            clonedAppName,
+          );
+
+          clonedAppId = copiedApp.appId;
+          isCloned = true;
+
+          this.logger.log(
+            `Successfully cloned app ${config.sourceAppId} to ${clonedAppId}`,
+          );
+        } catch (error) {
+          this.logger.error(
+            `Failed to clone app into environment: ${error.message}`,
+          );
+          // Don't fail the entire provisioning - environment was created successfully
+          // The clone failure will be logged and can be retried
+        }
+      }
 
       return {
-        environmentId: environment.name,
-        environmentUrl: `https://admin.powerplatform.microsoft.com/environments/${environment.name}`,
+        environmentId,
+        environmentUrl: `https://admin.powerplatform.microsoft.com/environments/${environmentId}`,
         status: environment.properties?.provisioningState || 'Succeeded',
+        appId: clonedAppId,
+        isCloned,
       };
     } catch (error) {
       this.logger.error(`Failed to create environment: ${error.message}`, error.stack);

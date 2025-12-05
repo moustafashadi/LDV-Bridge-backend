@@ -612,29 +612,58 @@ export class MendixService implements IBaseConnector {
       appId?: string;
       template?: string;
       mendixVersion?: string;
+      sourceAppId?: string; // If provided, clone existing app instead of creating new
     },
   ): Promise<{
     environmentId: string;
     environmentUrl: string;
     status: string;
+    appId: string;
+    isCloned: boolean;
   }> {
     try {
       this.logger.log(`Creating Mendix sandbox: ${config.name}`);
 
       const client = await this.getAuthenticatedClient(userId, organizationId);
 
-      // Create a new app (which includes a free sandbox environment)
-      const response = await client.post(
-        `${this.mendixConfig.buildApiUrl}/apps`,
-        {
-          name: config.name,
-          projectId: config.appId || null,
-          templateId: config.template || null,
-          mendixVersion: config.mendixVersion || null,
-        },
-      );
+      let app: any;
+      let isCloned = false;
 
-      const app = response.data;
+      // If sourceAppId provided, clone existing app
+      if (config.sourceAppId) {
+        this.logger.log(`Cloning app from sourceAppId: ${config.sourceAppId}`);
+        
+        // Auto-prefix the name with "Sandbox - "
+        const cloneName = config.name.startsWith('Sandbox - ') 
+          ? config.name 
+          : `Sandbox - ${config.name}`;
+
+        // Clone the existing app
+        const cloneResponse = await client.post(
+          `${this.mendixConfig.buildApiUrl}/apps/${config.sourceAppId}/clone`,
+          {
+            name: cloneName,
+          },
+        );
+
+        app = cloneResponse.data;
+        isCloned = true;
+        this.logger.log(`Successfully cloned app: ${app.appId}`);
+      } else {
+        // Create a new app (which includes a free sandbox environment)
+        const response = await client.post(
+          `${this.mendixConfig.buildApiUrl}/apps`,
+          {
+            name: config.name,
+            projectId: config.appId || null,
+            templateId: config.template || null,
+            mendixVersion: config.mendixVersion || null,
+          },
+        );
+
+        app = response.data;
+        this.logger.log(`Successfully created new app: ${app.appId}`);
+      }
 
       // Get the default environment (sandbox)
       const envResponse = await client.get(
@@ -651,6 +680,8 @@ export class MendixService implements IBaseConnector {
         environmentId: sandboxEnv.environmentId,
         environmentUrl: sandboxEnv.url || '',
         status: sandboxEnv.status || 'Stopped',
+        appId: app.appId,
+        isCloned,
       };
     } catch (error) {
       this.logger.error(`Failed to create sandbox: ${error.message}`, error.stack);

@@ -37,6 +37,7 @@ export class MendixProvisioner implements IEnvironmentProvisioner {
           name: config.name,
           template: config.template,
           mendixVersion: config.mendixVersion,
+          sourceAppId: config.sourceAppId, // Pass sourceAppId for cloning
         },
       );
 
@@ -44,6 +45,8 @@ export class MendixProvisioner implements IEnvironmentProvisioner {
         environmentId: sandbox.environmentId,
         environmentUrl: sandbox.environmentUrl,
         region: 'free-tier', // Mendix free sandboxes don't specify region
+        appId: sandbox.appId, // Return external app ID
+        isCloned: sandbox.isCloned, // Return whether this was a clone
         metadata: {
           mode: config.mode,
           mendixVersion: config.mendixVersion,
