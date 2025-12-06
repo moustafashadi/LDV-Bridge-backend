@@ -124,9 +124,10 @@ export class SandboxesService {
     }) as any as SandboxWithRelations;
 
     // Audit log
-    await (this.auditService as any).log({
+    await this.auditService.createAuditLog({
       userId,
-      action: 'CREATE_SANDBOX',
+      organizationId,
+      action: 'CREATE',
       entityType: 'sandbox',
       entityId: sandbox.id,
       details: { name: dto.name, platform: dto.platform, type: dto.type },
