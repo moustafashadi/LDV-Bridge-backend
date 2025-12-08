@@ -1,6 +1,7 @@
-import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException, Inject, forwardRef } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../common/audit/audit.service';
+import { ChangesGateway } from './changes.gateway';
 import { CreateChangeDto } from './dto/create-change.dto';
 import { UpdateChangeDto } from './dto/update-change.dto';
 import {
@@ -22,6 +23,8 @@ export class ChangesService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly auditService: AuditService,
+    @Inject(forwardRef(() => ChangesGateway))
+    private readonly changesGateway: ChangesGateway,
     private readonly jsonDiffService: JsonDiffService,
     private readonly impactAnalyzer: ImpactAnalyzerService,
     private readonly policyRiskEvaluator: PolicyRiskEvaluatorService,
@@ -92,19 +95,26 @@ export class ChangesService {
       const changeType = this.determineChangeType(diffSummary);
 
       // Create change record
+      // Note: authorId can be null for system-detected changes
+      const changeData: any = {
+        organizationId,
+        appId,
+        title: `Auto-detected changes from sync on ${new Date().toLocaleString()}`,
+        description: `Detected ${diffSummary.totalChanges} changes: ${diffSummary.added} added, ${diffSummary.modified} modified, ${diffSummary.deleted} deleted`,
+        changeType,
+        status: 'DRAFT',
+        beforeMetadata,
+        afterMetadata,
+        diffSummary,
+      };
+
+      // Only set authorId if it's a valid user (not 'system')
+      if (userId && userId !== 'system') {
+        changeData.authorId = userId;
+      }
+
       const change = await this.prisma.change.create({
-        data: {
-          organizationId,
-          appId,
-          authorId: userId, // "system" for auto-detected
-          title: `Auto-detected changes from sync on ${new Date().toLocaleString()}`,
-          description: `Detected ${diffSummary.totalChanges} changes: ${diffSummary.added} added, ${diffSummary.modified} modified, ${diffSummary.deleted} deleted`,
-          changeType,
-          status: 'DRAFT',
-          beforeMetadata,
-          afterMetadata,
-          diffSummary,
-        },
+        data: changeData,
         include: {
           app: {
             select: {
@@ -149,6 +159,58 @@ export class ChangesService {
       };
     } catch (error) {
       this.logger.error(`Failed to detect changes: ${error.message}`, error.stack);
+      throw error;
+    }
+  }
+
+  /**
+   * Manually sync changes from a sandbox environment
+   */
+  async syncSandbox(
+    sandboxId: string,
+    userId: string,
+    organizationId: string,
+  ): Promise<{ success: boolean; message: string; changeCount: number }> {
+    try {
+      this.logger.log(`Starting manual sync for sandbox ${sandboxId}`);
+
+      // Get sandbox details
+      const sandbox = await this.prisma.sandbox.findUnique({
+        where: {
+          id: sandboxId,
+          organizationId,
+        },
+      });
+
+      if (!sandbox) {
+        throw new NotFoundException(`Sandbox ${sandboxId} not found`);
+      }
+
+      // Emit sync started event
+      this.changesGateway.emitSyncStarted(sandboxId);
+
+      // Get the appId from sandbox (if linked)
+      const appId = (sandbox as any).appId || (sandbox.environment as any)?.appId;
+
+      if (!appId) {
+        throw new NotFoundException(`Sandbox ${sandboxId} is not linked to an app`);
+      }
+
+      // Detect changes for the app
+      const result = await this.detectChanges(appId, userId, organizationId);
+
+      // Emit sync completed event
+      this.changesGateway.emitSyncCompleted(sandboxId, result.totalChanges);
+
+      this.logger.log(`Manual sync completed for sandbox ${sandboxId}: ${result.totalChanges} changes`);
+
+      return {
+        success: true,
+        message: `Sync completed. ${result.totalChanges} changes detected.`,
+        changeCount: result.totalChanges,
+      };
+    } catch (error) {
+      this.logger.error(`Failed to sync sandbox ${sandboxId}: ${error.message}`, error.stack);
       throw error;
     }
   }
@@ -370,6 +432,7 @@ export class ChangesService {
       changeType?: ChangeType;
       page?: number;
       limit?: number;
+      includeDeleted?: boolean; // New filter to include soft-deleted changes
     },
   ): Promise<PaginatedChangesResponseDto> {
     const page = filters.page || 1;
@@ -379,6 +442,11 @@ export class ChangesService {
     const where: any = {
       organizationId,
     };
+
+    // Exclude soft-deleted changes by default
+    if (!filters.includeDeleted) {
+      where.deletedAt = null;
+    }
 
     if (filters.appId) {
       where.appId = filters.appId;
@@ -579,6 +647,145 @@ export class ChangesService {
     });
 
     this.logger.log(`Deleted change ${id}`);
+  }
+
+  /**
+   * Undo (soft delete) a change
+   */
+  async undo(id: string, userId: string, organizationId: string): Promise<ChangeResponseDto> {
+    // Verify change exists and is not already deleted
+    const change = await this.prisma.change.findUnique({
+      where: {
+        id,
+        organizationId,
+      },
+    });
+
+    if (!change) {
+      throw new NotFoundException(`Change ${id} not found`);
+    }
+
+    if (change.deletedAt) {
+      throw new NotFoundException(`Change ${id} is already undone`);
+    }
+
+    // Soft delete the change
+    const updatedChange = await this.prisma.change.update({
+      where: {
+        id,
+        organizationId,
+      },
+      data: {
+        deletedAt: new Date(),
+        deletedBy: userId,
+      },
+      include: {
+        app: {
+          select: {
+            id: true,
+            name: true,
+            platform: true,
+          },
+        },
+        author: {
+          select: {
+            id: true,
+            email: true,
+            displayName: true,
+          },
+        },
+        deletedByUser: {
+          select: {
+            id: true,
+            email: true,
+            displayName: true,
+          },
+        },
+      },
+    });
+
+    // Audit log
+    await this.auditService.createAuditLog({
+      organizationId,
+      userId,
+      action: 'UNDO',
+      entityType: 'change',
+      entityId: id,
+      details: {
+        appId: change.appId,
+        title: change.title,
+      },
+    });
+
+    this.logger.log(`Change ${id} undone by user ${userId}`);
+
+    return this.mapToResponseDto(updatedChange);
+  }
+
+  /**
+   * Restore (undelete) a change
+   */
+  async restore(id: string, userId: string, organizationId: string): Promise<ChangeResponseDto> {
+    // Verify change exists and is deleted
+    const change = await this.prisma.change.findUnique({
+      where: {
+        id,
+        organizationId,
+      },
+    });
+
+    if (!change) {
+      throw new NotFoundException(`Change ${id} not found`);
+    }
+
+    if (!change.deletedAt) {
+      throw new NotFoundException(`Change ${id} is not undone, cannot restore`);
+    }
+
+    // Restore the change
+    const restoredChange = await this.prisma.change.update({
+      where: {
+        id,
+        organizationId,
+      },
+      data: {
+        deletedAt: null,
+        deletedBy: null,
+      },
+      include: {
+        app: {
+          select: {
+            id: true,
+            name: true,
+            platform: true,
+          },
+        },
+        author: {
+          select: {
+            id: true,
+            email: true,
+            displayName: true,
+          },
+        },
+      },
+    });
+
+    // Audit log
+    await this.auditService.createAuditLog({
+      organizationId,
+      userId,
+      action: 'RESTORE',
+      entityType: 'change',
+      entityId: id,
+      details: {
+        appId: change.appId,
+        title: change.title,
+      },
+    });
+
+    this.logger.log(`Change ${id} restored by user ${userId}`);
+
+    return this.mapToResponseDto(restoredChange);
   }
 
   /**

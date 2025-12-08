@@ -16,6 +16,7 @@ import {
 import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth, ApiQuery } from '@nestjs/swagger';
 import type { Response } from 'express';
 import { PowerAppsService } from './powerapps.service';
+import { OAuthService } from '../services/oauth.service';
 import { CurrentUser } from '../../auth/decorators/current-user.decorator';
 import type { AuthenticatedUser } from '../../auth/interfaces/authenticated-user.interface';
 import { OnboardedGuard } from 'src/auth/guards/onboarded.guard';
@@ -26,7 +27,10 @@ import { Public } from 'src/auth/decorators/public.decorator';
 export class PowerAppsController {
   private readonly logger = new Logger(PowerAppsController.name);
 
-  constructor(private readonly powerAppsService: PowerAppsService) { }
+  constructor(
+    private readonly powerAppsService: PowerAppsService,
+    private readonly oauthService: OAuthService,
+  ) { }
 
   @Post('connect')
   @ApiOperation({ summary: 'Initiate PowerApps OAuth connection' })
@@ -40,7 +44,11 @@ export class PowerAppsController {
       throw new UnauthorizedException('User must complete onboarding before connecting platforms');
     }
 
-    const authorizationUrl = await this.powerAppsService.initiateOAuth(user.id, user.organizationId);
+    const authorizationUrl = await this.powerAppsService.initiateOAuth(
+      user.id, 
+      user.organizationId, 
+      user.role || undefined
+    );
 
     return {
       success: true,
@@ -52,28 +60,70 @@ export class PowerAppsController {
   @Get('callback')
   @Public() // OAuth callback must be public - no authentication required
   @ApiOperation({ summary: 'Handle OAuth callback from Microsoft' })
-  @ApiQuery({ name: 'code', required: true, description: 'Authorization code' })
+  @ApiQuery({ name: 'code', required: false, description: 'Authorization code' })
+  @ApiQuery({ name: 'error', required: false, description: 'Error code' })
+  @ApiQuery({ name: 'error_description', required: false, description: 'Error description' })
   @ApiQuery({ name: 'state', required: true, description: 'State parameter' })
   @ApiResponse({ status: 200, description: 'Connection successful' })
   async handleCallback(
     @Query('code') code: string,
+    @Query('error') error: string,
+    @Query('error_description') errorDescription: string,
     @Query('state') state: string,
     @Res() res: Response,
   ) {
     try {
       this.logger.log('Processing PowerApps OAuth callback');
 
+      // Parse state to get user role for redirect
+      const { userRole } = this.oauthService.parseState(state);
+      let redirectPath = '/admin/connectors'; // Default
+      
+      if (userRole === 'CITIZEN_DEVELOPER') {
+        redirectPath = '/citizen-developer/connectors';
+      } else if (userRole === 'PRO_DEVELOPER') {
+        redirectPath = '/pro-developer/connectors';
+      }
+
+      // Check if Microsoft returned an error
+      if (error) {
+        this.logger.error(`OAuth error from Microsoft: ${error} - ${errorDescription}`);
+        const errorMsg = errorDescription || error;
+        return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}${redirectPath}?status=error&message=${encodeURIComponent(errorMsg)}`);
+      }
+
+      // No code means OAuth flow wasn't completed
+      if (!code) {
+        return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}${redirectPath}?status=error&message=${encodeURIComponent('No authorization code received')}`);
+      }
+
       const token = await this.powerAppsService.completeOAuth(code, state);
 
       if (token) {
+        this.logger.log(`OAuth successful, redirecting user with role ${userRole} to ${redirectPath}`);
+        
         // Redirect to frontend success page
-        return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/admin/connectors?status=success&platform=powerapps`);
+        return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}${redirectPath}?status=success&platform=powerapps`);
       } else {
-        return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/admin/connectors?status=error&message=${encodeURIComponent('Failed to complete OAuth flow')}`);
+        return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}${redirectPath}?status=error&message=${encodeURIComponent('Failed to complete OAuth flow')}`);
       }
     } catch (error) {
       this.logger.error('OAuth callback error:', error);
-      return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/admin/connectors?status=error&message=${encodeURIComponent(error.message)}`);
+      
+      // Try to parse state for redirect path even in error case
+      let redirectPath = '/admin/connectors';
+      try {
+        const { userRole } = this.oauthService.parseState(state);
+        if (userRole === 'CITIZEN_DEVELOPER') {
+          redirectPath = '/citizen-developer/connectors';
+        } else if (userRole === 'PRO_DEVELOPER') {
+          redirectPath = '/pro-developer/connectors';
+        }
+      } catch (e) {
+        // If state parsing fails, use default
+      }
+      
+      return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}${redirectPath}?status=error&message=${encodeURIComponent(error.message)}`);
     }
   }
 

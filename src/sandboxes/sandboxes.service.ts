@@ -173,16 +173,39 @@ export class SandboxesService {
       }
 
       // Prepare platform-specific config
-      const config = this.preparePlatformConfig(dto, organizationId);
+      const config = this.preparePlatformConfig(dto, userId, organizationId);
 
       // Provision environment
       const envDetails = await provisioner.provision(config);
+
+      // Find or create the App record for this sandbox's external app
+      let appRecord: { id: string } | null = null;
+      if (envDetails.appId) {
+        // Try to find existing app by external ID
+        appRecord = await this.prisma.app.findFirst({
+          where: {
+            externalId: envDetails.appId,
+            organizationId,
+          },
+          select: {
+            id: true,
+          },
+        });
+
+        // If not found, we'll need to sync it first (this shouldn't happen normally)
+        if (!appRecord) {
+          this.logger.warn(
+            `App with externalId ${envDetails.appId} not found for sandbox ${sandboxId}. This app needs to be synced first.`,
+          );
+        }
+      }
 
       // Update sandbox with environment details
       await this.prisma.sandbox.update({
         where: { id: sandboxId },
         data: {
           status: SandboxStatus.ACTIVE,
+          appId: appRecord?.id || null, // Link to internal App record ID
           environment: {
             ...(await this.getSandboxEnvironment(sandboxId)),
             provisioningStatus: ProvisioningStatus.COMPLETED,
@@ -191,7 +214,7 @@ export class SandboxesService {
             region: envDetails.region,
             metadata: {
               ...envDetails.metadata,
-              appId: envDetails.appId, // Store external app ID
+              externalAppId: envDetails.appId, // Store external app ID in metadata for reference
               isCloned: envDetails.isCloned || false,
             },
           },
@@ -782,10 +805,13 @@ export class SandboxesService {
    */
   private preparePlatformConfig(
     dto: CreateSandboxDto,
+    userId: string,
     organizationId: string,
   ): any {
     if (dto.platform === SandboxPlatform.POWERAPPS) {
       return {
+        userId,
+        organizationId,
         displayName: `Sandbox: ${dto.name}`,
         environmentType: 'Developer',
         region: dto.platformConfig?.region || 'unitedstates',
@@ -794,6 +820,8 @@ export class SandboxesService {
       };
     } else {
       return {
+        userId,
+        organizationId,
         name: dto.name,
         template: dto.platformConfig?.template || 'blank',
         mode: 'sandbox',

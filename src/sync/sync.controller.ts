@@ -32,7 +32,7 @@ import { PlatformType, SyncStatus } from '@prisma/client';
 @ApiTags('Sync')
 @ApiBearerAuth()
 @UseGuards(JwtAuthGuard, RolesGuard)
-@Controller('api/v1/sync')
+@Controller('sync')
 export class SyncController {
   constructor(private readonly syncService: SyncService) {}
 

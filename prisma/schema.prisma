@@ -77,6 +77,7 @@ model User {
   appPermissions     AppPermission[]  @relation("UserAppAccess")
   grantedPermissions AppPermission[]  @relation("GrantedBy")
   changes            Change[]         @relation("ChangeAuthor")
+  deletedChanges     Change[]         @relation("ChangeDeleter")
   reviews            Review[]         @relation("Reviewer")
   comments           Comment[]
   notifications      Notification[]
@@ -237,6 +238,7 @@ model App {
   components    Component[]
   changes       Change[]
   syncHistory   SyncHistory[]
+  sandboxes     Sandbox[]         @relation("SandboxApp")
   sandboxClones SandboxClone[]
 
   @@unique([organizationId, externalId, platform])
@@ -392,11 +394,14 @@ model Change {
   riskScore      Int? // 0-100
   riskAssessment Json? // Risk analysis details
   submittedAt    DateTime?
+  deletedAt      DateTime? // Soft delete timestamp
+  deletedBy      String? // User who deleted/undid the change
   createdAt      DateTime     @default(now())
   updatedAt      DateTime     @updatedAt
 
   app         App          @relation(fields: [appId], references: [id], onDelete: Cascade)
   author      User         @relation("ChangeAuthor", fields: [authorId], references: [id])
+  deletedByUser User?      @relation("ChangeDeleter", fields: [deletedBy], references: [id])
   reviews     Review[]
   comments    Comment[]
   deployments Deployment[]
@@ -406,6 +411,7 @@ model Change {
   @@index([appId])
   @@index([authorId])
   @@index([status])
+  @@index([deletedAt])
   @@map("changes")
 }
 
@@ -471,20 +477,23 @@ model Sandbox {
   id             String    @id @default(uuid())
   organizationId String
   createdById    String
+  appId          String? // ID of the app in LDV-Bridge (for tracking changes)
   name           String
   description    String?
   status         String    @default("PROVISIONING") // PROVISIONING, ACTIVE, SUSPENDED, EXPIRED, FAILED, DELETED
-  environment    Json // Platform-specific environment details
+  environment    Json // Platform-specific environment details (includes external environmentId, appId)
   expiresAt      DateTime?
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
 
   organization Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   createdBy    User           @relation(fields: [createdById], references: [id])
+  app          App?           @relation("SandboxApp", fields: [appId], references: [id], onDelete: SetNull)
   clones       SandboxClone[]
 
   @@index([organizationId])
   @@index([createdById])
+  @@index([appId])
   @@index([status])
   @@index([expiresAt])
   @@map("sandboxes")
@@ -622,6 +631,8 @@ enum AuditAction {
   CREATE
   UPDATE
   DELETE
+  UNDO
+  RESTORE
   APPROVE
   REJECT
   DEPLOY

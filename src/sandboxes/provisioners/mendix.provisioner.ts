@@ -1,5 +1,6 @@
 import { Injectable, Logger, BadRequestException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { PrismaService } from '../../prisma/prisma.service';
 import { MendixService } from '../../connectors/mendix/mendix.service';
 import {
   IEnvironmentProvisioner,
@@ -20,6 +21,7 @@ export class MendixProvisioner implements IEnvironmentProvisioner {
   constructor(
     private readonly mendixService: MendixService,
     private readonly configService: ConfigService,
+    private readonly prisma: PrismaService,
   ) {}
 
   /**
@@ -29,6 +31,32 @@ export class MendixProvisioner implements IEnvironmentProvisioner {
     this.logger.log(`Provisioning Mendix sandbox: ${config.name}`);
 
     try {
+      // If cloning, look up the external Mendix app ID
+      let externalAppId: string | undefined;
+      if (config.sourceAppId) {
+        this.logger.log(`Looking up external app ID for internal ID: ${config.sourceAppId}`);
+        
+        const sourceApp = await this.prisma.app.findUnique({
+          where: { id: config.sourceAppId },
+          select: { externalId: true, name: true },
+        });
+
+        if (!sourceApp) {
+          throw new BadRequestException(
+            `Source app with ID ${config.sourceAppId} not found`,
+          );
+        }
+
+        if (!sourceApp.externalId) {
+          throw new BadRequestException(
+            `Source app "${sourceApp.name}" does not have an external ID. Cannot clone.`,
+          );
+        }
+
+        externalAppId = sourceApp.externalId;
+        this.logger.log(`Found external app ID: ${externalAppId} for app "${sourceApp.name}"`);
+      }
+
       // Create sandbox via Mendix Cloud Portal API
       const sandbox = await this.mendixService.createSandbox(
         config.userId,
@@ -37,7 +65,7 @@ export class MendixProvisioner implements IEnvironmentProvisioner {
           name: config.name,
           template: config.template,
           mendixVersion: config.mendixVersion,
-          sourceAppId: config.sourceAppId, // Pass sourceAppId for cloning
+          sourceAppId: externalAppId, // Pass external Mendix app ID for cloning
         },
       );
 

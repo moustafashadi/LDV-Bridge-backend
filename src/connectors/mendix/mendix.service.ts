@@ -620,6 +620,7 @@ export class MendixService implements IBaseConnector {
     status: string;
     appId: string;
     isCloned: boolean;
+    metadata?: any;
   }> {
     try {
       this.logger.log(`Creating Mendix sandbox: ${config.name}`);
@@ -629,59 +630,145 @@ export class MendixService implements IBaseConnector {
       let app: any;
       let isCloned = false;
 
-      // If sourceAppId provided, clone existing app
+      // If sourceAppId provided, use the existing app's free environment as sandbox
       if (config.sourceAppId) {
-        this.logger.log(`Cloning app from sourceAppId: ${config.sourceAppId}`);
+        this.logger.log(`Using existing app as sandbox base: ${config.sourceAppId}`);
         
-        // Auto-prefix the name with "Sandbox - "
-        const cloneName = config.name.startsWith('Sandbox - ') 
-          ? config.name 
-          : `Sandbox - ${config.name}`;
-
-        // Clone the existing app
-        const cloneResponse = await client.post(
-          `${this.mendixConfig.buildApiUrl}/apps/${config.sourceAppId}/clone`,
-          {
-            name: cloneName,
-          },
-        );
-
-        app = cloneResponse.data;
-        isCloned = true;
-        this.logger.log(`Successfully cloned app: ${app.appId}`);
+        // Mendix doesn't support app cloning via API
+        // Instead, we'll just use the existing app's free environment
+        // The user can manually duplicate the app in Mendix Portal if needed
+        
+        // Verify the app exists and get its details
+        try {
+          const appResponse = await client.get(
+            `${this.mendixConfig.apiUrl}/apps/${config.sourceAppId}`,
+          );
+          
+          app = appResponse.data;
+          app.appId = config.sourceAppId; // Ensure appId is set
+          
+          this.logger.log(`Found app: ${app.name || config.sourceAppId}`);
+          this.logger.warn(
+            `Note: Mendix does not support app cloning via API. ` +
+            `This sandbox will reference the existing app "${app.name || config.sourceAppId}". ` +
+            `To create a true copy, please duplicate the app in Mendix Portal first.`
+          );
+        } catch (error) {
+          this.logger.error(`Failed to fetch Mendix app: ${error.response?.status} ${error.response?.statusText}`);
+          this.logger.error(`App endpoint: GET ${this.mendixConfig.apiUrl}/apps/${config.sourceAppId}`);
+          this.logger.error(`Error details: ${JSON.stringify(error.response?.data)}`);
+          
+          throw new BadRequestException(
+            `Unable to find Mendix app with ID "${config.sourceAppId}". ` +
+            `Please ensure the app exists and you have access to it. ` +
+            `Error: ${error.message}`
+          );
+        }
       } else {
-        // Create a new app (which includes a free sandbox environment)
-        const response = await client.post(
-          `${this.mendixConfig.buildApiUrl}/apps`,
-          {
-            name: config.name,
-            projectId: config.appId || null,
-            templateId: config.template || null,
-            mendixVersion: config.mendixVersion || null,
-          },
-        );
+        // Create a new app using Mendix Build API
+        // Note: This requires appropriate permissions on the Mendix PAT
+        this.logger.log(`Attempting to create new Mendix app`);
+        
+        try {
+          const response = await client.post(
+            `${this.mendixConfig.buildApiUrl}/apps`,
+            {
+              name: config.name,
+            },
+          );
 
-        app = response.data;
-        this.logger.log(`Successfully created new app: ${app.appId}`);
+          app = response.data;
+          this.logger.log(`Successfully created new app: ${JSON.stringify(app)}`);
+        } catch (error) {
+          this.logger.error(`Failed to create new Mendix app via Build API: ${error.response?.status} ${error.response?.statusText}`);
+          this.logger.error(`Error details: ${JSON.stringify(error.response?.data)}`);
+          
+          // Provide helpful error message
+          throw new BadRequestException(
+            `Unable to create new Mendix app. This may require additional permissions or the Build API endpoint may have changed. ` +
+            `Please try cloning from an existing app instead, or create the app in Mendix Portal first and sync it. ` +
+            `Error: ${error.message}`
+          );
+        }
       }
 
       // Get the default environment (sandbox)
-      const envResponse = await client.get(
-        `${this.mendixConfig.deploymentsApiUrl}/apps/${app.appId}/environments`,
-      );
-
-      const sandboxEnv = envResponse.data?.find((env: any) => env.type === 'Free');
-
-      if (!sandboxEnv) {
-        throw new BadRequestException('No sandbox environment found for app');
+      // Note: Use Deploy API v1 for environments, not v2
+      const appIdToUse = app.appId || config.sourceAppId;
+      
+      this.logger.log(`Fetching environments for app ID: ${appIdToUse}`);
+      this.logger.debug(`App object from API: ${JSON.stringify(app)}`);
+      
+      let envResponse;
+      try {
+        // Use Deploy API v1 for environments (same as in getAppWithDetails)
+        envResponse = await client.get(
+          `${this.mendixConfig.apiUrl}/apps/${appIdToUse}/environments`,
+        );
+      } catch (error) {
+        this.logger.error(`Failed to fetch environments: ${error.response?.status} ${error.response?.statusText}`);
+        this.logger.error(`Environment endpoint: GET ${this.mendixConfig.apiUrl}/apps/${appIdToUse}/environments`);
+        this.logger.error(`Error details: ${JSON.stringify(error.response?.data)}`);
+        
+        throw new BadRequestException(
+          `Unable to fetch environments for Mendix app "${appIdToUse}". ` +
+          `This app may not have any environments, or the app ID format is incorrect. ` +
+          `Error: ${error.message}`
+        );
       }
 
+      this.logger.debug(`Environments response: ${JSON.stringify(envResponse.data)}`);
+
+      // Mendix Deploy API v1 uses "Mode" field, not "type"
+      // Look for "Sandbox" mode (free tier) or "Production: false"
+      const sandboxEnv = envResponse.data?.find(
+        (env: any) => env.Mode === 'Sandbox' || !env.Production
+      );
+
+      if (!sandboxEnv) {
+        this.logger.warn(`No Sandbox environment found. Available environments: ${JSON.stringify(envResponse.data)}`);
+        throw new BadRequestException(
+          `No sandbox environment found for app "${appIdToUse}". ` +
+          `Available environments do not include a free sandbox. ` +
+          `Please ensure this app has a free sandbox environment in Mendix Portal.`
+        );
+      }
+
+      this.logger.log(`Found sandbox environment: ${sandboxEnv.EnvironmentId}`);
+
+      // Construct the Mendix Developer Portal URL
+      // Note: As of Mendix 10, Studio (web) has been merged into Studio Pro (desktop)
+      // The Developer Portal is the web-accessible entry point where users can:
+      // - View project details and manage settings
+      // - Access "Edit in Studio Pro" button (requires desktop install)
+      // - View the running app
+      const projectId = app.ProjectId || app.projectId;
+      
+      // Use Developer Portal as the primary URL (web-accessible)
+      const portalUrl = projectId 
+        ? `https://sprintr.home.mendix.com/link/project/${projectId}`
+        : sandboxEnv.Url; // Fallback to app URL if no project ID
+
+      this.logger.log(`Mendix Developer Portal URL: ${portalUrl}`);
+
       return {
-        environmentId: sandboxEnv.environmentId,
-        environmentUrl: sandboxEnv.url || '',
-        status: sandboxEnv.status || 'Stopped',
+        environmentId: sandboxEnv.EnvironmentId, // Note: Capital E in API response
+        environmentUrl: portalUrl, // Developer Portal (web-accessible)
+        status: sandboxEnv.Status || 'Stopped', // Note: Capital S in API response
         appId: app.appId,
         isCloned,
+        metadata: {
+          runtimeUrl: sandboxEnv.Url, // The running app URL
+          projectId: projectId,
+          mode: sandboxEnv.Mode,
+          mendixVersion: sandboxEnv.MendixVersion,
+          editorType: 'studio-pro-desktop', // Indicates desktop app required for editing
+          studioPro: {
+            required: true,
+            downloadUrl: 'https://marketplace.mendix.com/link/studiopro/',
+            note: 'As of Mendix 10, Studio Web has been merged into Studio Pro (desktop)',
+          },
+        },
       };
     } catch (error) {
       this.logger.error(`Failed to create sandbox: ${error.message}`, error.stack);

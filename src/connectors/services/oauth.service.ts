@@ -1,6 +1,7 @@
 import { Injectable, Logger, BadRequestException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import axios from 'axios';
+import * as crypto from 'crypto';
 import { OAuth2Token } from '../interfaces/base-connector.interface';
 
 /**
@@ -16,13 +17,69 @@ export interface OAuth2Config {
 }
 
 /**
+ * PKCE parameters for OAuth flow
+ */
+export interface PKCEParams {
+  codeVerifier: string;
+  codeChallenge: string;
+  codeChallengeMethod: string;
+}
+
+/**
  * Service for handling OAuth2 flows
  */
 @Injectable()
 export class OAuthService {
   private readonly logger = new Logger(OAuthService.name);
+  // Store PKCE code verifiers temporarily (keyed by state)
+  private readonly pkceStore = new Map<string, string>();
 
   constructor(private config: ConfigService) {}
+
+  /**
+   * Generate PKCE parameters for OAuth2 flow
+   */
+  generatePKCE(): PKCEParams {
+    // Generate code_verifier: random string of 43-128 characters
+    const codeVerifier = crypto.randomBytes(32).toString('base64url');
+    
+    // Generate code_challenge: SHA256 hash of code_verifier, base64url encoded
+    const codeChallenge = crypto
+      .createHash('sha256')
+      .update(codeVerifier)
+      .digest('base64url');
+
+    this.logger.debug('Generated PKCE parameters');
+
+    return {
+      codeVerifier,
+      codeChallenge,
+      codeChallengeMethod: 'S256',
+    };
+  }
+
+  /**
+   * Store PKCE code verifier for later use
+   */
+  storePKCEVerifier(state: string, codeVerifier: string): void {
+    this.pkceStore.set(state, codeVerifier);
+    
+    // Clean up after 15 minutes (same as state expiry)
+    setTimeout(() => {
+      this.pkceStore.delete(state);
+    }, 15 * 60 * 1000);
+  }
+
+  /**
+   * Retrieve and remove PKCE code verifier
+   */
+  retrievePKCEVerifier(state: string): string | undefined {
+    const verifier = this.pkceStore.get(state);
+    if (verifier) {
+      this.pkceStore.delete(state);
+    }
+    return verifier;
+  }
 
   /**
    * Generate OAuth2 authorization URL
@@ -31,17 +88,26 @@ export class OAuthService {
     config: OAuth2Config,
     state: string,
     additionalParams?: Record<string, string>,
+    pkceParams?: { codeChallenge: string; codeChallengeMethod: string },
   ): string {
-    const params = new URLSearchParams({
+    const params: Record<string, string> = {
       client_id: config.clientId,
       redirect_uri: config.redirectUri,
       response_type: 'code',
       scope: config.scope,
       state,
       ...additionalParams,
-    });
+    };
 
-    const authUrl = `${config.authorizationUrl}?${params.toString()}`;
+    // Add PKCE parameters if provided
+    if (pkceParams) {
+      params.code_challenge = pkceParams.codeChallenge;
+      params.code_challenge_method = pkceParams.codeChallengeMethod;
+      this.logger.debug('Including PKCE parameters in auth URL');
+    }
+
+    const urlParams = new URLSearchParams(params);
+    const authUrl = `${config.authorizationUrl}?${urlParams.toString()}`;
     this.logger.debug(`Generated auth URL for state: ${state}`);
     
     return authUrl;
@@ -54,16 +120,25 @@ export class OAuthService {
     config: OAuth2Config,
     code: string,
     additionalParams?: Record<string, string>,
+    codeVerifier?: string,
   ): Promise<OAuth2Token> {
     try {
-      const tokenData = new URLSearchParams({
+      const tokenParams: Record<string, string> = {
         grant_type: 'authorization_code',
         code,
         redirect_uri: config.redirectUri,
         client_id: config.clientId,
         client_secret: config.clientSecret,
         ...additionalParams,
-      });
+      };
+
+      // Add PKCE code_verifier if provided
+      if (codeVerifier) {
+        tokenParams.code_verifier = codeVerifier;
+        this.logger.debug('Including PKCE code_verifier in token exchange');
+      }
+
+      const tokenData = new URLSearchParams(tokenParams);
 
       this.logger.debug(`Exchanging code for token at: ${config.tokenUrl}`);
 
@@ -193,12 +268,13 @@ export class OAuthService {
 
   /**
    * Generate state parameter for OAuth flow
-   * Format: base64(userId:organizationId:timestamp:random)
+   * Format: base64(userId:organizationId:role:timestamp:random)
    */
-  generateState(userId: string, organizationId: string): string {
+  generateState(userId: string, organizationId: string, userRole?: string): string {
     const timestamp = Date.now();
     const random = Math.random().toString(36).substring(2, 15);
-    const stateData = `${userId}:${organizationId}:${timestamp}:${random}`;
+    const role = userRole || 'ADMIN'; // Default to ADMIN for backward compatibility
+    const stateData = `${userId}:${organizationId}:${role}:${timestamp}:${random}`;
     
     return Buffer.from(stateData).toString('base64');
   }
@@ -206,10 +282,25 @@ export class OAuthService {
   /**
    * Parse and validate state parameter
    */
-  parseState(state: string): { userId: string; organizationId: string; timestamp: number } {
+  parseState(state: string): { userId: string; organizationId: string; userRole: string; timestamp: number } {
     try {
       const decoded = Buffer.from(state, 'base64').toString('utf-8');
-      const [userId, organizationId, timestamp] = decoded.split(':');
+      const parts = decoded.split(':');
+      
+      // Handle both old format (4 parts) and new format (5 parts)
+      const userId = parts[0];
+      const organizationId = parts[1];
+      let userRole = 'ADMIN';
+      let timestamp: string;
+      
+      if (parts.length >= 5) {
+        // New format: userId:organizationId:role:timestamp:random
+        userRole = parts[2];
+        timestamp = parts[3];
+      } else {
+        // Old format: userId:organizationId:timestamp:random
+        timestamp = parts[2];
+      }
 
       // Validate state is not too old (15 minutes max)
       const now = Date.now();
@@ -223,6 +314,7 @@ export class OAuthService {
       return {
         userId,
         organizationId,
+        userRole,
         timestamp: parseInt(timestamp),
       };
     } catch (error) {

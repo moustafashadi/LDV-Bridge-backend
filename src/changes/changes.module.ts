@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ChangesService } from './changes.service';
 import { ChangesController } from './changes.controller';
+import { ChangesGateway } from './changes.gateway';
 import { JsonDiffService } from './diff/json-diff.service';
 import { ImpactAnalyzerService } from './analyzers/impact-analyzer.service';
 import { PrismaModule } from '../prisma/prisma.module';
@@ -23,7 +24,9 @@ import { PoliciesService } from 'src/policies/policies.service';
       }),
     }),
   ],
-  providers: [ChangesService, 
+  providers: [
+    ChangesService, 
+    ChangesGateway,
     JsonDiffService, 
     ImpactAnalyzerService, 
     PolicyRiskEvaluatorService, 
@@ -32,6 +35,6 @@ import { PoliciesService } from 'src/policies/policies.service';
     PoliciesService
   ],
   controllers: [ChangesController],
-  exports: [ChangesService], // Export for SyncService to use
+  exports: [ChangesService, ChangesGateway], // Export for other modules
 })
 export class ChangesModule { }

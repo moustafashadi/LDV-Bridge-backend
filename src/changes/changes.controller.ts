@@ -31,7 +31,7 @@ import { ChangeStatus, ChangeType, UserRole } from '@prisma/client';
 
 @ApiTags('Changes')
 @ApiBearerAuth()
-@Controller('api/v1/changes')
+@Controller('changes')
 @UseGuards(AuthGuard('jwt'), RolesGuard)
 export class ChangesController {
   constructor(private readonly changesService: ChangesService) {}
@@ -49,6 +49,21 @@ export class ChangesController {
     @CurrentUser() user: AuthenticatedUser,
   ): Promise<DetectChangesResponseDto> {
     return this.changesService.detectChanges(appId, user.id!, user.organizationId!);
+  }
+
+  /**
+   * Manually trigger sync for a sandbox (will detect changes from platform)
+   */
+  @Post('sync/:sandboxId')
+  @Roles(UserRole.ADMIN, UserRole.PRO_DEVELOPER, UserRole.CITIZEN_DEVELOPER)
+  @ApiOperation({ summary: 'Manually sync changes from a sandbox environment' })
+  @ApiResponse({ status: 200, description: 'Sync completed' })
+  @ApiResponse({ status: 404, description: 'Sandbox not found' })
+  async syncSandbox(
+    @Param('sandboxId', ParseUUIDPipe) sandboxId: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ): Promise<{ success: boolean; message: string; changeCount: number }> {
+    return this.changesService.syncSandbox(sandboxId, user.id!, user.organizationId!);
   }
 
   /**
@@ -175,5 +190,35 @@ export class ChangesController {
       success: true,
       message: 'Change deleted successfully',
     };
+  }
+
+  /**
+   * Undo (soft delete) a change
+   */
+  @Post(':id/undo')
+  @Roles(UserRole.ADMIN, UserRole.PRO_DEVELOPER, UserRole.CITIZEN_DEVELOPER)
+  @ApiOperation({ summary: 'Undo a change (soft delete)' })
+  @ApiResponse({ status: 200, description: 'Change undone', type: ChangeResponseDto })
+  @ApiResponse({ status: 404, description: 'Change not found or already undone' })
+  async undo(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ): Promise<ChangeResponseDto> {
+    return this.changesService.undo(id, user.id!, user.organizationId!);
+  }
+
+  /**
+   * Restore (undelete) a change
+   */
+  @Post(':id/restore')
+  @Roles(UserRole.ADMIN, UserRole.PRO_DEVELOPER, UserRole.CITIZEN_DEVELOPER)
+  @ApiOperation({ summary: 'Restore an undone change' })
+  @ApiResponse({ status: 200, description: 'Change restored', type: ChangeResponseDto })
+  @ApiResponse({ status: 404, description: 'Change not found or not undone' })
+  async restore(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ): Promise<ChangeResponseDto> {
+    return this.changesService.restore(id, user.id!, user.organizationId!);
   }
 }

@@ -1,4 +1,5 @@
 import { Injectable, Logger, BadRequestException } from '@nestjs/common';
+import { PrismaService } from '../../prisma/prisma.service';
 import {
   IEnvironmentProvisioner,
   EnvironmentDetails,
@@ -22,7 +23,10 @@ export class PowerAppsProvisioner implements IEnvironmentProvisioner {
   private readonly MAX_PROVISION_WAIT_TIME = 10 * 60 * 1000; // 10 minutes
   private readonly POLL_INTERVAL = 30 * 1000; // 30 seconds
 
-  constructor(private readonly powerAppsService: PowerAppsService) { }
+  constructor(
+    private readonly powerAppsService: PowerAppsService,
+    private readonly prisma: PrismaService,
+  ) { }
 
   /**
    * Provision a new PowerApps environment
@@ -40,6 +44,32 @@ export class PowerAppsProvisioner implements IEnvironmentProvisioner {
     );
 
     try {
+      // If cloning, look up the external PowerApps app ID
+      let externalAppId: string | undefined;
+      if (powerAppsConfig.sourceAppId) {
+        this.logger.log(`Looking up external app ID for internal ID: ${powerAppsConfig.sourceAppId}`);
+        
+        const sourceApp = await this.prisma.app.findUnique({
+          where: { id: powerAppsConfig.sourceAppId },
+          select: { externalId: true, name: true },
+        });
+
+        if (!sourceApp) {
+          throw new BadRequestException(
+            `Source app with ID ${powerAppsConfig.sourceAppId} not found`,
+          );
+        }
+
+        if (!sourceApp.externalId) {
+          throw new BadRequestException(
+            `Source app "${sourceApp.name}" does not have an external ID. Cannot clone.`,
+          );
+        }
+
+        externalAppId = sourceApp.externalId;
+        this.logger.log(`Found external app ID: ${externalAppId} for app "${sourceApp.name}"`);
+      }
+
       // Step 1: Create environment
       const environment = await this.powerAppsService.createEnvironment(
         powerAppsConfig.userId,
@@ -48,7 +78,7 @@ export class PowerAppsProvisioner implements IEnvironmentProvisioner {
           name: powerAppsConfig.displayName,
           region: powerAppsConfig.region,
           type: powerAppsConfig.environmentType || 'Sandbox',
-          sourceAppId: powerAppsConfig.sourceAppId, // Pass sourceAppId for cloning
+          sourceAppId: externalAppId, // Pass external PowerApps app ID for cloning
         },
       );
 

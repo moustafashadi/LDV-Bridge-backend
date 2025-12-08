@@ -91,7 +91,21 @@ export class PowerAppsService implements IBaseConnector {
       clientId: this.config.get<string>('POWERAPP_CLIENT_ID') || '',
       clientSecret: this.config.get<string>('POWERAPP_CLIENT_SECRET') || '',
       redirectUri: this.config.get<string>('POWERAPP_REDIRECT_URI') || '',
-      // Use Microsoft Graph scopes - available in all Azure AD tenants
+      // LIMITATION: Requesting Microsoft Graph scope instead of Power Platform
+      // Reason: Power Platform service principals (Dynamics CRM, PowerApps Runtime Service) 
+      // are not registered in many Azure AD tenants (personal/student/new tenants).
+      // With Graph token, users can:
+      // - Connect their PowerApps account ✅
+      // - View connection status ✅
+      // - Cannot list/create environments programmatically ❌
+      // 
+      // To enable full Power Platform API access, the tenant must:
+      // 1. Have Power Platform/Dynamics 365 licenses
+      // 2. Have service principals registered (usually automatic with licenses)
+      // 3. User must sign in to https://make.powerapps.com at least once
+      //
+      // Workaround: Users can manually create environments in Power Platform Admin Center
+      // and use existing environments for sandboxing.
       scope: 'User.Read offline_access openid profile email',
     };
 
@@ -110,6 +124,70 @@ export class PowerAppsService implements IBaseConnector {
   }
 
   /**
+   * Get BAP API token using refresh token
+   */
+  private async getBAPTokenFromRefreshToken(refreshToken: string): Promise<string | null> {
+    try {
+      this.logger.debug('Getting BAP API token using refresh token');
+
+      const response = await axios.post(
+        `https://login.microsoftonline.com/common/oauth2/v2.0/token`,
+        new URLSearchParams({
+          grant_type: 'refresh_token',
+          client_id: this.oauth2Config.clientId,
+          client_secret: this.oauth2Config.clientSecret,
+          refresh_token: refreshToken,
+          scope: 'https://service.powerapps.com//.default',
+        }).toString(),
+        {
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+        }
+      );
+
+      this.logger.debug('Successfully got BAP API token');
+      return response.data.access_token;
+    } catch (error) {
+      this.logger.error(`BAP token request failed: ${error.response?.data?.error_description || error.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Exchange user token for BAP API token using On-Behalf-Of flow
+   */
+  private async exchangeForBAPToken(userToken: string): Promise<string> {
+    try {
+      this.logger.debug('Exchanging user token for BAP API token');
+
+      const response = await axios.post(
+        `https://login.microsoftonline.com/common/oauth2/v2.0/token`,
+        new URLSearchParams({
+          grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+          client_id: this.oauth2Config.clientId,
+          client_secret: this.oauth2Config.clientSecret,
+          assertion: userToken,
+          scope: 'https://service.powerapps.com//.default',
+          requested_token_use: 'on_behalf_of',
+        }).toString(),
+        {
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+        }
+      );
+
+      this.logger.debug('Successfully exchanged token for BAP API access');
+      return response.data.access_token;
+    } catch (error) {
+      this.logger.error(`Token exchange failed: ${error.response?.data?.error_description || error.message}`);
+      // If exchange fails, return original token (might work for some APIs)
+      return userToken;
+    }
+  }
+
+  /**
    * Create authenticated axios instance
    */
   private async getAuthenticatedClient(
@@ -124,6 +202,23 @@ export class PowerAppsService implements IBaseConnector {
       );
     }
 
+    // Log token details for debugging (without exposing the actual token)
+    this.logger.log(`[TOKEN DEBUG] Token expiry: ${token.expiresAt}`);
+    this.logger.log(`[TOKEN DEBUG] Has refresh token: ${!!token.refreshToken}`);
+
+    // Decode token to check audience (for debugging)
+    try {
+      const tokenParts = token.accessToken.split('.');
+      if (tokenParts.length === 3) {
+        const payload = JSON.parse(Buffer.from(tokenParts[1], 'base64').toString());
+        this.logger.log(`[TOKEN DEBUG] Token audience (aud): ${payload.aud}`);
+        this.logger.log(`[TOKEN DEBUG] Token scopes (scp): ${payload.scp || 'none'}`);
+        this.logger.log(`[TOKEN DEBUG] Token issuer (iss): ${payload.iss}`);
+      }
+    } catch (e) {
+      this.logger.warn(`[TOKEN DEBUG] Could not decode token: ${e.message}`);
+    }
+
     // Check if token is expired and refresh if needed
     const isExpired = await this.tokenManager.isTokenExpired(
       userId,
@@ -132,19 +227,42 @@ export class PowerAppsService implements IBaseConnector {
 
     if (isExpired && token.refreshToken) {
       this.logger.log(`Refreshing expired PowerApps token for user ${userId}`);
-      const newToken = await this.refreshToken(token.refreshToken);
-      await this.tokenManager.saveToken(
-        userId,
-        organizationId,
-        this.platform,
-        newToken,
+      try {
+        const newToken = await this.refreshToken(token.refreshToken);
+        await this.tokenManager.saveToken(
+          userId,
+          organizationId,
+          this.platform,
+          newToken,
+        );
+        token.accessToken = newToken.accessToken;
+        this.logger.log(`Token refreshed successfully`);
+      } catch (error) {
+        this.logger.error(`Token refresh failed: ${error.message}`);
+        throw new BadRequestException(
+          'Failed to refresh PowerApps token. Please reconnect your PowerApps account.'
+        );
+      }
+    } else if (isExpired && !token.refreshToken) {
+      throw new BadRequestException(
+        'PowerApps token expired and no refresh token available. Please reconnect your PowerApps account.'
       );
-      token.accessToken = newToken.accessToken;
+    }
+
+    // Try to get BAP token using refresh token
+    let bapToken: string | null = null;
+    if (token.refreshToken) {
+      bapToken = await this.getBAPTokenFromRefreshToken(token.refreshToken);
+    }
+
+    // If refresh token approach failed, try OBO flow
+    if (!bapToken) {
+      bapToken = await this.exchangeForBAPToken(token.accessToken);
     }
 
     return axios.create({
       headers: {
-        Authorization: `Bearer ${token.accessToken}`,
+        Authorization: `Bearer ${bapToken}`,
         'Content-Type': 'application/json',
       },
     });
@@ -153,17 +271,30 @@ export class PowerAppsService implements IBaseConnector {
   /**
    * Initiate OAuth2 flow
    */
-  async initiateOAuth(userId: string, organizationId: string): Promise<string> {
-    this.logger.log(`Initiating PowerApps OAuth for user ${userId}`);
+  async initiateOAuth(userId: string, organizationId: string, userRole?: string): Promise<string> {
+    this.logger.log(`Initiating PowerApps OAuth for user ${userId} (role: ${userRole})`);
 
-    const state = this.oauthService.generateState(userId, organizationId);
+    // Generate PKCE parameters
+    const pkce = this.oauthService.generatePKCE();
 
+    // Generate state
+    const state = this.oauthService.generateState(userId, organizationId, userRole);
+
+    // Store code_verifier for later use during token exchange
+    this.oauthService.storePKCEVerifier(state, pkce.codeVerifier);
+
+    // Generate auth URL with PKCE parameters
     const authUrl = this.oauthService.generateAuthUrl(
       this.oauth2Config,
       state,
       {
         response_mode: 'query',
-        prompt: 'consent', // Force consent to ensure refresh token
+        prompt: 'select_account', // Allow user to choose account, may bypass admin consent
+        domain_hint: 'organizations', // Hint that this is an organizational account
+      },
+      {
+        codeChallenge: pkce.codeChallenge,
+        codeChallengeMethod: pkce.codeChallengeMethod,
       },
     );
 
@@ -177,12 +308,21 @@ export class PowerAppsService implements IBaseConnector {
     this.logger.log('Completing PowerApps OAuth flow');
 
     // Validate and parse state
-    const { userId, organizationId } = this.oauthService.parseState(state);
+    const { userId, organizationId, userRole } = this.oauthService.parseState(state);
 
-    // Exchange code for token
+    // Retrieve PKCE code_verifier
+    const codeVerifier = this.oauthService.retrievePKCEVerifier(state);
+
+    if (!codeVerifier) {
+      this.logger.warn('No PKCE code_verifier found for state - continuing without PKCE');
+    }
+
+    // Exchange code for token with PKCE code_verifier
     const token = await this.oauthService.exchangeCodeForToken(
       this.oauth2Config,
       code,
+      undefined, // no additional params
+      codeVerifier, // PKCE code_verifier
     );
 
     // Save encrypted token
@@ -207,7 +347,10 @@ export class PowerAppsService implements IBaseConnector {
       status: ConnectionStatus.CONNECTED,
     });
 
-    this.logger.log(`PowerApps connection established for user ${userId}`);
+    this.logger.log(`PowerApps connection established for user ${userId} (role: ${userRole})`);
+
+    // Attach userRole to token for callback handler
+    (token as any).userRole = userRole;
 
     return token;
   }
@@ -372,6 +515,17 @@ export class PowerAppsService implements IBaseConnector {
         `Failed to fetch PowerApps environments: ${error.message}`,
         error.stack,
       );
+
+      if (error.response?.status === 401) {
+        const errorData = error.response.data?.error;
+        if (errorData?.code === 'InvalidAuthenticationAudience') {
+          throw new BadRequestException(
+            `Cannot list PowerApps environments. Your connection requires Power Platform API permissions. ` +
+            `See Azure AD app configuration documentation for setup instructions.`
+          );
+        }
+      }
+
       throw new BadRequestException(
         `Failed to fetch environments: ${error.message}`,
       );
@@ -472,7 +626,7 @@ export class PowerAppsService implements IBaseConnector {
         },
         take: 1,
       });
-      
+
       const connection = connections[0];
       if (!connection) {
         throw new BadRequestException('No active PowerApps connection found');
@@ -678,6 +832,17 @@ export class PowerAppsService implements IBaseConnector {
       const client = await this.getAuthenticatedClient(userId, organizationId);
 
       // Create environment via BAP API
+      this.logger.log(`POST ${this.bapApiUrl}/environments?api-version=2021-04-01`);
+      this.logger.debug(`Request body: ${JSON.stringify({
+        location: config.region || 'unitedstates',
+        properties: {
+          displayName: config.name,
+          description: config.description || '',
+          environmentSku: config.type || 'Developer',
+          azureRegion: config.region || 'unitedstates',
+        },
+      })}`);
+
       const response = await client.post(
         `${this.bapApiUrl}/environments?api-version=2021-04-01`,
         {
@@ -734,13 +899,46 @@ export class PowerAppsService implements IBaseConnector {
 
       return {
         environmentId,
-        environmentUrl: `https://admin.powerplatform.microsoft.com/environments/${environmentId}`,
+        // Use make.powerapps.com (maker portal) for editing apps, not admin portal
+        environmentUrl: `https://make.powerapps.com/environments/${environmentId}/home`,
         status: environment.properties?.provisioningState || 'Succeeded',
         appId: clonedAppId,
         isCloned,
       };
     } catch (error) {
       this.logger.error(`Failed to create environment: ${error.message}`, error.stack);
+
+      if (error.response) {
+        this.logger.error(`HTTP Status: ${error.response.status} ${error.response.statusText}`);
+        this.logger.error(`Response data: ${JSON.stringify(error.response.data)}`);
+
+        if (error.response.status === 401) {
+          const errorData = error.response.data?.error;
+          const errorCode = errorData?.code;
+
+          if (errorCode === 'InvalidAuthenticationAudience') {
+            // Token has wrong audience (e.g., Microsoft Graph instead of Power Platform)
+            throw new BadRequestException(
+              `PowerApps environment creation requires Power Platform API permissions. ` +
+              `Your connection is authenticated but cannot create environments. ` +
+              `\n\nTo fix this:\n` +
+              `1. Go to Azure Portal → Your App Registration → API permissions\n` +
+              `2. Add "Dynamics CRM" or "Common Data Service" API\n` +
+              `3. Add delegated permission: user_impersonation\n` +
+              `4. Grant admin consent (requires Azure AD admin role)\n` +
+              `5. Disconnect and reconnect your PowerApps account\n\n` +
+              `Alternatively, you can work with existing PowerApps environments instead of creating new ones.`
+            );
+          }
+
+          throw new BadRequestException(
+            `PowerApps authentication failed. Your token may have expired or lacks required permissions. ` +
+            `Please disconnect and reconnect your PowerApps account. ` +
+            `Required API permissions: Dynamics CRM user_impersonation (with admin consent)`
+          );
+        }
+      }
+
       throw new BadRequestException(`Failed to create environment: ${error.message}`);
     }
   }

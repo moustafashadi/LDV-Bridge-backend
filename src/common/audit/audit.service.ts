@@ -32,17 +32,24 @@ export class AuditService {
    */
   async createAuditLog(dto: CreateAuditLogDto): Promise<AuditLog> {
     try {
+      // If userId is 'system' or null, don't set it (system actions)
+      const data: any = {
+        organizationId: dto.organizationId,
+        action: dto.action,
+        entityType: dto.entityType,
+        entityId: dto.entityId,
+        details: dto.details || {},
+        ipAddress: dto.ipAddress,
+        userAgent: dto.userAgent,
+      };
+
+      // Only add userId if it's a valid user ID (not 'system')
+      if (dto.userId && dto.userId !== 'system') {
+        data.userId = dto.userId;
+      }
+
       const auditLog = await this.prisma.auditLog.create({
-        data: {
-          userId: dto.userId,
-          organizationId: dto.organizationId,
-          action: dto.action,
-          entityType: dto.entityType,
-          entityId: dto.entityId,
-          details: dto.details || {},
-          ipAddress: dto.ipAddress,
-          userAgent: dto.userAgent,
-        },
+        data,
       });
 
       this.logger.log(

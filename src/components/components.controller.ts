@@ -40,7 +40,7 @@ import { ComponentType, UserRole } from '@prisma/client';
 @ApiTags('Components')
 @ApiBearerAuth()
 @UseGuards(JwtAuthGuard, RolesGuard)
-@Controller('api/v1/components')
+@Controller('components')
 export class ComponentsController {
   constructor(private readonly componentsService: ComponentsService) { }
 
