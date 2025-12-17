@@ -1,6 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
-import { OAuth2Token, ConnectionStatus } from '../interfaces/base-connector.interface';
+import {
+  OAuth2Token,
+  ConnectionStatus,
+} from '../interfaces/base-connector.interface';
 import * as crypto from 'crypto-js';
 import { ConfigService } from '@nestjs/config';
 
@@ -17,11 +20,14 @@ export class TokenManagerService {
     private config: ConfigService,
   ) {
     // Get encryption key from environment or generate one
-    this.encryptionKey = this.config.get<string>('TOKEN_ENCRYPTION_KEY') || 
+    this.encryptionKey =
+      this.config.get<string>('TOKEN_ENCRYPTION_KEY') ||
       'default-encryption-key-change-in-production';
-    
+
     if (this.encryptionKey === 'default-encryption-key-change-in-production') {
-      this.logger.warn('Using default encryption key. Set TOKEN_ENCRYPTION_KEY in production!');
+      this.logger.warn(
+        'Using default encryption key. Set TOKEN_ENCRYPTION_KEY in production!',
+      );
     }
   }
 
@@ -51,9 +57,15 @@ export class TokenManagerService {
   ): Promise<void> {
     try {
       const encryptedAccessToken = this.encrypt(token.accessToken);
-      const encryptedRefreshToken = token.refreshToken 
-        ? this.encrypt(token.refreshToken) 
+      const encryptedRefreshToken = token.refreshToken
+        ? this.encrypt(token.refreshToken)
         : null;
+
+      // Merge token metadata with organizationId
+      const metadata = {
+        organizationId,
+        ...(token.metadata || {}), // Include any platform-specific metadata (e.g., Mendix PAT)
+      };
 
       await this.prisma.userConnection.upsert({
         where: {
@@ -69,14 +81,14 @@ export class TokenManagerService {
           refreshToken: encryptedRefreshToken,
           expiresAt: token.expiresAt,
           isActive: true,
-          metadata: { organizationId },
+          metadata,
         },
         update: {
           accessToken: encryptedAccessToken,
           refreshToken: encryptedRefreshToken,
           expiresAt: token.expiresAt,
           isActive: true,
-          metadata: { organizationId },
+          metadata,
           updatedAt: new Date(),
         },
       });
@@ -105,17 +117,19 @@ export class TokenManagerService {
         },
       });
 
-      if (!connection || !connection.accessToken) {
+      // Return null if connection doesn't exist, has no access token, or is not active
+      if (!connection || !connection.accessToken || !connection.isActive) {
         return null;
       }
 
       return {
         accessToken: this.decrypt(connection.accessToken),
-        refreshToken: connection.refreshToken 
-          ? this.decrypt(connection.refreshToken) 
+        refreshToken: connection.refreshToken
+          ? this.decrypt(connection.refreshToken)
           : undefined,
         expiresAt: connection.expiresAt || new Date(),
         tokenType: 'Bearer',
+        metadata: connection.metadata as Record<string, any> | undefined, // Include platform-specific metadata
       };
     } catch (error) {
       this.logger.error(`Failed to get token: ${error.message}`, error.stack);
@@ -128,14 +142,14 @@ export class TokenManagerService {
    */
   async isTokenExpired(userId: string, platform: string): Promise<boolean> {
     const token = await this.getToken(userId, platform);
-    
+
     if (!token) {
       return true;
     }
 
     const now = new Date();
     const expiresAt = new Date(token.expiresAt);
-    
+
     // Consider token expired if it expires in less than 5 minutes
     const bufferTime = 5 * 60 * 1000; // 5 minutes in milliseconds
     return expiresAt.getTime() - now.getTime() < bufferTime;
@@ -168,9 +182,14 @@ export class TokenManagerService {
         },
       });
 
-      this.logger.log(`Connection status updated: ${userId}/${platform} -> ${status}`);
+      this.logger.log(
+        `Connection status updated: ${userId}/${platform} -> ${status}`,
+      );
     } catch (error) {
-      this.logger.error(`Failed to update connection status: ${error.message}`, error.stack);
+      this.logger.error(
+        `Failed to update connection status: ${error.message}`,
+        error.stack,
+      );
       throw error;
     }
   }
@@ -191,7 +210,10 @@ export class TokenManagerService {
 
       this.logger.log(`Token deleted for user ${userId}, platform ${platform}`);
     } catch (error) {
-      this.logger.error(`Failed to delete token: ${error.message}`, error.stack);
+      this.logger.error(
+        `Failed to delete token: ${error.message}`,
+        error.stack,
+      );
       throw error;
     }
   }
@@ -227,7 +249,10 @@ export class TokenManagerService {
         },
       });
     } catch (error) {
-      this.logger.error(`Failed to update last sync: ${error.message}`, error.stack);
+      this.logger.error(
+        `Failed to update last sync: ${error.message}`,
+        error.stack,
+      );
     }
   }
 }

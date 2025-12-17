@@ -21,6 +21,7 @@ import {
 import { SandboxesService } from './sandboxes.service';
 import { CreateSandboxDto } from './dto/create-sandbox.dto';
 import { UpdateSandboxDto } from './dto/update-sandbox.dto';
+import { LinkExistingEnvironmentDto } from './dto/link-existing-environment.dto';
 import {
   SandboxResponseDto,
   SandboxStatsDto,
@@ -57,6 +58,26 @@ export class SandboxesController {
   ): Promise<SandboxResponseDto> {
     return this.sandboxesService.create(
       createSandboxDto,
+      userId,
+      organizationId,
+    );
+  }
+
+  @Post('link-existing')
+  @ApiOperation({ summary: 'Link an existing PowerApps/Mendix environment to LDV-Bridge' })
+  @ApiResponse({
+    status: 201,
+    description: 'Existing environment linked successfully',
+    type: SandboxResponseDto,
+  })
+  @ApiResponse({ status: 400, description: 'Bad Request - Environment not found or invalid' })
+  async linkExisting(
+    @Body() linkDto: LinkExistingEnvironmentDto,
+    @CurrentUser('id') userId: string,
+    @CurrentUser('organizationId') organizationId: string,
+  ): Promise<SandboxResponseDto> {
+    return this.sandboxesService.linkExistingEnvironment(
+      linkDto,
       userId,
       organizationId,
     );

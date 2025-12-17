@@ -10,7 +10,11 @@ import { Cron, CronExpression } from '@nestjs/schedule';
 import { addDays, differenceInDays } from 'date-fns';
 import { CreateSandboxDto } from './dto/create-sandbox.dto';
 import { UpdateSandboxDto } from './dto/update-sandbox.dto';
-import { SandboxResponseDto, SandboxStatsDto } from './dto/sandbox-response.dto';
+import { LinkExistingEnvironmentDto } from './dto/link-existing-environment.dto';
+import {
+  SandboxResponseDto,
+  SandboxStatsDto,
+} from './dto/sandbox-response.dto';
 import {
   SandboxPlatform,
   SandboxStatus,
@@ -65,8 +69,14 @@ export class SandboxesService {
   ) {
     // Initialize provisioners map
     this.provisioners = new Map<SandboxPlatform, IEnvironmentProvisioner>([
-      [SandboxPlatform.POWERAPPS, this.powerAppsProvisioner as IEnvironmentProvisioner],
-      [SandboxPlatform.MENDIX, this.mendixProvisioner as IEnvironmentProvisioner],
+      [
+        SandboxPlatform.POWERAPPS,
+        this.powerAppsProvisioner as IEnvironmentProvisioner,
+      ],
+      [
+        SandboxPlatform.MENDIX,
+        this.mendixProvisioner as IEnvironmentProvisioner,
+      ],
     ]);
   }
 
@@ -97,7 +107,7 @@ export class SandboxesService {
       : addDays(new Date(), quota.maxDuration);
 
     // Create sandbox record first (status: PROVISIONING)
-    const sandbox = await this.prisma.sandbox.create({
+    const sandbox = (await this.prisma.sandbox.create({
       data: {
         organizationId,
         createdById: userId,
@@ -121,7 +131,7 @@ export class SandboxesService {
           },
         },
       } as any,
-    }) as any as SandboxWithRelations;
+    })) as any as SandboxWithRelations;
 
     // Audit log
     await this.auditService.createAuditLog({
@@ -134,12 +144,131 @@ export class SandboxesService {
     });
 
     // Provision environment asynchronously
-    this.provisionEnvironment(sandbox.id, dto.platform, dto, userId, organizationId)
-      .catch((error) => {
-        this.logger.error(
-          `Failed to provision sandbox ${sandbox.id}: ${error.message}`,
+    this.provisionEnvironment(
+      sandbox.id,
+      dto.platform,
+      dto,
+      userId,
+      organizationId,
+    ).catch((error) => {
+      this.logger.error(
+        `Failed to provision sandbox ${sandbox.id}: ${error.message}`,
+      );
+    });
+
+    return this.toResponseDto(sandbox);
+  }
+
+  /**
+   * Link existing PowerApps/Mendix environment to LDV-Bridge
+   * This allows users to work with pre-existing environments without creating new ones
+   */
+  async linkExistingEnvironment(
+    dto: LinkExistingEnvironmentDto,
+    userId: string,
+    organizationId: string,
+  ): Promise<SandboxResponseDto> {
+    this.logger.log(
+      `Linking existing ${dto.platform} environment "${dto.environmentId}" for org ${organizationId}`,
+    );
+
+    // Check quotas
+    await this.checkQuotas(organizationId, dto.type);
+
+    // Calculate expiration date
+    const quota = SANDBOX_QUOTAS[dto.type];
+    const expiresAt = dto.expiresAt
+      ? new Date(dto.expiresAt)
+      : addDays(new Date(), quota.maxDuration);
+
+    // Verify environment exists and get its details
+    let environmentDetails: any;
+    try {
+      if (dto.platform === SandboxPlatform.POWERAPPS) {
+        // Use PowerAppsService directly to get environment details
+        const powerAppsProvisioner = this.provisioners.get(
+          SandboxPlatform.POWERAPPS,
+        ) as PowerAppsProvisioner;
+        environmentDetails = await (
+          powerAppsProvisioner as any
+        ).powerAppsService.getEnvironment(
+          userId,
+          organizationId,
+          dto.environmentId,
         );
-      });
+      } else {
+        // Mendix environment verification would go here
+        environmentDetails = { name: dto.name, url: null };
+      }
+    } catch (error) {
+      this.logger.error(`Failed to verify environment: ${error.message}`);
+      throw new BadRequestException(
+        `Could not verify environment ${dto.environmentId}. Make sure you're connected to ${dto.platform} and the environment exists.`,
+      );
+    }
+
+    // Create sandbox record linked to existing environment
+    const sandbox = (await this.prisma.sandbox.create({
+      data: {
+        organizationId,
+        createdById: userId,
+        name: dto.name,
+        description: dto.description || `Linked ${dto.platform} environment`,
+        status: SandboxStatus.ACTIVE, // Immediately active since environment already exists
+        expiresAt,
+        environment: {
+          platform: dto.platform,
+          type: dto.type,
+          provisioningStatus: ProvisioningStatus.COMPLETED, // Already provisioned
+          environmentId: dto.environmentId,
+          environmentUrl:
+            environmentDetails.url ||
+            environmentDetails.properties?.linkedEnvironmentMetadata
+              ?.instanceUrl,
+          region: environmentDetails.location || 'unknown',
+          platformConfig: {},
+          metadata: {
+            linkedExisting: true,
+            originalEnvironmentName:
+              environmentDetails.name ||
+              environmentDetails.properties?.displayName,
+          },
+        },
+      } as any,
+      include: {
+        createdBy: {
+          select: {
+            id: true,
+            email: true,
+            name: true,
+          },
+        },
+      } as any,
+    })) as any as SandboxWithRelations;
+
+    // Audit log
+    await this.auditService.createAuditLog({
+      userId,
+      organizationId,
+      action: 'CREATE',
+      entityType: 'sandbox',
+      entityId: sandbox.id,
+      details: {
+        name: dto.name,
+        platform: dto.platform,
+        type: dto.type,
+        linkedExisting: true,
+        environmentId: dto.environmentId,
+      },
+    });
+
+    // Send notification
+    await this.notificationsService.create({
+      userId,
+      type: 'SYSTEM',
+      title: 'Environment Linked',
+      message: `Your existing ${dto.platform} environment "${dto.name}" has been linked to LDV-Bridge successfully. Environment ID: ${dto.environmentId}`,
+    });
 
     return this.toResponseDto(sandbox);
   }
@@ -192,11 +321,66 @@ export class SandboxesService {
           },
         });
 
-        // If not found, we'll need to sync it first (this shouldn't happen normally)
+        // If not found, create the App record automatically
         if (!appRecord) {
-          this.logger.warn(
-            `App with externalId ${envDetails.appId} not found for sandbox ${sandboxId}. This app needs to be synced first.`,
+          this.logger.log(
+            `App with externalId ${envDetails.appId} not found. Creating App record for newly provisioned ${platform} app "${dto.name}".`,
           );
+
+          // Determine connector type based on platform
+          const platformType =
+            platform === SandboxPlatform.MENDIX
+              ? 'MENDIX'
+              : platform === SandboxPlatform.POWERAPPS
+                ? 'POWERAPPS'
+                : 'OTHER';
+
+          // Find the organization's platform connector for this platform
+          const connector = await this.prisma.platformConnector.findFirst({
+            where: {
+              organizationId,
+              platform: platformType as any,
+              isActive: true,
+            },
+            select: {
+              id: true,
+            },
+          });
+
+          if (!connector) {
+            this.logger.error(
+              `No active ${platformType} connector found for organization ${organizationId}. Cannot create App record.`,
+            );
+            // Don't throw error, just skip app creation - sandbox will still work
+          } else {
+            // Create the App record
+            appRecord = await this.prisma.app.create({
+              data: {
+                name: dto.name,
+                externalId: envDetails.appId,
+                platform: platformType as any,
+                organizationId,
+                ownerId: userId,
+                connectorId: connector.id,
+                status: 'DRAFT', // Newly created apps start as DRAFT
+                metadata: {
+                  ...envDetails.metadata,
+                  autoCreatedFromSandbox: true,
+                  sandboxId: sandboxId,
+                  projectId: envDetails.metadata?.projectId,
+                  environmentUrl:
+                    envDetails.environmentUrl || envDetails.metadata?.portalUrl,
+                },
+              },
+              select: {
+                id: true,
+              },
+            });
+
+            this.logger.log(
+              `Created App record ${appRecord.id} for ${platformType} app ${envDetails.appId}`,
+            );
+          }
         }
       }
 
@@ -312,7 +496,11 @@ export class SandboxesService {
     page = 1,
     limit = 20,
   ): Promise<{ data: SandboxResponseDto[]; total: number }> {
-    const where: any = { organizationId };
+    const where: any = {
+      organizationId,
+      // Exclude deleted sandboxes from listing
+      status: { not: SandboxStatus.DELETED },
+    };
 
     if (filters) {
       if (filters.platform) {
@@ -321,7 +509,10 @@ export class SandboxesService {
           equals: filters.platform,
         };
       }
-      if (filters.status) where.status = filters.status;
+      // Allow explicit status filter to override the DELETED exclusion
+      if (filters.status) {
+        where.status = filters.status;
+      }
       if (filters.userId) where.createdById = filters.userId;
     }
 
@@ -353,7 +544,10 @@ export class SandboxesService {
   /**
    * Get sandbox by ID
    */
-  async findOne(id: string, organizationId: string): Promise<SandboxResponseDto> {
+  async findOne(
+    id: string,
+    organizationId: string,
+  ): Promise<SandboxResponseDto> {
     const sandbox = await this.prisma.sandbox.findFirst({
       where: { id, organizationId },
       include: {
@@ -432,7 +626,11 @@ export class SandboxesService {
       const provisioner = this.provisioners.get(env.platform);
       if (provisioner) {
         try {
-          await provisioner.deprovision(userId, organizationId, env.environmentId);
+          await provisioner.deprovision(
+            userId,
+            organizationId,
+            env.environmentId,
+          );
         } catch (error) {
           this.logger.error(
             `Failed to deprovision environment: ${error.message}`,
@@ -450,7 +648,7 @@ export class SandboxesService {
     await this.auditService.createAuditLog({
       userId,
       organizationId,
-      action: 'DELETE_SANDBOX' as any,
+      action: 'DELETE',
       entityType: 'sandbox',
       entityId: id,
     });
@@ -475,7 +673,9 @@ export class SandboxesService {
 
     const provisioner = this.provisioners.get(env.platform);
     if (!provisioner) {
-      throw new BadRequestException(`Provisioner for ${env.platform} not found`);
+      throw new BadRequestException(
+        `Provisioner for ${env.platform} not found`,
+      );
     }
 
     await provisioner.start(userId, organizationId, env.environmentId);
@@ -513,7 +713,9 @@ export class SandboxesService {
 
     const provisioner = this.provisioners.get(env.platform);
     if (!provisioner) {
-      throw new BadRequestException(`Provisioner for ${env.platform} not found`);
+      throw new BadRequestException(
+        `Provisioner for ${env.platform} not found`,
+      );
     }
 
     await provisioner.stop(userId, organizationId, env.environmentId);
@@ -537,10 +739,7 @@ export class SandboxesService {
   /**
    * Get sandbox statistics
    */
-  async getStats(
-    id: string,
-    organizationId: string,
-  ): Promise<SandboxStatsDto> {
+  async getStats(id: string, organizationId: string): Promise<SandboxStatsDto> {
     const sandbox = await this.getRawSandbox(id, organizationId);
     const env = sandbox.environment as any;
 
@@ -557,10 +756,16 @@ export class SandboxesService {
 
     const provisioner = this.provisioners.get(env.platform);
     if (!provisioner) {
-      throw new BadRequestException(`Provisioner for ${env.platform} not found`);
+      throw new BadRequestException(
+        `Provisioner for ${env.platform} not found`,
+      );
     }
 
-    const resources = await provisioner.getResourceUsage(sandbox.createdById, organizationId, env.environmentId);
+    const resources = await provisioner.getResourceUsage(
+      sandbox.createdById,
+      organizationId,
+      env.environmentId,
+    );
 
     return {
       appsCount: resources.appsCount,
@@ -630,7 +835,11 @@ export class SandboxesService {
         const env = sandbox.environment as any;
         if (env?.environmentId && env?.platform) {
           const provisioner = this.provisioners.get(env.platform);
-          await provisioner?.deprovision(sandbox.createdById, sandbox.organizationId, env.environmentId);
+          await provisioner?.deprovision(
+            sandbox.createdById,
+            sandbox.organizationId,
+            env.environmentId,
+          );
         }
 
         // Update status
@@ -682,9 +891,9 @@ export class SandboxesService {
 
     for (const sandbox of expiringSoon) {
       if (!sandbox.expiresAt) continue;
-      
+
       const daysLeft = differenceInDays(sandbox.expiresAt, new Date());
-      
+
       await this.notificationsService.sendNotification({
         userId: sandbox.createdById,
         type: 'SYSTEM',
@@ -715,7 +924,7 @@ export class SandboxesService {
     });
 
     const quota = SANDBOX_QUOTAS[type];
-    
+
     // Simple check: max 10 sandboxes per org
     if (activeSandboxes >= 10) {
       throw new BadRequestException(
@@ -779,7 +988,10 @@ export class SandboxesService {
   /**
    * Helper: Get raw sandbox with relations (for internal operations)
    */
-  private async getRawSandbox(id: string, organizationId: string): Promise<SandboxWithRelations> {
+  private async getRawSandbox(
+    id: string,
+    organizationId: string,
+  ): Promise<SandboxWithRelations> {
     const sandbox = await this.prisma.sandbox.findFirst({
       where: { id, organizationId },
       include: {
@@ -846,8 +1058,7 @@ export class SandboxesService {
       platform: env?.platform || SandboxPlatform.POWERAPPS,
       type: env?.type || SandboxType.PERSONAL,
       status: sandbox.status,
-      provisioningStatus:
-        env?.provisioningStatus || ProvisioningStatus.PENDING,
+      provisioningStatus: env?.provisioningStatus || ProvisioningStatus.PENDING,
       environmentId: env?.environmentId,
       environmentUrl: env?.environmentUrl,
       region: env?.region,

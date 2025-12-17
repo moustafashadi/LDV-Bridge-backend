@@ -170,10 +170,11 @@ export class PowerAppsController {
 
     const status = await this.powerAppsService.getConnectionStatus(user.id, user.organizationId);
 
+    // Return properly formatted response matching ConnectionStatusResponse interface
     return {
-      success: true,
-      platform: 'POWERAPPS',
-      status,
+      isConnected: status === 'CONNECTED',
+      status: status,
+      lastConnected: undefined, // Could be added later if needed
     };
   }
 
@@ -182,13 +183,18 @@ export class PowerAppsController {
   @ApiResponse({ status: 200, description: 'List of environments' })
   @ApiBearerAuth()
   async listEnvironments(@CurrentUser() user: AuthenticatedUser) {
-    this.logger.log(`User ${user.id} listing PowerApps environments for organization ${user.organizationId}`);
+    this.logger.log(`[CONTROLLER] User ${user.id} listing PowerApps environments for organization ${user.organizationId}`);
 
     if (!user.id || !user.organizationId) {
+      this.logger.error(`[CONTROLLER] ❌ User incomplete: userId=${user.id}, orgId=${user.organizationId}`);
       throw new UnauthorizedException('User must complete onboarding before accessing PowerApps resources');
     }
 
+    this.logger.debug(`[CONTROLLER] Calling PowerAppsService.listEnvironments()`);
     const environments = await this.powerAppsService.listEnvironments(user.id, user.organizationId);
+    
+    this.logger.log(`[CONTROLLER] ✓ Service returned ${environments.length} environments`);
+    this.logger.debug(`[CONTROLLER] Returning response with success=true, count=${environments.length}`);
 
     return {
       success: true,

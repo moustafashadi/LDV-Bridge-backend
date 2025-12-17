@@ -339,7 +339,7 @@ export class PowerAppsProvisioner implements IEnvironmentProvisioner {
       }
 
       try {
-        const status = await this.getStatus(environmentId, userId, organizationId);
+        const status = await this.getStatus(userId, organizationId, environmentId);
 
         this.logger.debug(
           `Environment ${environmentId} status: ${status} (attempt ${attempts + 1}/${maxAttempts})`,
@@ -365,10 +365,13 @@ export class PowerAppsProvisioner implements IEnvironmentProvisioner {
           throw error;
         }
 
-        // If we can't get status, continue polling
+        // Log error but continue polling - environment might still be provisioning
         this.logger.warn(
-          `Failed to get status on attempt ${attempts + 1}: ${error.message}`,
+          `Failed to get status on attempt ${attempts + 1}: ${error.message}. Will retry...`,
         );
+        
+        // If it's a connection error, we should still continue
+        // The environment is being created by Microsoft, we just can't check status yet
         await new Promise((resolve) => setTimeout(resolve, this.POLL_INTERVAL));
         attempts++;
       }

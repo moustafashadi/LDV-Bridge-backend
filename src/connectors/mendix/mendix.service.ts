@@ -1,4 +1,9 @@
-import { Injectable, Logger, BadRequestException, UnauthorizedException } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  BadRequestException,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import axios, { AxiosInstance } from 'axios';
 import {
@@ -16,20 +21,20 @@ import { AppsService } from '../../apps/apps.service';
 /**
  * Mendix Connector Service
  * Integrates with Mendix Platform API using Personal Access Token (PAT) authentication
- * 
+ *
  * MULTITENANCY FLOW:
  * 1. Each user obtains their own Mendix PAT from Mendix portal
  * 2. User calls POST /connectors/mendix/connect with their apiKey + username
  * 3. saveCredentials() validates and stores the user's PAT (encrypted) in database
- * 4. All subsequent API calls use getAuthenticatedClient() which retrieves 
+ * 4. All subsequent API calls use getAuthenticatedClient() which retrieves
  *    the user-specific token from database via tokenManager.getToken(userId)
  * 5. Each user's credentials are isolated by userId + platform in UserConnection table
- * 
+ *
  * ENV VARIABLES (MENDIX_API_KEY, MENDIX_USERNAME):
  * - NOT required for multitenancy
  * - NOT used in actual API calls
  * - Optional placeholders only
- * 
+ *
  * API Documentation: https://docs.mendix.com/apidocs-mxsdk/apidocs/
  */
 @Injectable()
@@ -42,6 +47,7 @@ export class MendixService implements IBaseConnector {
     apiUrl: string;
     deploymentsApiUrl: string;
     buildApiUrl: string;
+    jobsApiUrl: string;
   };
 
   constructor(
@@ -54,9 +60,10 @@ export class MendixService implements IBaseConnector {
     this.mendixConfig = {
       apiUrl: 'https://deploy.mendix.com/api/1',
       deploymentsApiUrl: 'https://deploy.mendix.com/api/v2',
-      buildApiUrl: 'https://home.mendix.com/api/v2',
+      buildApiUrl: 'https://projects-api.home.mendix.com/v2',
+      jobsApiUrl: 'https://jobs.home.mendix.com/v1', // Central Jobs API for polling async operations
     };
-    
+
     this.validateConfig();
   }
 
@@ -69,7 +76,7 @@ export class MendixService implements IBaseConnector {
   private validateConfig(): void {
     const apiKey = this.config.get<string>('MENDIX_API_KEY');
     const username = this.config.get<string>('MENDIX_USERNAME');
-    
+
     if (!apiKey || !username) {
       this.logger.log(
         'Mendix env credentials not set - this is normal. Users will provide their own PAT tokens.',
@@ -78,8 +85,8 @@ export class MendixService implements IBaseConnector {
   }
 
   /**
-   * Create authenticated axios instance
-   * Note: Mendix uses Personal Access Token (PAT) in username field, password can be empty
+   * Create authenticated axios instance for general API access (listing projects, etc.)
+   * Uses API Key authentication with Mendix-Username and Mendix-ApiKey headers
    */
   private async getAuthenticatedClient(
     userId: string,
@@ -101,7 +108,9 @@ export class MendixService implements IBaseConnector {
 
     if (isExpired) {
       this.logger.warn(`Mendix connection may be expired for user ${userId}`);
-      throw new UnauthorizedException('Mendix connection expired. Please reconnect.');
+      throw new UnauthorizedException(
+        'Mendix connection expired. Please reconnect.',
+      );
     }
 
     // Mendix uses API Key authentication with username and API key headers
@@ -109,14 +118,16 @@ export class MendixService implements IBaseConnector {
       headers: {
         'Content-Type': 'application/json',
         'Mendix-Username': token.refreshToken, // Username stored in refreshToken field
-        'Mendix-ApiKey': token.accessToken,    // API key stored in accessToken field
+        'Mendix-ApiKey': token.accessToken, // API key stored in accessToken field
       },
     });
 
     // Add request interceptor for logging
     client.interceptors.request.use(
       (config) => {
-        this.logger.debug(`Mendix API Request: ${config.method?.toUpperCase()} ${config.url}`);
+        this.logger.debug(
+          `Mendix API Request: ${config.method?.toUpperCase()} ${config.url}`,
+        );
         return config;
       },
       (error) => {
@@ -130,6 +141,86 @@ export class MendixService implements IBaseConnector {
       (response) => response,
       async (error) => {
         if (error.response?.status === 401) {
+          this.logger.warn(
+            'Mendix API returned 401 - Invalid or expired credentials',
+          );
+          await this.tokenManager.updateConnectionStatus(
+            userId,
+            this.platform,
+            ConnectionStatus.ERROR,
+          );
+        }
+        return Promise.reject(error);
+      },
+    );
+
+    return client;
+  }
+
+  /**
+   * Create authenticated axios instance for app creation operations
+   * Uses PAT (Personal Access Token) with Authorization: MxToken header
+   */
+  private async getPatAuthenticatedClient(
+    userId: string,
+    organizationId: string,
+  ): Promise<AxiosInstance> {
+    const token = await this.tokenManager.getToken(userId, this.platform);
+
+    if (!token) {
+      throw new BadRequestException(
+        'No Mendix connection found. Please connect first.',
+      );
+    }
+
+    if (!token.metadata?.pat) {
+      throw new BadRequestException(
+        'No Mendix PAT found. Please reconnect with a Personal Access Token.',
+      );
+    }
+
+    // Check if token is expired
+    const isExpired = await this.tokenManager.isTokenExpired(
+      userId,
+      this.platform,
+    );
+
+    if (isExpired) {
+      this.logger.warn(`Mendix connection may be expired for user ${userId}`);
+      throw new UnauthorizedException(
+        'Mendix connection expired. Please reconnect.',
+      );
+    }
+
+    // For app creation, use PAT with Authorization: MxToken header
+    const client = axios.create({
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `MxToken ${token.metadata.pat}`, // PAT authentication
+      },
+    });
+
+    // Add request interceptor for logging
+    client.interceptors.request.use(
+      (config) => {
+        this.logger.debug(
+          `Mendix PAT API Request: ${config.method?.toUpperCase()} ${config.url}`,
+        );
+        return config;
+      },
+      (error) => {
+        this.logger.error('Mendix PAT API Request Error:', error);
+        return Promise.reject(error);
+      },
+    );
+
+    // Add response interceptor for error handling
+    client.interceptors.response.use(
+      (response) => response,
+      async (error) => {
+        // Only mark connection as ERROR for authentication failures (401)
+        // Ignore 404 errors as they may occur during job polling
+        if (error.response?.status === 401) {
           this.logger.warn('Mendix API returned 401 - Invalid or expired PAT');
           await this.tokenManager.updateConnectionStatus(
             userId,
@@ -137,6 +228,7 @@ export class MendixService implements IBaseConnector {
             ConnectionStatus.ERROR,
           );
         }
+        // Don't update connection status for other errors (like 404 during polling)
         return Promise.reject(error);
       },
     );
@@ -157,18 +249,39 @@ export class MendixService implements IBaseConnector {
   }
 
   /**
-   * Complete "OAuth" flow (for Mendix, this saves the API key)
-   * @param code - Personal Access Token
-   * @param state - Encrypted state with userId and organizationId
+   * Complete "OAuth" flow (for Mendix, this is a wrapper around credentials validation)
+   * The interface requires (code, state) but Mendix doesn't use OAuth
+   * @param code - Not used for Mendix (API key setup)
+   * @param state - Not used for Mendix
    */
-  async completeOAuth(apiKey: string, username: string): Promise<OAuth2Token> {
-    this.logger.log('Completing Mendix connection setup');
+  async completeOAuth(code: string, state: string): Promise<OAuth2Token> {
+    // This method is not used for Mendix - use validateCredentials instead
+    throw new BadRequestException(
+      'Mendix does not use OAuth. Please use the /connect endpoint with API key, PAT, and username.',
+    );
+  }
 
-    if (!apiKey || !username) {
-      throw new BadRequestException('Mendix API key and username are required');
+  /**
+   * Validate Mendix credentials and create token object
+   * @param apiKey - Mendix API Key for general API access
+   * @param pat - Personal Access Token for app creation (stored but not validated during connection)
+   * @param username - Mendix username/email
+   */
+  private async validateCredentials(
+    apiKey: string,
+    pat: string,
+    username: string,
+  ): Promise<OAuth2Token> {
+    this.logger.log('Validating Mendix credentials with username + API Key');
+
+    if (!apiKey || !pat || !username) {
+      throw new BadRequestException(
+        'Mendix API key, PAT, and username are required',
+      );
     }
 
-    // Validate the API key by making a test request
+    // Validate ONLY the API key and username by making a test request
+    // PAT is stored for future app creation operations but not validated here
     try {
       const client = axios.create({
         headers: {
@@ -177,22 +290,35 @@ export class MendixService implements IBaseConnector {
         },
       });
 
-      // Test the credentials by fetching user info
+      // Test the credentials by fetching apps (validates username + API key)
+      this.logger.debug('Testing Mendix connection with username + API Key');
       await client.get(`${this.mendixConfig.apiUrl}/apps`);
+      this.logger.log('Mendix username + API Key validated successfully');
 
       // Create a pseudo-OAuth token object
-      // For Mendix, we store the API key as accessToken and username as metadata
+      // For Mendix, we store:
+      // - API key in accessToken (for general API access)
+      // - Username in refreshToken
+      // - PAT in metadata (for app creation with MxToken header - validated when first used)
       const token: OAuth2Token = {
         accessToken: apiKey,
         tokenType: 'ApiKey',
         expiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000), // 1 year expiry
         refreshToken: username, // Store username in refreshToken field
+        metadata: {
+          pat: pat, // Store PAT separately for app creation operations (not validated during connection)
+        },
       };
 
       return token;
     } catch (error) {
-      this.logger.error('Failed to validate Mendix credentials:', error.message);
-      throw new UnauthorizedException('Invalid Mendix API key or username');
+      this.logger.error(
+        'Failed to validate Mendix credentials:',
+        error.message,
+      );
+      throw new UnauthorizedException(
+        'Invalid Mendix API key or username. Please verify your credentials.',
+      );
     }
   }
 
@@ -202,7 +328,9 @@ export class MendixService implements IBaseConnector {
   async refreshToken(refreshToken: string): Promise<OAuth2Token> {
     // Mendix PATs don't expire like OAuth tokens
     // We just return the existing token
-    throw new BadRequestException('Mendix API keys do not support token refresh. Please provide a new API key.');
+    throw new BadRequestException(
+      'Mendix API keys do not support token refresh. Please provide a new API key.',
+    );
   }
 
   /**
@@ -216,10 +344,10 @@ export class MendixService implements IBaseConnector {
 
     try {
       const client = await this.getAuthenticatedClient(userId, organizationId);
-      
+
       // Test by fetching apps
       const response = await client.get(`${this.mendixConfig.apiUrl}/apps`);
-      
+
       if (response.status === 200) {
         await this.tokenManager.updateConnectionStatus(
           userId,
@@ -233,7 +361,7 @@ export class MendixService implements IBaseConnector {
       return false;
     } catch (error) {
       this.logger.error('Mendix connection test failed:', error.message);
-      
+
       await this.tokenManager.updateConnectionStatus(
         userId,
         this.platform,
@@ -247,10 +375,7 @@ export class MendixService implements IBaseConnector {
   /**
    * Disconnect Mendix account
    */
-  async disconnect(
-    userId: string,
-    organizationId: string,
-  ): Promise<void> {
+  async disconnect(userId: string, organizationId: string): Promise<void> {
     this.logger.log(`Disconnecting Mendix for user ${userId}`);
 
     try {
@@ -276,13 +401,16 @@ export class MendixService implements IBaseConnector {
     organizationId: string,
   ): Promise<ConnectionStatus> {
     const token = await this.tokenManager.getToken(userId, this.platform);
-    
+
     if (!token) {
       return ConnectionStatus.DISCONNECTED;
     }
 
-    const isExpired = await this.tokenManager.isTokenExpired(userId, this.platform);
-    
+    const isExpired = await this.tokenManager.isTokenExpired(
+      userId,
+      this.platform,
+    );
+
     if (isExpired) {
       return ConnectionStatus.EXPIRED;
     }
@@ -293,18 +421,15 @@ export class MendixService implements IBaseConnector {
   /**
    * List all projects accessible to the user
    */
-  async listProjects(
-    userId: string,
-    organizationId: string,
-  ): Promise<any[]> {
+  async listProjects(userId: string, organizationId: string): Promise<any[]> {
     this.logger.log(`Fetching Mendix projects for user ${userId}`);
 
     try {
       const client = await this.getAuthenticatedClient(userId, organizationId);
-      
+
       // Fetch apps (Mendix calls them "apps" in API)
       const response = await client.get(`${this.mendixConfig.apiUrl}/apps`);
-      
+
       const projects = response.data || [];
 
       this.logger.log(`Found ${projects.length} Mendix projects`);
@@ -335,7 +460,7 @@ export class MendixService implements IBaseConnector {
 
     try {
       const client = await this.getAuthenticatedClient(userId, organizationId);
-      
+
       let apps: any[] = [];
 
       if (projectId) {
@@ -384,7 +509,7 @@ export class MendixService implements IBaseConnector {
 
     try {
       const client = await this.getAuthenticatedClient(userId, organizationId);
-      
+
       // Get app details
       const appResponse = await client.get(
         `${this.mendixConfig.apiUrl}/apps/${appId}`,
@@ -420,7 +545,9 @@ export class MendixService implements IBaseConnector {
       };
     } catch (error) {
       this.logger.error(`Failed to fetch Mendix app ${appId}:`, error.message);
-      throw new BadRequestException(`Failed to fetch Mendix app: ${error.message}`);
+      throw new BadRequestException(
+        `Failed to fetch Mendix app: ${error.message}`,
+      );
     }
   }
 
@@ -439,7 +566,9 @@ export class MendixService implements IBaseConnector {
       const appDetails = await this.getApp(userId, organizationId, appId);
 
       // Get the connector for this organization
-      const connections = await this.tokenManager['prisma'].platformConnector.findMany({
+      const connections = await this.tokenManager[
+        'prisma'
+      ].platformConnector.findMany({
         where: {
           organizationId,
           platform: 'MENDIX',
@@ -447,7 +576,7 @@ export class MendixService implements IBaseConnector {
         },
         take: 1,
       });
-      
+
       const connection = connections[0];
       if (!connection) {
         throw new BadRequestException('No active Mendix connection found');
@@ -539,14 +668,16 @@ export class MendixService implements IBaseConnector {
       const teamServer = teamServerResponse.data;
 
       if (!teamServer || !teamServer.url) {
-        throw new BadRequestException('Team Server information not available for this app');
+        throw new BadRequestException(
+          'Team Server information not available for this app',
+        );
       }
 
       // In a real implementation, we would:
       // 1. Use SVN client to checkout/export the repository
       // 2. Create a ZIP archive
       // 3. Return the buffer
-      
+
       // For now, return placeholder
       throw new BadRequestException(
         'Mendix app export requires SVN client integration. This will be implemented in a future version.',
@@ -558,18 +689,19 @@ export class MendixService implements IBaseConnector {
   }
 
   /**
-   * Save Mendix API credentials
+   * Save Mendix API credentials (API Key + PAT + Username)
    */
   async saveCredentials(
     userId: string,
     organizationId: string,
     apiKey: string,
+    pat: string,
     username: string,
   ): Promise<void> {
     this.logger.log(`Saving Mendix credentials for user ${userId}`);
 
     // Validate credentials
-    const token = await this.completeOAuth(apiKey, username);
+    const token = await this.validateCredentials(apiKey, pat, username);
 
     // Save token
     await this.tokenManager.saveToken(
@@ -625,112 +757,275 @@ export class MendixService implements IBaseConnector {
     try {
       this.logger.log(`Creating Mendix sandbox: ${config.name}`);
 
-      const client = await this.getAuthenticatedClient(userId, organizationId);
+      // Use API Key client for general operations (listing apps)
+      const apiKeyClient = await this.getAuthenticatedClient(
+        userId,
+        organizationId,
+      );
+
+      // Use PAT client for app creation operations
+      const patClient = await this.getPatAuthenticatedClient(
+        userId,
+        organizationId,
+      );
 
       let app: any;
       let isCloned = false;
 
       // If sourceAppId provided, use the existing app's free environment as sandbox
       if (config.sourceAppId) {
-        this.logger.log(`Using existing app as sandbox base: ${config.sourceAppId}`);
-        
+        this.logger.log(
+          `Using existing app as sandbox base: ${config.sourceAppId}`,
+        );
+
         // Mendix doesn't support app cloning via API
         // Instead, we'll just use the existing app's free environment
         // The user can manually duplicate the app in Mendix Portal if needed
-        
-        // Verify the app exists and get its details
+
+        // Verify the app exists and get its details (use API Key client for reading)
         try {
-          const appResponse = await client.get(
+          const appResponse = await apiKeyClient.get(
             `${this.mendixConfig.apiUrl}/apps/${config.sourceAppId}`,
           );
-          
+
           app = appResponse.data;
           app.appId = config.sourceAppId; // Ensure appId is set
-          
+
           this.logger.log(`Found app: ${app.name || config.sourceAppId}`);
           this.logger.warn(
             `Note: Mendix does not support app cloning via API. ` +
-            `This sandbox will reference the existing app "${app.name || config.sourceAppId}". ` +
-            `To create a true copy, please duplicate the app in Mendix Portal first.`
+              `This sandbox will reference the existing app "${app.name || config.sourceAppId}". ` +
+              `To create a true copy, please duplicate the app in Mendix Portal first.`,
           );
         } catch (error) {
-          this.logger.error(`Failed to fetch Mendix app: ${error.response?.status} ${error.response?.statusText}`);
-          this.logger.error(`App endpoint: GET ${this.mendixConfig.apiUrl}/apps/${config.sourceAppId}`);
-          this.logger.error(`Error details: ${JSON.stringify(error.response?.data)}`);
-          
+          this.logger.error(
+            `Failed to fetch Mendix app: ${error.response?.status} ${error.response?.statusText}`,
+          );
+          this.logger.error(
+            `App endpoint: GET ${this.mendixConfig.apiUrl}/apps/${config.sourceAppId}`,
+          );
+          this.logger.error(
+            `Error details: ${JSON.stringify(error.response?.data)}`,
+          );
+
           throw new BadRequestException(
             `Unable to find Mendix app with ID "${config.sourceAppId}". ` +
-            `Please ensure the app exists and you have access to it. ` +
-            `Error: ${error.message}`
+              `Please ensure the app exists and you have access to it. ` +
+              `Error: ${error.message}`,
           );
         }
       } else {
-        // Create a new app using Mendix Build API
-        // Note: This requires appropriate permissions on the Mendix PAT
-        this.logger.log(`Attempting to create new Mendix app`);
-        
+        // Create a new app using Mendix Build API with PAT authentication
+        // Note: This requires PAT with appropriate permissions
+        // The Build API returns a jobId, not an appId - app creation is asynchronous
+        this.logger.log(`Attempting to create new Mendix app using PAT`);
+
         try {
-          const response = await client.post(
-            `${this.mendixConfig.buildApiUrl}/apps`,
+          const response = await patClient.post(
+            `${this.mendixConfig.buildApiUrl}/projects`,
             {
               name: config.name,
             },
           );
 
-          app = response.data;
-          this.logger.log(`Successfully created new app: ${JSON.stringify(app)}`);
+          const jobData = response.data;
+          this.logger.log(
+            `App creation job submitted: ${JSON.stringify(jobData)}`,
+          );
+
+          // Mendix Build API returns a jobId for async app creation
+          // Poll the job status endpoint to wait for completion
+          if (jobData.jobId) {
+            this.logger.log(
+              `App creation initiated (jobId: ${jobData.jobId}). Polling job status...`,
+            );
+
+            // Poll the job status endpoint
+            const maxWaitTime = 2 * 60 * 1000; // 2 minutes max
+            const startTime = Date.now();
+            let pollInterval = 3000; // Start with 3 seconds
+            const maxPollInterval = 15000; // Max 15 seconds between polls
+            let jobCompleted = false;
+            let projectId: string | null = null;
+
+            while (Date.now() - startTime < maxWaitTime && !jobCompleted) {
+              await new Promise((resolve) => setTimeout(resolve, pollInterval));
+
+              try {
+                // Poll the job status endpoint: GET /projects/jobs/{job-id}
+                this.logger.debug(`Checking job status: ${jobData.jobId}`);
+                const jobStatusResponse = await patClient.get(
+                  `${this.mendixConfig.buildApiUrl}/projects/jobs/${jobData.jobId}`,
+                );
+
+                const jobStatus = jobStatusResponse.data;
+                this.logger.debug(`Job status: ${JSON.stringify(jobStatus)}`);
+
+                // Check if job is completed
+                if (
+                  jobStatus.status === 'completed' ||
+                  jobStatus.state === 'completed'
+                ) {
+                  jobCompleted = true;
+                  projectId =
+                    jobStatus.projectId || jobStatus.result?.projectId;
+                  this.logger.log(
+                    `App creation completed! Project ID: ${projectId}`,
+                  );
+                } else if (
+                  jobStatus.status === 'failed' ||
+                  jobStatus.state === 'failed'
+                ) {
+                  throw new BadRequestException(
+                    `App creation failed: ${jobStatus.error || jobStatus.message || 'Unknown error'}`,
+                  );
+                } else {
+                  // Still processing
+                  this.logger.debug(
+                    `Job still processing (status: ${jobStatus.status || jobStatus.state}). Will retry in ${Math.round(pollInterval / 1000)}s`,
+                  );
+                  pollInterval = Math.min(pollInterval * 1.3, maxPollInterval);
+                }
+              } catch (pollError) {
+                if (pollError.response?.status === 404) {
+                  // Job not found yet, keep trying
+                  this.logger.debug(`Job not found yet, will retry...`);
+                  pollInterval = Math.min(pollInterval * 1.3, maxPollInterval);
+                } else {
+                  this.logger.warn(
+                    `Error checking job status: ${pollError.message}`,
+                  );
+                  // Don't mark connection as error during polling
+                  if (Date.now() - startTime >= maxWaitTime) {
+                    throw pollError;
+                  }
+                }
+              }
+            }
+
+            if (!jobCompleted || !projectId) {
+              // Timeout
+              this.logger.warn(
+                `Job polling timed out after ${Math.round((Date.now() - startTime) / 1000)}s`,
+              );
+              throw new BadRequestException(
+                `App creation verification timed out. The app "${config.name}" may still be creating. ` +
+                  `Please check Mendix Portal (https://sprintr.home.mendix.com/) and sync from Connectors page once it appears.`,
+              );
+            }
+
+            // Job completed successfully, set the app with the projectId
+            app = {
+              appId: projectId,
+              projectId: projectId,
+              name: config.name,
+            };
+          } else {
+            // Unexpected response format
+            throw new BadRequestException(
+              `Unexpected response from Mendix Build API. Expected jobId but got: ${JSON.stringify(jobData)}`,
+            );
+          }
         } catch (error) {
-          this.logger.error(`Failed to create new Mendix app via Build API: ${error.response?.status} ${error.response?.statusText}`);
-          this.logger.error(`Error details: ${JSON.stringify(error.response?.data)}`);
-          
+          this.logger.error(
+            `Failed to create new Mendix app via Build API: ${error.response?.status} ${error.response?.statusText}`,
+          );
+          this.logger.error(
+            `Error details: ${JSON.stringify(error.response?.data)}`,
+          );
+
           // Provide helpful error message
           throw new BadRequestException(
-            `Unable to create new Mendix app. This may require additional permissions or the Build API endpoint may have changed. ` +
-            `Please try cloning from an existing app instead, or create the app in Mendix Portal first and sync it. ` +
-            `Error: ${error.message}`
+            `Unable to create new Mendix app. ` +
+              `This may indicate an invalid PAT or insufficient permissions (requires mx:projects:write). ` +
+              `Please verify your Personal Access Token has app creation permissions. ` +
+              `Alternatively, try creating the app in Mendix Portal first and sync it. ` +
+              `Error: ${error.message}`,
           );
         }
       }
 
       // Get the default environment (sandbox)
-      // Note: Use Deploy API v1 for environments, not v2
+      // Note: Newly created apps won't have environments in Deploy API until first deployment
       const appIdToUse = app.appId || config.sourceAppId;
-      
+
       this.logger.log(`Fetching environments for app ID: ${appIdToUse}`);
       this.logger.debug(`App object from API: ${JSON.stringify(app)}`);
-      
+
       let envResponse;
+      let sandboxEnv;
+
       try {
-        // Use Deploy API v1 for environments (same as in getAppWithDetails)
-        envResponse = await client.get(
+        // Use Deploy API v1 for environments (same as in getAppWithDetails) with API Key client
+        envResponse = await apiKeyClient.get(
           `${this.mendixConfig.apiUrl}/apps/${appIdToUse}/environments`,
         );
+
+        this.logger.debug(
+          `Environments response: ${JSON.stringify(envResponse.data)}`,
+        );
+
+        // Mendix Deploy API v1 uses "Mode" field, not "type"
+        // Look for "Sandbox" mode (free tier) or "Production: false"
+        sandboxEnv = envResponse.data?.find(
+          (env: any) => env.Mode === 'Sandbox' || !env.Production,
+        );
       } catch (error) {
-        this.logger.error(`Failed to fetch environments: ${error.response?.status} ${error.response?.statusText}`);
-        this.logger.error(`Environment endpoint: GET ${this.mendixConfig.apiUrl}/apps/${appIdToUse}/environments`);
-        this.logger.error(`Error details: ${JSON.stringify(error.response?.data)}`);
-        
+        // If app not found in Deploy API, it means it's a newly created app without environments yet
+        if (
+          error.response?.status === 404 &&
+          error.response?.data?.errorCode === 'APP_NOT_FOUND'
+        ) {
+          this.logger.log(
+            `App "${appIdToUse}" not found in Deploy API - this is expected for newly created apps. ` +
+              `Returning success with project info.`,
+          );
+
+          // Return success with project information
+          // User can access the app in Mendix Portal and deploy it manually
+          return {
+            environmentId: appIdToUse, // Use projectId as identifier
+            environmentUrl: `https://sprintr.home.mendix.com/link/project/${appIdToUse}`, // Direct link to project
+            status: 'created',
+            appId: appIdToUse,
+            isCloned: isCloned,
+            metadata: {
+              projectId: appIdToUse,
+              appName: config.name,
+              createdAt: new Date().toISOString(),
+              message:
+                'App created successfully! The app needs to be deployed before it has environments. Visit Mendix Portal to deploy your app.',
+              portalUrl: `https://sprintr.home.mendix.com/link/project/${appIdToUse}`,
+            },
+          };
+        }
+
+        // For other errors, log and throw
+        this.logger.error(
+          `Failed to fetch environments: ${error.response?.status} ${error.response?.statusText}`,
+        );
+        this.logger.error(
+          `Environment endpoint: GET ${this.mendixConfig.apiUrl}/apps/${appIdToUse}/environments`,
+        );
+        this.logger.error(
+          `Error details: ${JSON.stringify(error.response?.data)}`,
+        );
+
         throw new BadRequestException(
           `Unable to fetch environments for Mendix app "${appIdToUse}". ` +
-          `This app may not have any environments, or the app ID format is incorrect. ` +
-          `Error: ${error.message}`
+            `This app may not have any environments, or the app ID format is incorrect. ` +
+            `Error: ${error.message}`,
         );
       }
 
-      this.logger.debug(`Environments response: ${JSON.stringify(envResponse.data)}`);
-
-      // Mendix Deploy API v1 uses "Mode" field, not "type"
-      // Look for "Sandbox" mode (free tier) or "Production: false"
-      const sandboxEnv = envResponse.data?.find(
-        (env: any) => env.Mode === 'Sandbox' || !env.Production
-      );
-
       if (!sandboxEnv) {
-        this.logger.warn(`No Sandbox environment found. Available environments: ${JSON.stringify(envResponse.data)}`);
+        this.logger.warn(
+          `No Sandbox environment found. Available environments: ${JSON.stringify(envResponse.data)}`,
+        );
         throw new BadRequestException(
           `No sandbox environment found for app "${appIdToUse}". ` +
-          `Available environments do not include a free sandbox. ` +
-          `Please ensure this app has a free sandbox environment in Mendix Portal.`
+            `Available environments do not include a free sandbox. ` +
+            `Please ensure this app has a free sandbox environment in Mendix Portal.`,
         );
       }
 
@@ -743,9 +1038,9 @@ export class MendixService implements IBaseConnector {
       // - Access "Edit in Studio Pro" button (requires desktop install)
       // - View the running app
       const projectId = app.ProjectId || app.projectId;
-      
+
       // Use Developer Portal as the primary URL (web-accessible)
-      const portalUrl = projectId 
+      const portalUrl = projectId
         ? `https://sprintr.home.mendix.com/link/project/${projectId}`
         : sandboxEnv.Url; // Fallback to app URL if no project ID
 
@@ -771,8 +1066,13 @@ export class MendixService implements IBaseConnector {
         },
       };
     } catch (error) {
-      this.logger.error(`Failed to create sandbox: ${error.message}`, error.stack);
-      throw new BadRequestException(`Failed to create sandbox: ${error.message}`);
+      this.logger.error(
+        `Failed to create sandbox: ${error.message}`,
+        error.stack,
+      );
+      throw new BadRequestException(
+        `Failed to create sandbox: ${error.message}`,
+      );
     }
   }
 
@@ -790,26 +1090,72 @@ export class MendixService implements IBaseConnector {
     try {
       this.logger.log(`Deleting Mendix sandbox: ${environmentId}`);
 
-      const client = await this.getAuthenticatedClient(userId, organizationId);
-
-      // Stop the environment first
-      try {
-        await this.stopEnvironment(userId, organizationId, environmentId);
-      } catch (error) {
-        this.logger.warn(`Failed to stop environment before deletion: ${error.message}`);
-      }
-
-      // Delete the app (which includes the sandbox)
-      const appId = await this.getAppIdFromEnvironment(userId, organizationId, environmentId);
-      
-      await client.delete(
-        `${this.mendixConfig.buildApiUrl}/apps/${appId}`,
+      const apiKeyClient = await this.getAuthenticatedClient(
+        userId,
+        organizationId,
+      );
+      const patClient = await this.getPatAuthenticatedClient(
+        userId,
+        organizationId,
       );
 
-      this.logger.log(`Sandbox ${environmentId} deleted successfully`);
+      // First, try to determine if this is a deployed app or newly created project
+      // For newly created apps, environmentId is actually the projectId
+
+      try {
+        // Try Deploy API first (for deployed apps with actual environments)
+        // Stop the environment first
+        try {
+          await this.stopEnvironment(userId, organizationId, environmentId);
+        } catch (stopError) {
+          this.logger.warn(
+            `Failed to stop environment (may not be running): ${stopError.message}`,
+          );
+        }
+
+        // Try to get app ID and delete via Deploy API
+        const appId = await this.getAppIdFromEnvironment(
+          userId,
+          organizationId,
+          environmentId,
+        );
+
+        await apiKeyClient.delete(`${this.mendixConfig.apiUrl}/apps/${appId}`);
+        this.logger.log(`Sandbox ${environmentId} deleted via Deploy API`);
+      } catch (deployError) {
+        // If Deploy API fails (404), this is likely a newly created project
+        // Try to delete via Build API using projectId
+        this.logger.log(
+          `Deploy API deletion failed (${deployError.message}). Attempting Build API deletion for project ${environmentId}...`,
+        );
+
+        try {
+          // Delete project via Build API using PAT
+          await patClient.delete(
+            `${this.mendixConfig.buildApiUrl}/projects/${environmentId}`,
+          );
+          this.logger.log(`Project ${environmentId} deleted via Build API`);
+        } catch (buildError) {
+          // If both APIs fail, log but don't throw - the app might already be deleted
+          if (buildError.response?.status === 404) {
+            this.logger.warn(
+              `Project ${environmentId} not found in Build API either - may already be deleted`,
+            );
+          } else {
+            throw buildError;
+          }
+        }
+      }
+
+      this.logger.log(`Sandbox ${environmentId} deletion completed`);
     } catch (error) {
-      this.logger.error(`Failed to delete sandbox: ${error.message}`, error.stack);
-      throw new BadRequestException(`Failed to delete sandbox: ${error.message}`);
+      this.logger.error(
+        `Failed to delete sandbox: ${error.message}`,
+        error.stack,
+      );
+      throw new BadRequestException(
+        `Failed to delete sandbox: ${error.message}`,
+      );
     }
   }
 
@@ -836,8 +1182,13 @@ export class MendixService implements IBaseConnector {
 
       this.logger.log(`Environment ${environmentId} started successfully`);
     } catch (error) {
-      this.logger.error(`Failed to start environment: ${error.message}`, error.stack);
-      throw new BadRequestException(`Failed to start environment: ${error.message}`);
+      this.logger.error(
+        `Failed to start environment: ${error.message}`,
+        error.stack,
+      );
+      throw new BadRequestException(
+        `Failed to start environment: ${error.message}`,
+      );
     }
   }
 
@@ -864,8 +1215,13 @@ export class MendixService implements IBaseConnector {
 
       this.logger.log(`Environment ${environmentId} stopped successfully`);
     } catch (error) {
-      this.logger.error(`Failed to stop environment: ${error.message}`, error.stack);
-      throw new BadRequestException(`Failed to stop environment: ${error.message}`);
+      this.logger.error(
+        `Failed to stop environment: ${error.message}`,
+        error.stack,
+      );
+      throw new BadRequestException(
+        `Failed to stop environment: ${error.message}`,
+      );
     }
   }
 
@@ -881,7 +1237,11 @@ export class MendixService implements IBaseConnector {
     environmentId: string,
   ): Promise<'Running' | 'Stopped' | 'Starting' | 'Stopping'> {
     try {
-      const details = await this.getEnvironmentDetails(userId, organizationId, environmentId);
+      const details = await this.getEnvironmentDetails(
+        userId,
+        organizationId,
+        environmentId,
+      );
       return details.status || 'Stopped';
     } catch (error) {
       this.logger.error(`Failed to get environment status: ${error.message}`);
@@ -929,8 +1289,13 @@ export class MendixService implements IBaseConnector {
         instances: environment.instances || 1,
       };
     } catch (error) {
-      this.logger.error(`Failed to get environment details: ${error.message}`, error.stack);
-      throw new BadRequestException(`Failed to get environment details: ${error.message}`);
+      this.logger.error(
+        `Failed to get environment details: ${error.message}`,
+        error.stack,
+      );
+      throw new BadRequestException(
+        `Failed to get environment details: ${error.message}`,
+      );
     }
   }
 
@@ -964,8 +1329,13 @@ export class MendixService implements IBaseConnector {
 
       this.logger.log(`Environment ${environmentId} data cleared successfully`);
     } catch (error) {
-      this.logger.error(`Failed to clear environment data: ${error.message}`, error.stack);
-      throw new BadRequestException(`Failed to clear environment data: ${error.message}`);
+      this.logger.error(
+        `Failed to clear environment data: ${error.message}`,
+        error.stack,
+      );
+      throw new BadRequestException(
+        `Failed to clear environment data: ${error.message}`,
+      );
     }
   }
 
@@ -985,9 +1355,15 @@ export class MendixService implements IBaseConnector {
     storageUsed: number;
   }> {
     try {
-      this.logger.log(`Getting resource usage for environment: ${environmentId}`);
+      this.logger.log(
+        `Getting resource usage for environment: ${environmentId}`,
+      );
 
-      const details = await this.getEnvironmentDetails(userId, organizationId, environmentId);
+      const details = await this.getEnvironmentDetails(
+        userId,
+        organizationId,
+        environmentId,
+      );
 
       // Mendix free sandboxes have 1 app per environment
       return {
@@ -996,8 +1372,13 @@ export class MendixService implements IBaseConnector {
         storageUsed: 0, // Not available via API
       };
     } catch (error) {
-      this.logger.error(`Failed to get resource usage: ${error.message}`, error.stack);
-      throw new BadRequestException(`Failed to get resource usage: ${error.message}`);
+      this.logger.error(
+        `Failed to get resource usage: ${error.message}`,
+        error.stack,
+      );
+      throw new BadRequestException(
+        `Failed to get resource usage: ${error.message}`,
+      );
     }
   }
 
@@ -1016,7 +1397,9 @@ export class MendixService implements IBaseConnector {
       const client = await this.getAuthenticatedClient(userId, organizationId);
 
       // Get all apps and find the one with this environment
-      const response = await client.get(`${this.mendixConfig.buildApiUrl}/apps`);
+      const response = await client.get(
+        `${this.mendixConfig.buildApiUrl}/apps`,
+      );
       const apps = response.data;
 
       for (const app of apps) {

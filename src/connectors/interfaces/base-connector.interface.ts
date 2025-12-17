@@ -25,6 +25,7 @@ export interface OAuth2Token {
   expiresAt: Date;
   tokenType: string;
   scope?: string;
+  metadata?: Record<string, any>; // Additional platform-specific data (e.g., Mendix PAT)
 }
 
 /**

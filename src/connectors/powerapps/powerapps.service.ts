@@ -91,22 +91,16 @@ export class PowerAppsService implements IBaseConnector {
       clientId: this.config.get<string>('POWERAPP_CLIENT_ID') || '',
       clientSecret: this.config.get<string>('POWERAPP_CLIENT_SECRET') || '',
       redirectUri: this.config.get<string>('POWERAPP_REDIRECT_URI') || '',
-      // LIMITATION: Requesting Microsoft Graph scope instead of Power Platform
-      // Reason: Power Platform service principals (Dynamics CRM, PowerApps Runtime Service) 
-      // are not registered in many Azure AD tenants (personal/student/new tenants).
-      // With Graph token, users can:
-      // - Connect their PowerApps account ✅
-      // - View connection status ✅
-      // - Cannot list/create environments programmatically ❌
-      // 
-      // To enable full Power Platform API access, the tenant must:
-      // 1. Have Power Platform/Dynamics 365 licenses
-      // 2. Have service principals registered (usually automatic with licenses)
-      // 3. User must sign in to https://make.powerapps.com at least once
-      //
-      // Workaround: Users can manually create environments in Power Platform Admin Center
-      // and use existing environments for sandboxing.
-      scope: 'User.Read offline_access openid profile email',
+      // Use the proper Dynamics CRM / Common Data Service scope
+      // The BAP API accepts tokens from Dynamics CRM
+      // Format: https://<tenant>.crm<region>.dynamics.com for specific tenant
+      // Using generic CDS endpoint that works across regions
+      // Requires:
+      // 1. Dynamics CRM API permission (user_impersonation) - GRANTED ✅
+      // 2. PowerApps Runtime Service API permission (user_impersonation) - GRANTED ✅
+      // 3. Admin consent granted - DONE ✅
+      // 4. User has appropriate Power Platform license
+      scope: 'https://service.powerapps.com//.default offline_access',
     };
 
     this.validateConfig();
@@ -168,7 +162,7 @@ export class PowerAppsService implements IBaseConnector {
           client_id: this.oauth2Config.clientId,
           client_secret: this.oauth2Config.clientSecret,
           assertion: userToken,
-          scope: 'https://service.powerapps.com//.default',
+          scope: '82f77645-8a66-4745-bcdf-9706824f9ad0/.default',
           requested_token_use: 'on_behalf_of',
         }).toString(),
         {
@@ -194,13 +188,16 @@ export class PowerAppsService implements IBaseConnector {
     userId: string,
     organizationId: string,
   ): Promise<AxiosInstance> {
+    this.logger.debug(`[AUTH CLIENT] Step 1: Retrieving stored token for user ${userId}`);
     const token = await this.tokenManager.getToken(userId, this.platform);
 
     if (!token) {
+      this.logger.error(`[AUTH CLIENT] ❌ No token found for user ${userId}`);
       throw new BadRequestException(
         'No PowerApps connection found. Please connect first.',
       );
     }
+    this.logger.debug(`[AUTH CLIENT] Step 1: ✓ Token retrieved`);
 
     // Log token details for debugging (without exposing the actual token)
     this.logger.log(`[TOKEN DEBUG] Token expiry: ${token.expiresAt}`);
@@ -220,13 +217,15 @@ export class PowerAppsService implements IBaseConnector {
     }
 
     // Check if token is expired and refresh if needed
+    this.logger.debug(`[AUTH CLIENT] Step 2: Checking token expiration`);
     const isExpired = await this.tokenManager.isTokenExpired(
       userId,
       this.platform,
     );
+    this.logger.debug(`[AUTH CLIENT] Step 2: Token expired: ${isExpired}`);
 
     if (isExpired && token.refreshToken) {
-      this.logger.log(`Refreshing expired PowerApps token for user ${userId}`);
+      this.logger.log(`[AUTH CLIENT] Step 3: Refreshing expired PowerApps token for user ${userId}`);
       try {
         const newToken = await this.refreshToken(token.refreshToken);
         await this.tokenManager.saveToken(
@@ -236,30 +235,43 @@ export class PowerAppsService implements IBaseConnector {
           newToken,
         );
         token.accessToken = newToken.accessToken;
-        this.logger.log(`Token refreshed successfully`);
+        this.logger.log(`[AUTH CLIENT] Step 3: ✓ Token refreshed successfully`);
       } catch (error) {
-        this.logger.error(`Token refresh failed: ${error.message}`);
+        this.logger.error(`[AUTH CLIENT] ❌ Token refresh failed: ${error.message}`);
         throw new BadRequestException(
           'Failed to refresh PowerApps token. Please reconnect your PowerApps account.'
         );
       }
     } else if (isExpired && !token.refreshToken) {
+      this.logger.error(`[AUTH CLIENT] ❌ Token expired and no refresh token available`);
       throw new BadRequestException(
         'PowerApps token expired and no refresh token available. Please reconnect your PowerApps account.'
       );
     }
 
     // Try to get BAP token using refresh token
+    this.logger.debug(`[AUTH CLIENT] Step 4: Getting BAP API token`);
     let bapToken: string | null = null;
     if (token.refreshToken) {
+      this.logger.debug(`[AUTH CLIENT] Step 4a: Attempting BAP token via refresh token`);
       bapToken = await this.getBAPTokenFromRefreshToken(token.refreshToken);
+      if (bapToken) {
+        this.logger.debug(`[AUTH CLIENT] Step 4a: ✓ BAP token obtained via refresh token`);
+      }
     }
 
     // If refresh token approach failed, try OBO flow
     if (!bapToken) {
+      this.logger.debug(`[AUTH CLIENT] Step 4b: Attempting BAP token via OBO flow`);
       bapToken = await this.exchangeForBAPToken(token.accessToken);
+      if (bapToken) {
+        this.logger.debug(`[AUTH CLIENT] Step 4b: ✓ BAP token obtained via OBO flow`);
+      } else {
+        this.logger.warn(`[AUTH CLIENT] Step 4b: ⚠️ OBO flow returned null, using original token`);
+      }
     }
 
+    this.logger.debug(`[AUTH CLIENT] Step 5: Creating axios client with BAP token`);
     return axios.create({
       headers: {
         Authorization: `Bearer ${bapToken}`,
@@ -498,23 +510,50 @@ export class PowerAppsService implements IBaseConnector {
     organizationId: string,
   ): Promise<PowerAppsEnvironment[]> {
     try {
-      this.logger.log(`Fetching PowerApps environments for user ${userId}`);
+      this.logger.debug(`[LIST ENVIRONMENTS] Starting for user ${userId}, org ${organizationId}`);
 
+      this.logger.debug(`[LIST ENVIRONMENTS] Step 1: Getting authenticated client`);
       const client = await this.getAuthenticatedClient(
         userId,
         organizationId,
       );
+      this.logger.debug(`[LIST ENVIRONMENTS] Step 1: ✓ Client obtained`);
 
-      const response = await client.get<{ value: PowerAppsEnvironment[] }>(
-        `${this.bapApiUrl}/environments?api-version=2020-10-01`,
-      );
+      const url = `${this.bapApiUrl}/environments?api-version=2020-10-01`;
+      this.logger.debug(`[LIST ENVIRONMENTS] Step 2: Calling BAP API: ${url}`);
+      
+      const response = await client.get<{ value: PowerAppsEnvironment[] }>(url);
 
-      return response.data.value || [];
+      this.logger.debug(`[LIST ENVIRONMENTS] Step 2: ✓ API responded with status ${response.status}`);
+      this.logger.debug(`[LIST ENVIRONMENTS] Step 3: Processing response data`);
+      
+      const environments = response.data.value || [];
+      this.logger.log(`[LIST ENVIRONMENTS] Step 3: ✓ Found ${environments.length} environments`);
+      
+      if (environments.length > 0) {
+        this.logger.debug(`[LIST ENVIRONMENTS] First environment: ${JSON.stringify({
+          name: environments[0].name,
+          displayName: environments[0].properties?.displayName,
+          id: environments[0].id,
+          type: environments[0].type,
+          location: environments[0].location,
+        })}`);
+      } else {
+        this.logger.warn(`[LIST ENVIRONMENTS] No environments returned from API`);
+      }
+
+      return environments;
     } catch (error) {
       this.logger.error(
-        `Failed to fetch PowerApps environments: ${error.message}`,
+        `[LIST ENVIRONMENTS] ❌ Failed to fetch PowerApps environments: ${error.message}`,
         error.stack,
       );
+
+      // Log detailed error information
+      if (error.response) {
+        this.logger.error(`[LIST ENVIRONMENTS] HTTP Status: ${error.response.status}`);
+        this.logger.error(`[LIST ENVIRONMENTS] Response Data: ${JSON.stringify(error.response.data)}`);
+      }
 
       if (error.response?.status === 401) {
         const errorData = error.response.data?.error;
@@ -832,26 +871,29 @@ export class PowerAppsService implements IBaseConnector {
       const client = await this.getAuthenticatedClient(userId, organizationId);
 
       // Create environment via BAP API
+      // Valid location/region values: unitedstates, europe, asia, australia, india, japan, canada, unitedkingdom, unitedstatesfirstrelease, southamerica, france, germany, switzerland, norway, korea, southafrica, uaenorth, singapore
+      // Note: Use lowercase without spaces (e.g., 'unitedstates' not 'United States')
+      const location = config.region || 'unitedstates';
+      
       this.logger.log(`POST ${this.bapApiUrl}/environments?api-version=2021-04-01`);
       this.logger.debug(`Request body: ${JSON.stringify({
-        location: config.region || 'unitedstates',
+        location: location,
         properties: {
           displayName: config.name,
           description: config.description || '',
           environmentSku: config.type || 'Developer',
-          azureRegion: config.region || 'unitedstates',
         },
       })}`);
 
       const response = await client.post(
         `${this.bapApiUrl}/environments?api-version=2021-04-01`,
         {
-          location: config.region || 'unitedstates',
+          location: location,
           properties: {
             displayName: config.name,
             description: config.description || '',
             environmentSku: config.type || 'Developer',
-            azureRegion: config.region || 'unitedstates',
+            // Don't specify azureRegion separately - it's inferred from location
           },
         },
       );
@@ -974,7 +1016,7 @@ export class PowerAppsService implements IBaseConnector {
    * Get environment details
    * @param userId User ID
    * @param organizationId Organization ID
-   * @param environmentId Environment ID
+   * @param environmentId Environment ID (can be full resource path or just GUID)
    */
   async getEnvironment(
     userId: string,
@@ -982,12 +1024,17 @@ export class PowerAppsService implements IBaseConnector {
     environmentId: string,
   ): Promise<PowerAppsEnvironment> {
     try {
-      this.logger.log(`Getting PowerApps environment: ${environmentId}`);
+      // Extract just the GUID if a full resource path was provided
+      // Format: /providers/Microsoft.BusinessAppPlatform/environments/{guid}
+      const envIdMatch = environmentId.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i);
+      const cleanEnvId = envIdMatch ? envIdMatch[1] : environmentId;
+      
+      this.logger.log(`Getting PowerApps environment: ${cleanEnvId}`);
 
       const client = await this.getAuthenticatedClient(userId, organizationId);
 
       const response = await client.get(
-        `${this.bapApiUrl}/environments/${environmentId}?api-version=2021-04-01`,
+        `${this.bapApiUrl}/environments/${cleanEnvId}?api-version=2021-04-01`,
       );
 
       return response.data;
