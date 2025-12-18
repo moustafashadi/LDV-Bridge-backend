@@ -24,6 +24,7 @@ import { ChangesModule } from './changes/changes.module';
 import { ReviewsModule } from './reviews/reviews.module';
 import { SandboxesModule } from './sandboxes/sandboxes.module';
 import { AppsModule } from './apps/apps.module';
+import { LinkedEnvironmentsModule } from './linked-environments/linked-environments.module';
 
 @Module({
   imports: [
@@ -64,6 +65,7 @@ import { AppsModule } from './apps/apps.module';
     AppsModule, // App access control and permissions
     ReviewsModule, // Review workflow system with comments & approval
     SandboxesModule, // Sandbox management with environment provisioning
+    LinkedEnvironmentsModule, // Linked external environments (PowerApps)
   ],
   controllers: [AppController],
   providers: [

@@ -36,6 +36,7 @@ model Organization {
   auditLogs       AuditLog[]
   sandboxes       Sandbox[]
   sandboxClones   SandboxClone[]
+  linkedEnvironments LinkedEnvironment[]
 
   @@map("organizations")
 }
@@ -85,6 +86,7 @@ model User {
   auditLogs          AuditLog[]
   sandboxes          Sandbox[]
   sandboxClones      SandboxClone[]
+  linkedEnvironments LinkedEnvironment[]
 
   @@unique([organizationId, email])
   @@index([organizationId])
@@ -518,6 +520,40 @@ model SandboxClone {
   @@index([sandboxId])
   @@index([organizationId])
   @@map("sandbox_clones")
+}
+
+// ========================================
+// LINKED ENVIRONMENTS (PowerApps)
+// ========================================
+
+// Linked environments represent external PowerApps environments
+// connected to LDV-Bridge for browsing and syncing apps.
+// This is separate from Sandbox which is an app workspace.
+model LinkedEnvironment {
+  id             String   @id @default(uuid())
+  organizationId String
+  createdById    String
+
+  name           String   // Display name in LDV-Bridge
+  description    String?
+  platform       PlatformType @default(POWERAPPS) // Currently PowerApps only
+  environmentId  String   // External platform environment ID
+  environmentUrl String?  // URL to environment in platform
+  region         String?
+  metadata       Json     @default("{}")
+
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  createdBy      User         @relation(fields: [createdById], references: [id])
+
+  @@unique([organizationId, environmentId])
+  @@index([organizationId])
+  @@index([createdById])
+  @@index([platform])
+  @@map("linked_environments")
 }
 
 // ========================================
