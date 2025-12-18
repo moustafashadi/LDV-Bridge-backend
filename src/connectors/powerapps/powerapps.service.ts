@@ -1,4 +1,10 @@
-import { Injectable, Logger, BadRequestException } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  BadRequestException,
+  Inject,
+  forwardRef,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import axios, { AxiosInstance } from 'axios';
 import {
@@ -13,6 +19,7 @@ import { OAuthService } from '../services/oauth.service';
 import { ConnectorsWebSocketGateway } from '../../websocket/websocket.gateway';
 import { AppStatus } from '@prisma/client';
 import { AppsService } from '../../apps/apps.service';
+import { GitHubService } from '../../github/github.service';
 
 /**
  * PowerApps environment info
@@ -83,6 +90,8 @@ export class PowerAppsService implements IBaseConnector {
     private oauthService: OAuthService,
     private websocketGateway: ConnectorsWebSocketGateway,
     private appsService: AppsService,
+    @Inject(forwardRef(() => GitHubService))
+    private githubService: GitHubService,
   ) {
     // Initialize OAuth config after constructor injection
     // Multi-tenant: works with any Azure AD organization
@@ -714,9 +723,11 @@ export class PowerAppsService implements IBaseConnector {
 
       const client = await this.getAuthenticatedClient(userId, organizationId);
 
-      const response = await client.get<PowerAppsApp>(
-        `${this.powerAppsApiUrl}/apps/${appId}?api-version=2016-11-01`,
-      );
+      // Use the PowerApps Maker API (same as listApps) - this works with service.powerapps.com token
+      const url = `https://api.powerapps.com/providers/Microsoft.PowerApps/apps/${appId}?api-version=2016-11-01`;
+      this.logger.debug(`[GET APP] Calling PowerApps Maker API: ${url}`);
+
+      const response = await client.get<PowerAppsApp>(url);
 
       return response.data;
     } catch (error) {
@@ -745,21 +756,45 @@ export class PowerAppsService implements IBaseConnector {
       // Get app details from PowerApps
       const appDetails = await this.getApp(userId, organizationId, appId);
 
-      // Get the connector for this user
-      const connections = await this.tokenManager[
+      // Get or create the connector for this organization
+      let connection = await this.tokenManager[
         'prisma'
-      ].platformConnector.findMany({
+      ].platformConnector.findFirst({
         where: {
           organizationId,
           platform: 'POWERAPPS',
           isActive: true,
         },
-        take: 1,
       });
 
-      const connection = connections[0];
+      // If no connector exists but user has a valid connection, create a default connector
       if (!connection) {
-        throw new BadRequestException('No active PowerApps connection found');
+        const userConnection = await this.tokenManager.getToken(
+          userId,
+          this.platform,
+        );
+        if (userConnection) {
+          this.logger.log(
+            `Creating default PowerApps connector for organization ${organizationId}`,
+          );
+          connection = await this.tokenManager[
+            'prisma'
+          ].platformConnector.create({
+            data: {
+              organizationId,
+              platform: 'POWERAPPS',
+              name: 'PowerApps (Auto-created)',
+              isActive: true,
+              config: {},
+            },
+          });
+        }
+      }
+
+      if (!connection) {
+        throw new BadRequestException(
+          'No active PowerApps connection found. Please connect PowerApps first.',
+        );
       }
 
       // Create or update app in database
@@ -801,12 +836,112 @@ export class PowerAppsService implements IBaseConnector {
         this.logger.log(`Created new app ${app.name} (${app.id})`);
       }
 
+      // === GitHub Integration ===
+      // Sync to GitHub if organization has GitHub connected
+      try {
+        const organization = await this.appsService[
+          'prisma'
+        ].organization.findUnique({
+          where: { id: organizationId },
+        });
+
+        if (organization?.githubInstallationId) {
+          this.logger.log(
+            `[GITHUB] Organization has GitHub connected, syncing to repository...`,
+          );
+
+          // Create GitHub repo if it doesn't exist
+          if (!app.githubRepoUrl) {
+            this.logger.log(`[GITHUB] Creating repository for app ${app.name}`);
+            const repo = await this.githubService.createAppRepository(app);
+
+            // Update app with GitHub repo info
+            app = await this.appsService['prisma'].app.update({
+              where: { id: app.id },
+              data: {
+                githubRepoId: repo.node_id,
+                githubRepoUrl: repo.html_url,
+                githubRepoName: repo.full_name,
+              },
+            });
+            this.logger.log(`[GITHUB] Created repository: ${repo.full_name}`);
+          }
+
+          // Download and commit the msapp content
+          try {
+            this.logger.log(
+              `[GITHUB] Exporting msapp and committing to GitHub...`,
+            );
+
+            // Export the msapp file
+            const msappBuffer = await this.exportApp(
+              userId,
+              organizationId,
+              appId,
+            );
+
+            // Create a temp directory with the msapp content
+            const os = require('os');
+            const path = require('path');
+            const fs = require('fs');
+
+            const tempDir = path.join(
+              os.tmpdir(),
+              'ldvbridge',
+              `app_${app.id}_${Date.now()}`,
+            );
+            await fs.promises.mkdir(tempDir, { recursive: true });
+
+            // Write msapp and extract it
+            const msappPath = path.join(tempDir, 'app.msapp');
+            await fs.promises.writeFile(msappPath, msappBuffer);
+
+            // Use unzipper to extract
+            const unzipper = require('unzipper');
+            const extractPath = path.join(tempDir, 'extracted');
+            await fs.promises.mkdir(extractPath, { recursive: true });
+
+            await fs
+              .createReadStream(msappPath)
+              .pipe(unzipper.Extract({ path: extractPath }))
+              .promise();
+
+            // Commit the extracted content to GitHub
+            await this.githubService.commitAppSnapshot(
+              app,
+              extractPath,
+              `Sync: ${app.name} - ${new Date().toISOString()}`,
+            );
+
+            this.logger.log(
+              `[GITHUB] Successfully committed app content to GitHub`,
+            );
+
+            // Cleanup temp directory
+            await fs.promises.rm(tempDir, { recursive: true, force: true });
+          } catch (exportError) {
+            this.logger.warn(
+              `[GITHUB] Failed to export/commit msapp: ${exportError.message}`,
+            );
+            // Don't fail the sync if GitHub commit fails
+          }
+        } else {
+          this.logger.debug(
+            `[GITHUB] Organization does not have GitHub connected, skipping`,
+          );
+        }
+      } catch (githubError) {
+        this.logger.warn(`[GITHUB] GitHub sync failed: ${githubError.message}`);
+        // Don't fail the main sync if GitHub sync fails
+      }
+
       return {
         success: true,
         appId: app.id,
         componentsCount: 0, // Will be populated by component extraction
         changesDetected: 0, // Will be populated by change detection
         syncedAt: new Date(),
+        githubRepoUrl: app.githubRepoUrl,
       };
     } catch (error) {
       this.logger.error(
@@ -828,6 +963,9 @@ export class PowerAppsService implements IBaseConnector {
   /**
    * Export PowerApp (download .msapp file)
    * This will download the app package for analysis
+   *
+   * The msapp file URL is available in the app metadata from getApp response
+   * at: properties.appUris.documentUri.value
    */
   async exportApp(
     userId: string,
@@ -837,24 +975,34 @@ export class PowerAppsService implements IBaseConnector {
     try {
       this.logger.log(`Exporting PowerApp ${appId} for user ${userId}`);
 
-      const client = await this.getAuthenticatedClient(userId, organizationId);
+      // First, get the app details to find the documentUri
+      const appDetails = (await this.getApp(
+        userId,
+        organizationId,
+        appId,
+      )) as any;
 
-      // Request app export
-      const exportResponse = await client.post(
-        `${this.powerAppsApiUrl}/apps/${appId}/exportPackage?api-version=2016-11-01`,
-        {},
-      );
+      const documentUri = appDetails?.properties?.appUris?.documentUri?.value;
 
-      const packageLink = exportResponse.data?.packageLink?.value;
-
-      if (!packageLink) {
-        throw new BadRequestException('Failed to get app export link');
+      if (!documentUri) {
+        throw new BadRequestException(
+          'Failed to get app document URI. The app may not have been published yet.',
+        );
       }
 
-      // Download the package
-      const downloadResponse = await axios.get(packageLink, {
+      this.logger.debug(
+        `[EXPORT] Downloading msapp from: ${documentUri.substring(0, 100)}...`,
+      );
+
+      // Download the msapp file directly from the blob storage URL
+      // This URL already contains SAS token authentication
+      const downloadResponse = await axios.get(documentUri, {
         responseType: 'arraybuffer',
       });
+
+      this.logger.log(
+        `[EXPORT] Successfully downloaded msapp (${downloadResponse.data.byteLength} bytes)`,
+      );
 
       return Buffer.from(downloadResponse.data);
     } catch (error) {

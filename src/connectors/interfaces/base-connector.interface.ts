@@ -102,4 +102,5 @@ export interface ISyncResult {
   changesDetected: number;
   syncedAt: Date;
   errors?: string[];
+  githubRepoUrl?: string;
 }

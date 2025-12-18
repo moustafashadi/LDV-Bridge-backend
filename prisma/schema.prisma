@@ -25,6 +25,10 @@ model Organization {
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt
 
+  // GitHub Integration
+  githubInstallationId String? // GitHub App installation ID
+  githubOrgName        String? // GitHub organization name
+
   // Relations
   users           User[]
   apps            App[]
@@ -231,6 +235,11 @@ model App {
   metadata       Json? // Full app metadata from platform
   lastSyncedAt   DateTime?
   createdAt      DateTime     @default(now())
+
+  // GitHub Integration
+  githubRepoId   String? // GitHub repository ID
+  githubRepoUrl  String? // e.g., https://github.com/org/ldvbridge-myapp
+  githubRepoName String? // e.g., ldvbridge-myapp
   updatedAt      DateTime     @updatedAt
 
   organization  Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
@@ -441,6 +450,10 @@ model Review {
   createdAt   DateTime     @default(now())
   updatedAt   DateTime     @updatedAt
 
+  // GitHub Integration
+  githubPrNumber Int?    // Pull Request number
+  githubPrUrl    String? // PR URL
+
   change   Change @relation(fields: [changeId], references: [id], onDelete: Cascade)
   reviewer User   @relation("Reviewer", fields: [reviewerId], references: [id])
 
@@ -487,6 +500,9 @@ model Sandbox {
   expiresAt      DateTime?
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
+
+  // GitHub Integration
+  githubBranch   String? // e.g., sandbox/abc123
 
   organization Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   createdBy    User           @relation(fields: [createdById], references: [id])

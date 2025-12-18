@@ -1,7 +1,16 @@
-import { Injectable, NotFoundException, ForbiddenException, BadRequestException, Logger } from '@nestjs/common';
+import {
+  Injectable,
+  NotFoundException,
+  ForbiddenException,
+  BadRequestException,
+  Logger,
+} from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { AppStatus } from '@prisma/client';
-import { GrantAppAccessDto, UpdateAppAccessDto } from './dto/grant-app-access.dto';
+import {
+  GrantAppAccessDto,
+  UpdateAppAccessDto,
+} from './dto/grant-app-access.dto';
 import { CreateAppDto } from './dto/create-app.dto';
 
 @Injectable()
@@ -13,12 +22,10 @@ export class AppsService {
   /**
    * Create a new app
    */
-  async createApp(
-    userId: string,
-    organizationId: string,
-    dto: CreateAppDto,
-  ) {
-    this.logger.log(`Creating new app: ${dto.name} for organization ${organizationId}`);
+  async createApp(userId: string, organizationId: string, dto: CreateAppDto) {
+    this.logger.log(
+      `Creating new app: ${dto.name} for organization ${organizationId}`,
+    );
 
     // If externalId is provided, check for duplicates
     if (dto.externalId) {
@@ -50,7 +57,9 @@ export class AppsService {
       });
 
       if (!connector) {
-        throw new NotFoundException('Connector not found or does not belong to organization');
+        throw new NotFoundException(
+          'Connector not found or does not belong to organization',
+        );
       }
     }
 
@@ -116,6 +125,57 @@ export class AppsService {
   }
 
   /**
+   * Get a single app by ID
+   */
+  async getAppById(appId: string, organizationId: string) {
+    const app = await this.prisma.app.findFirst({
+      where: {
+        id: appId,
+        organizationId,
+      },
+      include: {
+        owner: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+          },
+        },
+        sandboxes: {
+          select: {
+            id: true,
+            name: true,
+            status: true,
+            createdAt: true,
+          },
+          orderBy: {
+            createdAt: 'desc',
+          },
+          take: 10,
+        },
+        changes: {
+          select: {
+            id: true,
+            changeType: true,
+            description: true,
+            createdAt: true,
+          },
+          orderBy: {
+            createdAt: 'desc',
+          },
+          take: 10,
+        },
+      },
+    });
+
+    if (!app) {
+      throw new NotFoundException('App not found');
+    }
+
+    return app;
+  }
+
+  /**
    * Grant access to an app for one or more users
    */
   async grantAccess(
@@ -154,7 +214,9 @@ export class AppsService {
       (await this.hasAccessLevel(appId, grantedByUserId, 'OWNER'));
 
     if (!canGrant) {
-      throw new ForbiddenException('You do not have permission to grant access to this app');
+      throw new ForbiddenException(
+        'You do not have permission to grant access to this app',
+      );
     }
 
     // Verify all users exist and belong to the same organization
@@ -166,7 +228,9 @@ export class AppsService {
     });
 
     if (users.length !== dto.userIds.length) {
-      throw new BadRequestException('One or more users not found or not in the same organization');
+      throw new BadRequestException(
+        'One or more users not found or not in the same organization',
+      );
     }
 
     // Create or update permissions for each user
@@ -295,7 +359,9 @@ export class AppsService {
       (await this.hasAccessLevel(appId, updatedByUserId, 'OWNER'));
 
     if (!canUpdate) {
-      throw new ForbiddenException('You do not have permission to update access to this app');
+      throw new ForbiddenException(
+        'You do not have permission to update access to this app',
+      );
     }
 
     // Find existing permission
@@ -333,7 +399,9 @@ export class AppsService {
       },
     });
 
-    this.logger.log(`User ${updatedByUserId} updated access for user ${userId} on app ${appId} to ${dto.accessLevel}`);
+    this.logger.log(
+      `User ${updatedByUserId} updated access for user ${userId} on app ${appId} to ${dto.accessLevel}`,
+    );
 
     return updated;
   }
@@ -341,7 +409,12 @@ export class AppsService {
   /**
    * Revoke access from a user
    */
-  async revokeAccess(appId: string, userId: string, revokedByUserId: string, organizationId: string) {
+  async revokeAccess(
+    appId: string,
+    userId: string,
+    revokedByUserId: string,
+    organizationId: string,
+  ) {
     // Verify app exists
     const app = await this.prisma.app.findFirst({
       where: {
@@ -365,7 +438,9 @@ export class AppsService {
       (await this.hasAccessLevel(appId, revokedByUserId, 'OWNER'));
 
     if (!canRevoke) {
-      throw new ForbiddenException('You do not have permission to revoke access to this app');
+      throw new ForbiddenException(
+        'You do not have permission to revoke access to this app',
+      );
     }
 
     // Find and delete permission
@@ -386,7 +461,9 @@ export class AppsService {
       where: { id: permission.id },
     });
 
-    this.logger.log(`User ${revokedByUserId} revoked access for user ${userId} on app ${appId}`);
+    this.logger.log(
+      `User ${revokedByUserId} revoked access for user ${userId} on app ${appId}`,
+    );
 
     return { message: 'Access revoked successfully' };
   }
@@ -461,7 +538,11 @@ export class AppsService {
   /**
    * Check if user has at least a certain access level to an app
    */
-  private async hasAccessLevel(appId: string, userId: string, minLevel: string): Promise<boolean> {
+  private async hasAccessLevel(
+    appId: string,
+    userId: string,
+    minLevel: string,
+  ): Promise<boolean> {
     const permission = await this.prisma.appPermission.findUnique({
       where: {
         appId_userId: {

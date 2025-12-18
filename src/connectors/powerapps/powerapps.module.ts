@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { Module, forwardRef } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { PowerAppsController } from './powerapps.controller';
 import { PowerAppsService } from './powerapps.service';
@@ -7,6 +7,7 @@ import { TokenManagerService } from '../services/token-manager.service';
 import { PrismaModule } from '../../prisma/prisma.module';
 import { WebSocketModule } from '../../websocket/websocket.module';
 import { AppsModule } from '../../apps/apps.module';
+import { GitHubModule } from '../../github/github.module';
 
 @Module({
   imports: [
@@ -14,13 +15,10 @@ import { AppsModule } from '../../apps/apps.module';
     PrismaModule,
     WebSocketModule,
     AppsModule,
+    forwardRef(() => GitHubModule),
   ],
   controllers: [PowerAppsController],
-  providers: [
-    PowerAppsService,
-    OAuthService,
-    TokenManagerService,
-  ],
+  providers: [PowerAppsService, OAuthService, TokenManagerService],
   exports: [PowerAppsService],
 })
 export class PowerAppsModule {}

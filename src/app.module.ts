@@ -25,6 +25,7 @@ import { ReviewsModule } from './reviews/reviews.module';
 import { SandboxesModule } from './sandboxes/sandboxes.module';
 import { AppsModule } from './apps/apps.module';
 import { LinkedEnvironmentsModule } from './linked-environments/linked-environments.module';
+import { GitHubModule } from './github/github.module';
 
 @Module({
   imports: [
@@ -66,6 +67,7 @@ import { LinkedEnvironmentsModule } from './linked-environments/linked-environme
     ReviewsModule, // Review workflow system with comments & approval
     SandboxesModule, // Sandbox management with environment provisioning
     LinkedEnvironmentsModule, // Linked external environments (PowerApps)
+    GitHubModule, // GitHub integration for version control
   ],
   controllers: [AppController],
   providers: [
