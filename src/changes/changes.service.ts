@@ -1,4 +1,10 @@
-import { Injectable, Logger, NotFoundException, Inject, forwardRef } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  NotFoundException,
+  Inject,
+  forwardRef,
+} from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../common/audit/audit.service';
 import { ChangesGateway } from './changes.gateway';
@@ -79,7 +85,10 @@ export class ChangesService {
       const afterMetadata = app.metadata || {};
 
       // Calculate diff
-      const diffSummary = this.jsonDiffService.calculateDiff(beforeMetadata, afterMetadata);
+      const diffSummary = this.jsonDiffService.calculateDiff(
+        beforeMetadata,
+        afterMetadata,
+      );
 
       // If no changes, return early
       if (diffSummary.totalChanges === 0) {
@@ -95,10 +104,11 @@ export class ChangesService {
       const changeType = this.determineChangeType(diffSummary);
 
       // Create change record
-      // Note: authorId can be null for system-detected changes
-      const changeData: any = {
-        organizationId,
-        appId,
+      // Note: authorId can be null for system-detected changes, but Prisma requires author relation
+      // For system-detected changes without a valid user, we'll skip setting author
+      const changeCreateData: any = {
+        organization: { connect: { id: organizationId } },
+        app: { connect: { id: appId } },
         title: `Auto-detected changes from sync on ${new Date().toLocaleString()}`,
         description: `Detected ${diffSummary.totalChanges} changes: ${diffSummary.added} added, ${diffSummary.modified} modified, ${diffSummary.deleted} deleted`,
         changeType,
@@ -108,13 +118,13 @@ export class ChangesService {
         diffSummary,
       };
 
-      // Only set authorId if it's a valid user (not 'system')
+      // Only set author if it's a valid user (not 'system')
       if (userId && userId !== 'system') {
-        changeData.authorId = userId;
+        changeCreateData.author = { connect: { id: userId } };
       }
 
       const change = await this.prisma.change.create({
-        data: changeData,
+        data: changeCreateData,
         include: {
           app: {
             select: {
@@ -132,7 +142,9 @@ export class ChangesService {
 
       // Analyze impact (async, in background)
       this.analyzeChangeImpact(change.id).catch((error) => {
-        this.logger.error(`Failed to analyze impact for change ${change.id}: ${error.message}`);
+        this.logger.error(
+          `Failed to analyze impact for change ${change.id}: ${error.message}`,
+        );
       });
 
       // Audit log
@@ -149,7 +161,9 @@ export class ChangesService {
         },
       });
 
-      this.logger.log(`Detected ${diffSummary.totalChanges} changes for app ${appId}`);
+      this.logger.log(
+        `Detected ${diffSummary.totalChanges} changes for app ${appId}`,
+      );
 
       return {
         success: true,
@@ -158,7 +172,10 @@ export class ChangesService {
         change: this.mapToResponseDto(change),
       };
     } catch (error) {
-      this.logger.error(`Failed to detect changes: ${error.message}`, error.stack);
+      this.logger.error(
+        `Failed to detect changes: ${error.message}`,
+        error.stack,
+      );
       throw error;
     }
   }
@@ -190,10 +207,13 @@ export class ChangesService {
       this.changesGateway.emitSyncStarted(sandboxId);
 
       // Get the appId from sandbox (if linked)
-      const appId = (sandbox as any).appId || (sandbox.environment as any)?.appId;
+      const appId =
+        (sandbox as any).appId || (sandbox.environment as any)?.appId;
 
       if (!appId) {
-        throw new NotFoundException(`Sandbox ${sandboxId} is not linked to an app`);
+        throw new NotFoundException(
+          `Sandbox ${sandboxId} is not linked to an app`,
+        );
       }
 
       // Detect changes for the app
@@ -202,7 +222,9 @@ export class ChangesService {
       // Emit sync completed event
       this.changesGateway.emitSyncCompleted(sandboxId, result.totalChanges);
 
-      this.logger.log(`Manual sync completed for sandbox ${sandboxId}: ${result.totalChanges} changes`);
+      this.logger.log(
+        `Manual sync completed for sandbox ${sandboxId}: ${result.totalChanges} changes`,
+      );
 
       return {
         success: true,
@@ -210,7 +232,10 @@ export class ChangesService {
         changeCount: result.totalChanges,
       };
     } catch (error) {
-      this.logger.error(`Failed to sync sandbox ${sandboxId}: ${error.message}`, error.stack);
+      this.logger.error(
+        `Failed to sync sandbox ${sandboxId}: ${error.message}`,
+        error.stack,
+      );
       throw error;
     }
   }
@@ -247,9 +272,14 @@ export class ChangesService {
         });
 
         const code = change.afterCode || change.beforeCode;
-        const platform = (app?.platform?.toLowerCase() === 'mendix' ? 'mendix' : 'powerapps') as 'powerapps' | 'mendix';
+        const platform = (
+          app?.platform?.toLowerCase() === 'mendix' ? 'mendix' : 'powerapps'
+        ) as 'powerapps' | 'mendix';
 
-        formulaAnalysis = await this.formulaAnalyzer.analyzeFormula(code, platform);
+        formulaAnalysis = await this.formulaAnalyzer.analyzeFormula(
+          code,
+          platform,
+        );
       }
 
       // Step 4: Calculate enhanced risk score
@@ -280,7 +310,10 @@ export class ChangesService {
         );
       }
     } catch (error) {
-      this.logger.error(`Failed to analyze impact: ${error.message}`, error.stack);
+      this.logger.error(
+        `Failed to analyze impact: ${error.message}`,
+        error.stack,
+      );
     }
   }
 
@@ -416,7 +449,10 @@ export class ChangesService {
 
       return this.mapToResponseDto(change);
     } catch (error) {
-      this.logger.error(`Failed to create change: ${error.message}`, error.stack);
+      this.logger.error(
+        `Failed to create change: ${error.message}`,
+        error.stack,
+      );
       throw error;
     }
   }
@@ -499,7 +535,10 @@ export class ChangesService {
   /**
    * Get a single change
    */
-  async findOne(id: string, organizationId: string): Promise<ChangeResponseDto> {
+  async findOne(
+    id: string,
+    organizationId: string,
+  ): Promise<ChangeResponseDto> {
     const change = await this.prisma.change.findUnique({
       where: {
         id,
@@ -551,11 +590,16 @@ export class ChangesService {
     // Recalculate diff if metadata changed
     let diffSummary: any = existingChange.diffSummary;
     if (updateChangeDto.beforeMetadata || updateChangeDto.afterMetadata) {
-      const beforeMetadata = updateChangeDto.beforeMetadata || existingChange.beforeMetadata;
-      const afterMetadata = updateChangeDto.afterMetadata || existingChange.afterMetadata;
+      const beforeMetadata =
+        updateChangeDto.beforeMetadata || existingChange.beforeMetadata;
+      const afterMetadata =
+        updateChangeDto.afterMetadata || existingChange.afterMetadata;
 
       if (beforeMetadata && afterMetadata) {
-        diffSummary = this.jsonDiffService.calculateDiff(beforeMetadata, afterMetadata) as any;
+        diffSummary = this.jsonDiffService.calculateDiff(
+          beforeMetadata,
+          afterMetadata,
+        ) as any;
       }
     }
 
@@ -612,7 +656,11 @@ export class ChangesService {
   /**
    * Delete a change
    */
-  async remove(id: string, userId: string, organizationId: string): Promise<void> {
+  async remove(
+    id: string,
+    userId: string,
+    organizationId: string,
+  ): Promise<void> {
     // Verify change exists
     const change = await this.prisma.change.findUnique({
       where: {
@@ -652,7 +700,11 @@ export class ChangesService {
   /**
    * Undo (soft delete) a change
    */
-  async undo(id: string, userId: string, organizationId: string): Promise<ChangeResponseDto> {
+  async undo(
+    id: string,
+    userId: string,
+    organizationId: string,
+  ): Promise<ChangeResponseDto> {
     // Verify change exists and is not already deleted
     const change = await this.prisma.change.findUnique({
       where: {
@@ -725,7 +777,11 @@ export class ChangesService {
   /**
    * Restore (undelete) a change
    */
-  async restore(id: string, userId: string, organizationId: string): Promise<ChangeResponseDto> {
+  async restore(
+    id: string,
+    userId: string,
+    organizationId: string,
+  ): Promise<ChangeResponseDto> {
     // Verify change exists and is deleted
     const change = await this.prisma.change.findUnique({
       where: {
@@ -808,8 +864,10 @@ export class ChangesService {
     }
 
     // Use code if available, otherwise use metadata
-    const before = change.beforeCode || JSON.stringify(change.beforeMetadata, null, 2) || '';
-    const after = change.afterCode || JSON.stringify(change.afterMetadata, null, 2) || '';
+    const before =
+      change.beforeCode || JSON.stringify(change.beforeMetadata, null, 2) || '';
+    const after =
+      change.afterCode || JSON.stringify(change.afterMetadata, null, 2) || '';
 
     if (format === 'html') {
       return this.jsonDiffService.generateHtmlDiff(before, after);

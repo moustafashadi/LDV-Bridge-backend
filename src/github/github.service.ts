@@ -112,6 +112,22 @@ export class GitHubService {
       iss: this.appId,
     };
 
+    // Debug logging
+    this.logger.debug(`[JWT DEBUG] App ID: ${this.appId}`);
+    this.logger.debug(`[JWT DEBUG] Current timestamp: ${now}`);
+    this.logger.debug(
+      `[JWT DEBUG] iat: ${payload.iat} (${new Date(payload.iat * 1000).toISOString()})`,
+    );
+    this.logger.debug(
+      `[JWT DEBUG] exp: ${payload.exp} (${new Date(payload.exp * 1000).toISOString()})`,
+    );
+    this.logger.debug(
+      `[JWT DEBUG] Private key length: ${this.privateKey.length} chars`,
+    );
+    this.logger.debug(
+      `[JWT DEBUG] Private key starts with: ${this.privateKey.substring(0, 30)}...`,
+    );
+
     return jwt.sign(payload, this.privateKey, { algorithm: 'RS256' });
   }
 

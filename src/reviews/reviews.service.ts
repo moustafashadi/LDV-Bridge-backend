@@ -12,7 +12,10 @@ import { CreateReviewDto } from './dto/create-review.dto';
 import { SubmitForReviewDto } from './dto/submit-for-review.dto';
 import { ReviewDecisionDto } from './dto/review-decision.dto';
 import { ReviewResponseDto, ReviewSLADto } from './dto/review-response.dto';
-import { ReviewMetricsDto, RiskLevelMetricsDto } from './dto/review-metrics.dto';
+import {
+  ReviewMetricsDto,
+  RiskLevelMetricsDto,
+} from './dto/review-metrics.dto';
 
 // SLA thresholds in hours by risk level
 const SLA_THRESHOLDS = {
@@ -67,7 +70,10 @@ export class ReviewsService {
 
     // Determine reviewers
     let reviewerIds: string[] = [];
-    if (submitForReviewDto.reviewerIds && submitForReviewDto.reviewerIds.length > 0) {
+    if (
+      submitForReviewDto.reviewerIds &&
+      submitForReviewDto.reviewerIds.length > 0
+    ) {
       reviewerIds = submitForReviewDto.reviewerIds;
     } else {
       reviewerIds = await this.autoAssignReviewers(change);
@@ -84,7 +90,9 @@ export class ReviewsService {
 
       return {
         message: 'Change auto-approved due to low risk',
-        change: await this.prisma.change.findUnique({ where: { id: changeId } }),
+        change: await this.prisma.change.findUnique({
+          where: { id: changeId },
+        }),
         reviews: [],
       };
     }
@@ -201,7 +209,12 @@ export class ReviewsService {
       page?: number;
       limit?: number;
     },
-  ): Promise<{ data: ReviewResponseDto[]; total: number; page: number; limit: number }> {
+  ): Promise<{
+    data: ReviewResponseDto[];
+    total: number;
+    page: number;
+    limit: number;
+  }> {
     const page = filters.page || 1;
     const limit = filters.limit || 20;
     const skip = (page - 1) * limit;
@@ -254,7 +267,10 @@ export class ReviewsService {
   /**
    * Get a single review by ID
    */
-  async findOne(reviewId: string, organizationId: string): Promise<ReviewResponseDto> {
+  async findOne(
+    reviewId: string,
+    organizationId: string,
+  ): Promise<ReviewResponseDto> {
     const review = await this.prisma.review.findFirst({
       where: {
         id: reviewId,
@@ -312,7 +328,9 @@ export class ReviewsService {
     }
 
     if (review.status !== ReviewStatus.PENDING) {
-      throw new BadRequestException(`Review is already ${review.status.toLowerCase()}`);
+      throw new BadRequestException(
+        `Review is already ${review.status.toLowerCase()}`,
+      );
     }
 
     const updatedReview = await this.prisma.review.update({
@@ -342,18 +360,20 @@ export class ReviewsService {
       },
     });
 
-    // Notify change author
-    await this.notificationsService.sendNotification({
-      userId: review.change.authorId,
-      type: 'REVIEW_ASSIGNED',
-      title: 'Review Started',
-      message: `${updatedReview.reviewer.name} has started reviewing "${review.change.title}"`,
-      data: {
-        reviewId,
-        changeId: review.changeId,
-        reviewerName: updatedReview.reviewer.name,
-      },
-    });
+    // Notify change author (if known)
+    if (review.change.authorId) {
+      await this.notificationsService.sendNotification({
+        userId: review.change.authorId,
+        type: 'REVIEW_ASSIGNED',
+        title: 'Review Started',
+        message: `${updatedReview.reviewer.name} has started reviewing "${review.change.title}"`,
+        data: {
+          reviewId,
+          changeId: review.changeId,
+          reviewerName: updatedReview.reviewer.name,
+        },
+      });
+    }
 
     this.logger.log(`Review ${reviewId} started by user ${userId}`);
 
@@ -368,7 +388,11 @@ export class ReviewsService {
     userId: string,
     organizationId: string,
     reviewDecisionDto: ReviewDecisionDto,
-  ): Promise<{ review: ReviewResponseDto; changeStatus: string; allApproved: boolean }> {
+  ): Promise<{
+    review: ReviewResponseDto;
+    changeStatus: string;
+    allApproved: boolean;
+  }> {
     const review = await this.prisma.review.findFirst({
       where: {
         id: reviewId,
@@ -431,31 +455,35 @@ export class ReviewsService {
       });
       changeStatus = 'APPROVED';
 
-      // Notify change author of approval
-      await this.notificationsService.sendNotification({
-        userId: review.change.authorId,
-        type: 'REVIEW_APPROVED',
-        title: 'Change Approved',
-        message: `Your change "${review.change.title}" has been approved and is ready for deployment`,
-        data: {
-          reviewId,
-          changeId: review.changeId,
-          reviewerName: updatedReview.reviewer.name,
-        },
-      });
+      // Notify change author of approval (if known)
+      if (review.change.authorId) {
+        await this.notificationsService.sendNotification({
+          userId: review.change.authorId,
+          type: 'REVIEW_APPROVED',
+          title: 'Change Approved',
+          message: `Your change "${review.change.title}" has been approved and is ready for deployment`,
+          data: {
+            reviewId,
+            changeId: review.changeId,
+            reviewerName: updatedReview.reviewer.name,
+          },
+        });
+      }
     } else {
-      // Notify author that one review is approved but others pending
-      await this.notificationsService.sendNotification({
-        userId: review.change.authorId,
-        type: 'REVIEW_APPROVED',
-        title: 'Review Approved',
-        message: `${updatedReview.reviewer.name} approved "${review.change.title}". Waiting for other reviewers.`,
-        data: {
-          reviewId,
-          changeId: review.changeId,
-          reviewerName: updatedReview.reviewer.name,
-        },
-      });
+      // Notify author that one review is approved but others pending (if known)
+      if (review.change.authorId) {
+        await this.notificationsService.sendNotification({
+          userId: review.change.authorId,
+          type: 'REVIEW_APPROVED',
+          title: 'Review Approved',
+          message: `${updatedReview.reviewer.name} approved "${review.change.title}". Waiting for other reviewers.`,
+          data: {
+            reviewId,
+            changeId: review.changeId,
+            reviewerName: updatedReview.reviewer.name,
+          },
+        });
+      }
     }
 
     this.logger.log(`Review ${reviewId} approved by user ${userId}`);
@@ -532,19 +560,21 @@ export class ReviewsService {
       data: { status: 'REJECTED' },
     });
 
-    // Notify change author
-    await this.notificationsService.sendNotification({
-      userId: review.change.authorId,
-      type: 'REVIEW_REJECTED',
-      title: 'Change Rejected',
-      message: `${updatedReview.reviewer.name} rejected "${review.change.title}": ${reviewDecisionDto.feedback}`,
-      data: {
-        reviewId,
-        changeId: review.changeId,
-        reviewerName: updatedReview.reviewer.name,
-        feedback: reviewDecisionDto.feedback,
-      },
-    });
+    // Notify change author (if known)
+    if (review.change.authorId) {
+      await this.notificationsService.sendNotification({
+        userId: review.change.authorId,
+        type: 'REVIEW_REJECTED',
+        title: 'Change Rejected',
+        message: `${updatedReview.reviewer.name} rejected "${review.change.title}": ${reviewDecisionDto.feedback}`,
+        data: {
+          reviewId,
+          changeId: review.changeId,
+          reviewerName: updatedReview.reviewer.name,
+          feedback: reviewDecisionDto.feedback,
+        },
+      });
+    }
 
     this.logger.log(`Review ${reviewId} rejected by user ${userId}`);
 
@@ -612,21 +642,25 @@ export class ReviewsService {
       data: { status: 'DRAFT' },
     });
 
-    // Notify change author
-    await this.notificationsService.sendNotification({
-      userId: review.change.authorId,
-      type: 'CHANGE_REQUESTED',
-      title: 'Changes Requested',
-      message: `${updatedReview.reviewer.name} requested changes on "${review.change.title}": ${reviewDecisionDto.feedback}`,
-      data: {
-        reviewId,
-        changeId: review.changeId,
-        reviewerName: updatedReview.reviewer.name,
-        feedback: reviewDecisionDto.feedback,
-      },
-    });
+    // Notify change author (if known)
+    if (review.change.authorId) {
+      await this.notificationsService.sendNotification({
+        userId: review.change.authorId,
+        type: 'CHANGE_REQUESTED',
+        title: 'Changes Requested',
+        message: `${updatedReview.reviewer.name} requested changes on "${review.change.title}": ${reviewDecisionDto.feedback}`,
+        data: {
+          reviewId,
+          changeId: review.changeId,
+          reviewerName: updatedReview.reviewer.name,
+          feedback: reviewDecisionDto.feedback,
+        },
+      });
+    }
 
-    this.logger.log(`Changes requested on review ${reviewId} by user ${userId}`);
+    this.logger.log(
+      `Changes requested on review ${reviewId} by user ${userId}`,
+    );
 
     return this.mapToResponseDto(updatedReview);
   }
@@ -749,8 +783,10 @@ export class ReviewsService {
       allReviews.length > 0 ? totalResponseTime / allReviews.length : 0;
     const avgReviewTime =
       allReviews.length > 0 ? totalReviewTime / allReviews.length : 0;
-    const approvalRate = completedReviews > 0 ? approvalCount / completedReviews : 0;
-    const rejectionRate = completedReviews > 0 ? rejectionCount / completedReviews : 0;
+    const approvalRate =
+      completedReviews > 0 ? approvalCount / completedReviews : 0;
+    const rejectionRate =
+      completedReviews > 0 ? rejectionCount / completedReviews : 0;
     const changesRequestedRate =
       completedReviews > 0 ? changesRequestedCount / completedReviews : 0;
 
@@ -765,12 +801,13 @@ export class ReviewsService {
       rejectionRate: Number(rejectionRate.toFixed(2)),
       changesRequestedRate: Number(changesRequestedRate.toFixed(2)),
       overdueReviews: overdueCount,
-      dateRange: filters?.from || filters?.to
-        ? {
-            from: filters.from || new Date(0),
-            to: filters.to || new Date(),
-          }
-        : undefined,
+      dateRange:
+        filters?.from || filters?.to
+          ? {
+              from: filters.from || new Date(0),
+              to: filters.to || new Date(),
+            }
+          : undefined,
     };
   }
 
@@ -820,7 +857,10 @@ export class ReviewsService {
   /**
    * Notify reviewers of new assignment
    */
-  private async notifyReviewers(reviews: ReviewResponseDto[], change: any): Promise<void> {
+  private async notifyReviewers(
+    reviews: ReviewResponseDto[],
+    change: any,
+  ): Promise<void> {
     for (const review of reviews) {
       try {
         await this.notificationsService.sendNotification({
@@ -846,7 +886,9 @@ export class ReviewsService {
   /**
    * Get risk level from risk score
    */
-  private getRiskLevel(riskScore: number): 'low' | 'medium' | 'high' | 'critical' {
+  private getRiskLevel(
+    riskScore: number,
+  ): 'low' | 'medium' | 'high' | 'critical' {
     if (riskScore < 30) return 'low';
     if (riskScore < 60) return 'medium';
     if (riskScore < 80) return 'high';
@@ -900,7 +942,8 @@ export class ReviewsService {
    */
   private mapToResponseDto(review: any): ReviewResponseDto {
     const riskAssessment = review.change.riskAssessment as any;
-    const riskLevel = riskAssessment?.level || this.getRiskLevel(review.change.riskScore || 0);
+    const riskLevel =
+      riskAssessment?.level || this.getRiskLevel(review.change.riskScore || 0);
 
     return {
       id: review.id,
