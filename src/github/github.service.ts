@@ -319,6 +319,60 @@ export class GitHubService {
       });
     }
 
+    // Handle "name already exists" error - fetch existing repo instead
+    if (!response.ok && response.status === 422) {
+      const error = await response.json();
+      const nameExistsError = error.errors?.some(
+        (e: any) => e.field === 'name' && e.message?.includes('already exists'),
+      );
+
+      if (nameExistsError) {
+        this.logger.log(
+          `Repository ${repoName} already exists, fetching existing repo...`,
+        );
+
+        // Fetch the existing repository
+        const getRepoResponse = await fetch(
+          `https://api.github.com/repos/${org.githubOrgName}/${repoName}`,
+          {
+            headers: {
+              Accept: 'application/vnd.github+json',
+              Authorization: `Bearer ${token}`,
+              'X-GitHub-Api-Version': '2022-11-28',
+            },
+          },
+        );
+
+        if (getRepoResponse.ok) {
+          const existingRepo: GitHubRepo = await getRepoResponse.json();
+
+          // Update app with GitHub info
+          await this.prisma.app.update({
+            where: { id: app.id },
+            data: {
+              githubRepoId: existingRepo.node_id,
+              githubRepoUrl: existingRepo.html_url,
+              githubRepoName: existingRepo.name,
+            },
+          });
+
+          this.logger.log(
+            `Using existing GitHub repository for app ${app.id}: ${existingRepo.full_name}`,
+          );
+          return existingRepo;
+        }
+      }
+
+      // If we couldn't handle the error, throw it
+      this.logger.error(
+        `Failed to create repository: ${JSON.stringify(error)}`,
+      );
+      throw new HttpException(
+        error.message || 'Failed to create GitHub repository',
+        HttpStatus.BAD_GATEWAY,
+      );
+    }
+
     if (!response.ok) {
       const error = await response.json();
       this.logger.error(
@@ -407,7 +461,7 @@ export class GitHubService {
     app: App,
     extractedPath: string,
     message: string,
-    branch: string = 'main',
+    branch?: string,
   ): Promise<GitHubCommit> {
     const org = await this.prisma.organization.findUnique({
       where: { id: app.organizationId },
@@ -423,15 +477,33 @@ export class GitHubService {
     const token = await this.getInstallationToken(app.organizationId);
     const repoFullName = `${org.githubOrgName}/${app.githubRepoName}`;
 
-    // Get the current commit SHA of the branch
-    const branchRef = await this.getBranchRef(repoFullName, branch, token);
-    const baseTreeSha = await this.getTreeSha(repoFullName, branchRef, token);
+    // Get actual default branch from repo if not specified
+    let targetBranch = branch;
+    if (!targetBranch) {
+      const repoInfo = await this.getRepoInfo(repoFullName, token);
+      targetBranch = repoInfo.default_branch || 'main';
+      this.logger.debug(`[COMMIT] Using default branch: ${targetBranch}`);
+    }
+
+    // Try to get the current branch ref; if it fails (empty repo), we'll create an orphan commit
+    let branchRef: string | null = null;
+    let baseTreeSha: string | null = null;
+
+    try {
+      branchRef = await this.getBranchRef(repoFullName, targetBranch, token);
+      baseTreeSha = await this.getTreeSha(repoFullName, branchRef, token);
+    } catch (error) {
+      this.logger.log(
+        `Branch ${targetBranch} not found, will create initial commit`,
+      );
+      // Empty repo - we'll create an orphan commit
+    }
 
     // Create tree from files
     const tree = await this.createTreeFromDirectory(
       repoFullName,
       extractedPath,
-      baseTreeSha,
+      baseTreeSha, // null for empty repo
       token,
     );
 
@@ -439,16 +511,93 @@ export class GitHubService {
     const commit = await this.createCommit(
       repoFullName,
       tree.sha,
-      branchRef,
+      branchRef, // null for empty repo (orphan commit)
       message,
       token,
     );
 
-    // Update branch reference
-    await this.updateBranchRef(repoFullName, branch, commit.sha, token);
+    // Update or create branch reference
+    if (branchRef) {
+      await this.updateBranchRef(repoFullName, targetBranch, commit.sha, token);
+    } else {
+      // Create new branch for empty repo
+      await this.createBranchRef(repoFullName, targetBranch, commit.sha, token);
+    }
 
     this.logger.log(`Committed app snapshot for ${app.id}: ${commit.sha}`);
     return commit;
+  }
+
+  /**
+   * Get repository info including default branch
+   */
+  private async getRepoInfo(
+    repoFullName: string,
+    token: string,
+  ): Promise<{ default_branch: string; [key: string]: any }> {
+    this.logger.debug(`[REPO INFO] Fetching info for: ${repoFullName}`);
+
+    const response = await fetch(
+      `https://api.github.com/repos/${repoFullName}`,
+      {
+        headers: {
+          Accept: 'application/vnd.github+json',
+          Authorization: `Bearer ${token}`,
+          'X-GitHub-Api-Version': '2022-11-28',
+        },
+      },
+    );
+
+    if (!response.ok) {
+      const errorBody = await response.text();
+      this.logger.error(
+        `[REPO INFO] Failed: ${response.status} - ${errorBody}`,
+      );
+      throw new HttpException(
+        `Failed to get repository info`,
+        HttpStatus.BAD_GATEWAY,
+      );
+    }
+
+    return response.json();
+  }
+
+  /**
+   * Create a new branch reference (for empty repos)
+   */
+  private async createBranchRef(
+    repoFullName: string,
+    branch: string,
+    sha: string,
+    token: string,
+  ): Promise<void> {
+    const response = await fetch(
+      `https://api.github.com/repos/${repoFullName}/git/refs`,
+      {
+        method: 'POST',
+        headers: {
+          Accept: 'application/vnd.github+json',
+          Authorization: `Bearer ${token}`,
+          'X-GitHub-Api-Version': '2022-11-28',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          ref: `refs/heads/${branch}`,
+          sha,
+        }),
+      },
+    );
+
+    if (!response.ok) {
+      const error = await response.json();
+      this.logger.error(`Failed to create branch: ${JSON.stringify(error)}`);
+      throw new HttpException(
+        error.message || 'Failed to create branch',
+        HttpStatus.BAD_GATEWAY,
+      );
+    }
+
+    this.logger.log(`Created branch ${branch} for repo ${repoFullName}`);
   }
 
   // ========================================
@@ -861,7 +1010,7 @@ export class GitHubService {
   private async createTreeFromDirectory(
     repoFullName: string,
     dirPath: string,
-    baseTreeSha: string,
+    baseTreeSha: string | null,
     token: string,
   ): Promise<{ sha: string }> {
     const treeItems: any[] = [];
@@ -902,7 +1051,7 @@ export class GitHubService {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          base_tree: baseTreeSha,
+          ...(baseTreeSha && { base_tree: baseTreeSha }),
           tree: treeItems,
         }),
       },
@@ -922,7 +1071,7 @@ export class GitHubService {
   private async createCommit(
     repoFullName: string,
     treeSha: string,
-    parentSha: string,
+    parentSha: string | null,
     message: string,
     token: string,
   ): Promise<GitHubCommit> {
@@ -939,7 +1088,7 @@ export class GitHubService {
         body: JSON.stringify({
           message,
           tree: treeSha,
-          parents: [parentSha],
+          ...(parentSha && { parents: [parentSha] }),
         }),
       },
     );

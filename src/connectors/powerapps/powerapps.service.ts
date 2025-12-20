@@ -861,7 +861,7 @@ export class PowerAppsService implements IBaseConnector {
               data: {
                 githubRepoId: repo.node_id,
                 githubRepoUrl: repo.html_url,
-                githubRepoName: repo.full_name,
+                githubRepoName: repo.name, // Use repo.name, not full_name (full_name includes org)
               },
             });
             this.logger.log(`[GITHUB] Created repository: ${repo.full_name}`);
