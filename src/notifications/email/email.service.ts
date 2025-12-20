@@ -15,12 +15,16 @@ export class EmailService {
   private readonly emailEnabled: boolean;
 
   constructor(private readonly configService: ConfigService) {
-    this.emailEnabled = this.configService.get<string>('SMTP_HOST') ? true : false;
+    this.emailEnabled = this.configService.get<string>('SMTP_HOST')
+      ? true
+      : false;
 
     if (this.emailEnabled) {
       this.initializeTransporter();
     } else {
-      this.logger.warn('Email service disabled - SMTP_HOST not configured. This is normal for development.');
+      this.logger.warn(
+        'Email service disabled - SMTP_HOST not configured. This is normal for development.',
+      );
     }
   }
 
@@ -41,7 +45,9 @@ export class EmailService {
 
       this.logger.log('Email transporter initialized successfully');
     } catch (error) {
-      this.logger.error(`Failed to initialize email transporter: ${error.message}`);
+      this.logger.error(
+        `Failed to initialize email transporter: ${error.message}`,
+      );
       this.transporter = null;
     }
   }
@@ -57,13 +63,18 @@ export class EmailService {
     data?: Record<string, any>,
   ): Promise<boolean> {
     if (!this.emailEnabled || !this.transporter) {
-      this.logger.warn(`Email not configured - would have sent: ${subject} to ${to}`);
+      this.logger.warn(
+        `Email not configured - would have sent: ${subject} to ${to}`,
+      );
       return false;
     }
 
     try {
       const html = this.generateEmailHTML(subject, message, type, data);
-      const fromAddress = this.configService.get<string>('EMAIL_FROM', 'LDV Bridge <noreply@ldvbridge.com>');
+      const fromAddress = this.configService.get<string>(
+        'EMAIL_FROM',
+        'LDV Bridge <noreply@ldvbridge.com>',
+      );
 
       const info = await this.transporter.sendMail({
         from: fromAddress,
@@ -99,6 +110,7 @@ export class EmailService {
       DEPLOYMENT_FAILED: '⚠️',
       COMMENT_ADDED: '💬',
       COMMENT_MENTION: '💬',
+      HIGH_RISK_CHANGE_DETECTED: '🚨',
       SYSTEM: 'ℹ️',
     };
 
@@ -111,12 +123,16 @@ export class EmailService {
       DEPLOYMENT_FAILED: '#ef4444', // red
       COMMENT_ADDED: '#8b5cf6', // purple
       COMMENT_MENTION: '#8b5cf6', // purple
+      HIGH_RISK_CHANGE_DETECTED: '#dc2626', // bright red for urgency
       SYSTEM: '#6b7280', // gray
     };
 
     const icon = iconMap[type] || 'ℹ️';
     const color = colorMap[type] || '#6b7280';
-    const appUrl = this.configService.get<string>('FRONTEND_URL', 'http://localhost:3000');
+    const appUrl = this.configService.get<string>(
+      'FRONTEND_URL',
+      'http://localhost:3000',
+    );
 
     return `
       <!DOCTYPE html>
@@ -146,19 +162,27 @@ export class EmailService {
                         ${message}
                       </p>
                       
-                      ${data && Object.keys(data).length > 0 ? `
+                      ${
+                        data && Object.keys(data).length > 0
+                          ? `
                         <div style="background-color: #f9fafb; border-radius: 6px; padding: 16px; margin-top: 20px;">
                           <h3 style="margin: 0 0 12px; color: #111827; font-size: 14px; font-weight: 600;">Details:</h3>
                           <table style="width: 100%; font-size: 14px; color: #6b7280;">
-                            ${Object.entries(data).map(([key, value]) => `
+                            ${Object.entries(data)
+                              .map(
+                                ([key, value]) => `
                               <tr>
                                 <td style="padding: 4px 0; font-weight: 500;">${this.formatKey(key)}:</td>
                                 <td style="padding: 4px 0; text-align: right;">${value}</td>
                               </tr>
-                            `).join('')}
+                            `,
+                              )
+                              .join('')}
                           </table>
                         </div>
-                      ` : ''}
+                      `
+                          : ''
+                      }
                     </td>
                   </tr>
                   
@@ -213,7 +237,9 @@ export class EmailService {
       this.logger.log('Email connection verified successfully');
       return true;
     } catch (error) {
-      this.logger.error(`Email connection verification failed: ${error.message}`);
+      this.logger.error(
+        `Email connection verification failed: ${error.message}`,
+      );
       return false;
     }
   }

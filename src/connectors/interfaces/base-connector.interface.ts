@@ -103,4 +103,10 @@ export interface ISyncResult {
   syncedAt: Date;
   errors?: string[];
   githubRepoUrl?: string;
+  // Policy-driven sync fields
+  changeId?: string;
+  riskLevel?: 'low' | 'medium' | 'high' | 'critical';
+  riskScore?: number;
+  requiresReview?: boolean;
+  stagingBranch?: string;
 }

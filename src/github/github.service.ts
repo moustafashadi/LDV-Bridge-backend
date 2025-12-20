@@ -732,6 +732,224 @@ export class GitHubService {
   }
 
   // ========================================
+  // STAGING BRANCHES (CHANGE SYNC)
+  // ========================================
+
+  /**
+   * Generate staging branch name for a change
+   */
+  getStagingBranchName(changeId: string): string {
+    return `staging/change-${changeId.slice(0, 8)}`;
+  }
+
+  /**
+   * Commit app snapshot to a staging branch for review
+   * Creates the staging branch from main if it doesn't exist
+   */
+  async commitToStagingBranch(
+    app: App,
+    extractedPath: string,
+    changeId: string,
+    message: string,
+  ): Promise<{ commit: GitHubCommit; branch: string }> {
+    const org = await this.prisma.organization.findUnique({
+      where: { id: app.organizationId },
+    });
+
+    if (!org?.githubOrgName || !app.githubRepoName) {
+      throw new HttpException(
+        'GitHub repository not configured for this app',
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+
+    const token = await this.getInstallationToken(app.organizationId);
+    const repoFullName = `${org.githubOrgName}/${app.githubRepoName}`;
+    const stagingBranch = this.getStagingBranchName(changeId);
+
+    // Get default branch SHA to base staging branch on
+    const repoInfo = await this.getRepoInfo(repoFullName, token);
+    const defaultBranch = repoInfo.default_branch || 'main';
+
+    // Try to get staging branch; if not exists, create from default
+    let branchRef: string | null = null;
+    let baseTreeSha: string | null = null;
+
+    try {
+      branchRef = await this.getBranchRef(repoFullName, stagingBranch, token);
+      baseTreeSha = await this.getTreeSha(repoFullName, branchRef, token);
+      this.logger.debug(
+        `[STAGING] Using existing staging branch: ${stagingBranch}`,
+      );
+    } catch {
+      // Staging branch doesn't exist, create from default branch
+      this.logger.log(
+        `[STAGING] Creating staging branch ${stagingBranch} from ${defaultBranch}`,
+      );
+      try {
+        const defaultRef = await this.getBranchRef(
+          repoFullName,
+          defaultBranch,
+          token,
+        );
+        await this.createBranchRef(
+          repoFullName,
+          stagingBranch,
+          defaultRef,
+          token,
+        );
+        branchRef = defaultRef;
+        baseTreeSha = await this.getTreeSha(repoFullName, branchRef, token);
+      } catch (createError) {
+        this.logger.warn(
+          `[STAGING] Could not create from ${defaultBranch}, creating orphan branch`,
+        );
+        // Default branch might not exist (empty repo), create orphan
+      }
+    }
+
+    // Create tree from files
+    const tree = await this.createTreeFromDirectory(
+      repoFullName,
+      extractedPath,
+      baseTreeSha,
+      token,
+    );
+
+    // Create commit
+    const commit = await this.createCommit(
+      repoFullName,
+      tree.sha,
+      branchRef,
+      message,
+      token,
+    );
+
+    // Update or create branch reference
+    if (branchRef) {
+      await this.updateBranchRef(
+        repoFullName,
+        stagingBranch,
+        commit.sha,
+        token,
+      );
+    } else {
+      await this.createBranchRef(
+        repoFullName,
+        stagingBranch,
+        commit.sha,
+        token,
+      );
+    }
+
+    this.logger.log(`[STAGING] Committed to ${stagingBranch}: ${commit.sha}`);
+
+    return { commit, branch: stagingBranch };
+  }
+
+  /**
+   * Merge staging branch to main (called when review is approved)
+   */
+  async mergeStagingToMain(
+    app: App,
+    changeId: string,
+    commitMessage: string,
+  ): Promise<{ merged: boolean; sha?: string }> {
+    const org = await this.prisma.organization.findUnique({
+      where: { id: app.organizationId },
+    });
+
+    if (!org?.githubOrgName || !app.githubRepoName) {
+      throw new HttpException(
+        'GitHub repository not configured for this app',
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+
+    const token = await this.getInstallationToken(app.organizationId);
+    const repoFullName = `${org.githubOrgName}/${app.githubRepoName}`;
+    const stagingBranch = this.getStagingBranchName(changeId);
+
+    // Get default branch
+    const repoInfo = await this.getRepoInfo(repoFullName, token);
+    const defaultBranch = repoInfo.default_branch || 'main';
+
+    // Merge staging into main
+    const response = await fetch(
+      `https://api.github.com/repos/${repoFullName}/merges`,
+      {
+        method: 'POST',
+        headers: {
+          Accept: 'application/vnd.github+json',
+          Authorization: `Bearer ${token}`,
+          'X-GitHub-Api-Version': '2022-11-28',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          base: defaultBranch,
+          head: stagingBranch,
+          commit_message: commitMessage,
+        }),
+      },
+    );
+
+    if (!response.ok) {
+      const error = await response.json();
+
+      // 409 means nothing to merge (already up to date)
+      if (response.status === 409) {
+        this.logger.log(
+          `[STAGING] Branch ${stagingBranch} already merged or up to date`,
+        );
+        return { merged: true };
+      }
+
+      this.logger.error(`[STAGING] Merge failed: ${JSON.stringify(error)}`);
+      throw new HttpException(
+        error.message || 'Failed to merge staging branch',
+        HttpStatus.BAD_GATEWAY,
+      );
+    }
+
+    const mergeResult = await response.json();
+    this.logger.log(
+      `[STAGING] Merged ${stagingBranch} to ${defaultBranch}: ${mergeResult.sha}`,
+    );
+
+    // Delete staging branch after successful merge
+    await this.deleteBranch(repoFullName, stagingBranch, token);
+
+    return { merged: true, sha: mergeResult.sha };
+  }
+
+  /**
+   * Delete a branch
+   */
+  private async deleteBranch(
+    repoFullName: string,
+    branch: string,
+    token: string,
+  ): Promise<void> {
+    const response = await fetch(
+      `https://api.github.com/repos/${repoFullName}/git/refs/heads/${branch}`,
+      {
+        method: 'DELETE',
+        headers: {
+          Accept: 'application/vnd.github+json',
+          Authorization: `Bearer ${token}`,
+          'X-GitHub-Api-Version': '2022-11-28',
+        },
+      },
+    );
+
+    if (!response.ok && response.status !== 404) {
+      this.logger.warn(`[STAGING] Failed to delete branch ${branch}`);
+    } else {
+      this.logger.log(`[STAGING] Deleted branch ${branch}`);
+    }
+  }
+
+  // ========================================
   // PULL REQUESTS (REVIEWS)
   // ========================================
 

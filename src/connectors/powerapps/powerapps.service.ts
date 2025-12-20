@@ -20,6 +20,8 @@ import { ConnectorsWebSocketGateway } from '../../websocket/websocket.gateway';
 import { AppStatus } from '@prisma/client';
 import { AppsService } from '../../apps/apps.service';
 import { GitHubService } from '../../github/github.service';
+import { ChangesService } from '../../changes/changes.service';
+import { NotificationsService } from '../../notifications/notifications.service';
 
 /**
  * PowerApps environment info
@@ -92,6 +94,10 @@ export class PowerAppsService implements IBaseConnector {
     private appsService: AppsService,
     @Inject(forwardRef(() => GitHubService))
     private githubService: GitHubService,
+    @Inject(forwardRef(() => ChangesService))
+    private changesService: ChangesService,
+    @Inject(forwardRef(() => NotificationsService))
+    private notificationsService: NotificationsService,
   ) {
     // Initialize OAuth config after constructor injection
     // Multi-tenant: works with any Azure AD organization
@@ -838,6 +844,11 @@ export class PowerAppsService implements IBaseConnector {
 
       // === GitHub Integration ===
       // Sync to GitHub if organization has GitHub connected
+      // Declare variables at this scope so they're available for return
+      let changeResult: any = null;
+      let riskAssessment: any = null;
+      let stagingBranch: string | undefined = undefined;
+
       try {
         const organization = await this.appsService[
           'prisma'
@@ -867,10 +878,44 @@ export class PowerAppsService implements IBaseConnector {
             this.logger.log(`[GITHUB] Created repository: ${repo.full_name}`);
           }
 
-          // Download and commit the msapp content
+          // === CHANGE DETECTION AND RISK ANALYSIS ===
+          // Detect changes in the app metadata
+          try {
+            this.logger.log(`[SYNC] Detecting changes for app ${app.id}...`);
+            changeResult = await this.changesService.detectChanges(
+              app.id,
+              userId,
+              organizationId,
+            );
+
+            if (changeResult.change) {
+              // Run risk analysis synchronously
+              this.logger.log(
+                `[SYNC] Running risk analysis for change ${changeResult.change.id}...`,
+              );
+              riskAssessment =
+                await this.changesService.analyzeChangeImpactSync(
+                  changeResult.change.id,
+                );
+
+              if (riskAssessment) {
+                this.logger.log(
+                  `[SYNC] Risk level: ${riskAssessment.level}, score: ${riskAssessment.score}`,
+                );
+              }
+            }
+          } catch (changeError) {
+            this.logger.warn(
+              `[SYNC] Change detection failed: ${changeError.message}`,
+            );
+            // Continue with sync even if change detection fails
+          }
+
+          // Download and commit the msapp content to STAGING branch
+          let stagingBranch: string | null = null;
           try {
             this.logger.log(
-              `[GITHUB] Exporting msapp and committing to GitHub...`,
+              `[GITHUB] Exporting msapp and committing to staging branch...`,
             );
 
             // Export the msapp file
@@ -906,15 +951,18 @@ export class PowerAppsService implements IBaseConnector {
               .pipe(unzipper.Extract({ path: extractPath }))
               .promise();
 
-            // Commit the extracted content to GitHub
-            await this.githubService.commitAppSnapshot(
+            // Commit to STAGING branch (not main) - always pending review
+            const changeId = changeResult?.change?.id || `temp-${Date.now()}`;
+            const commitResult = await this.githubService.commitToStagingBranch(
               app,
               extractPath,
+              changeId,
               `Sync: ${app.name} - ${new Date().toISOString()}`,
             );
+            stagingBranch = commitResult.branch;
 
             this.logger.log(
-              `[GITHUB] Successfully committed app content to GitHub`,
+              `[GITHUB] Successfully committed to staging branch: ${stagingBranch}`,
             );
 
             // Cleanup temp directory
@@ -924,6 +972,36 @@ export class PowerAppsService implements IBaseConnector {
               `[GITHUB] Failed to export/commit msapp: ${exportError.message}`,
             );
             // Don't fail the sync if GitHub commit fails
+          }
+
+          // === NOTIFY PRO DEVELOPERS FOR HIGH RISK ===
+          if (
+            riskAssessment &&
+            (riskAssessment.level === 'high' ||
+              riskAssessment.level === 'critical')
+          ) {
+            try {
+              this.logger.log(
+                `[NOTIFY] Notifying pro developers of high-risk change`,
+              );
+              await this.notificationsService.notifyProDevelopers(
+                organizationId,
+                'HIGH_RISK_CHANGE_DETECTED',
+                `High-risk change detected in ${app.name}`,
+                {
+                  changeId: changeResult?.change?.id,
+                  appId: app.id,
+                  appName: app.name,
+                  riskLevel: riskAssessment.level,
+                  riskScore: riskAssessment.score,
+                  stagingBranch,
+                },
+              );
+            } catch (notifyError) {
+              this.logger.warn(
+                `[NOTIFY] Failed to notify pro developers: ${notifyError.message}`,
+              );
+            }
           }
         } else {
           this.logger.debug(
@@ -935,11 +1013,17 @@ export class PowerAppsService implements IBaseConnector {
         // Don't fail the main sync if GitHub sync fails
       }
 
+      // Return enhanced sync result
       return {
         success: true,
         appId: app.id,
-        componentsCount: 0, // Will be populated by component extraction
-        changesDetected: 0, // Will be populated by change detection
+        componentsCount: 0,
+        changesDetected: changeResult?.totalChanges || 0,
+        changeId: changeResult?.change?.id,
+        riskLevel: riskAssessment?.level,
+        riskScore: riskAssessment?.score,
+        requiresReview: true, // All changes require pro dev review
+        stagingBranch: stagingBranch,
         syncedAt: new Date(),
         githubRepoUrl: app.githubRepoUrl,
       };

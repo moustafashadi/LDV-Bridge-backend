@@ -1,7 +1,10 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { Notification, NotificationType, Prisma } from '@prisma/client';
-import { CreateNotificationDto, SendNotificationDto } from './dto/create-notification.dto';
+import {
+  CreateNotificationDto,
+  SendNotificationDto,
+} from './dto/create-notification.dto';
 import {
   NotificationResponseDto,
   PaginatedNotificationsResponseDto,
@@ -31,8 +34,12 @@ export class NotificationsService {
   /**
    * Create in-app notification
    */
-  async create(createNotificationDto: CreateNotificationDto): Promise<NotificationResponseDto> {
-    this.logger.log(`Creating notification for user ${createNotificationDto.userId}`);
+  async create(
+    createNotificationDto: CreateNotificationDto,
+  ): Promise<NotificationResponseDto> {
+    this.logger.log(
+      `Creating notification for user ${createNotificationDto.userId}`,
+    );
 
     try {
       const notification = await this.prisma.notification.create({
@@ -41,7 +48,9 @@ export class NotificationsService {
           type: createNotificationDto.type,
           title: createNotificationDto.title,
           message: createNotificationDto.message,
-          data: createNotificationDto.data ? (createNotificationDto.data as Prisma.InputJsonValue) : Prisma.JsonNull,
+          data: createNotificationDto.data
+            ? (createNotificationDto.data as Prisma.InputJsonValue)
+            : Prisma.JsonNull,
         },
       });
 
@@ -57,10 +66,22 @@ export class NotificationsService {
    * Send notification through multiple channels
    * This is the main method other services should call
    */
-  async sendNotification(sendNotificationDto: SendNotificationDto): Promise<SendNotificationResponseDto> {
-    const { userId, type, title, message, data, channels = ['in-app'], emailOptions } = sendNotificationDto;
+  async sendNotification(
+    sendNotificationDto: SendNotificationDto,
+  ): Promise<SendNotificationResponseDto> {
+    const {
+      userId,
+      type,
+      title,
+      message,
+      data,
+      channels = ['in-app'],
+      emailOptions,
+    } = sendNotificationDto;
 
-    this.logger.log(`Sending notification to user ${userId} via channels: ${channels.join(', ')}`);
+    this.logger.log(
+      `Sending notification to user ${userId} via channels: ${channels.join(', ')}`,
+    );
 
     const result: SendNotificationResponseDto = {
       notificationId: '',
@@ -85,14 +106,15 @@ export class NotificationsService {
 
     // 2. Send via WebSocket (real-time push)
     if (channels.includes('websocket')) {
-      const websocketSent = await this.notificationsGateway.sendNotificationToUser(userId, {
-        id: result.notificationId,
-        type,
-        title,
-        message,
-        data,
-        createdAt: new Date(),
-      });
+      const websocketSent =
+        await this.notificationsGateway.sendNotificationToUser(userId, {
+          id: result.notificationId,
+          type,
+          title,
+          message,
+          data,
+          createdAt: new Date(),
+        });
       result.websocketPushed = websocketSent;
       if (websocketSent) {
         result.channels.push('websocket');
@@ -124,11 +146,72 @@ export class NotificationsService {
           this.logger.warn(`No email found for user ${userId}`);
         }
       } catch (error) {
-        this.logger.error(`Failed to queue email notification: ${error.message}`);
+        this.logger.error(
+          `Failed to queue email notification: ${error.message}`,
+        );
       }
     }
 
     return result;
+  }
+
+  /**
+   * Notify all pro developers in an organization
+   * Used for high-risk change alerts and other organization-wide notifications
+   */
+  async notifyProDevelopers(
+    organizationId: string,
+    type: NotificationType,
+    title: string,
+    data?: Record<string, any>,
+  ): Promise<{ notifiedCount: number }> {
+    this.logger.log(
+      `Notifying pro developers in organization ${organizationId}`,
+    );
+
+    try {
+      // Find all pro developers in the organization
+      const proDevelopers = await this.prisma.user.findMany({
+        where: {
+          organizationId,
+          role: 'PRO_DEVELOPER',
+        },
+        select: { id: true, email: true, name: true },
+      });
+
+      if (proDevelopers.length === 0) {
+        this.logger.warn(
+          `No pro developers found in organization ${organizationId}`,
+        );
+        return { notifiedCount: 0 };
+      }
+
+      this.logger.log(`Found ${proDevelopers.length} pro developers to notify`);
+
+      // Send notification to each pro developer
+      for (const proDev of proDevelopers) {
+        await this.sendNotification({
+          userId: proDev.id,
+          type,
+          title,
+          message: `${title}. Please review the changes.`,
+          data: {
+            ...data,
+            organizationId,
+            urgent: true,
+          },
+          channels: ['in-app', 'websocket', 'email'],
+          emailOptions: {
+            subject: `[ACTION REQUIRED] ${title}`,
+          },
+        });
+      }
+
+      return { notifiedCount: proDevelopers.length };
+    } catch (error) {
+      this.logger.error(`Failed to notify pro developers: ${error.message}`);
+      throw error;
+    }
   }
 
   /**
@@ -140,7 +223,9 @@ export class NotificationsService {
     limit: number = 20,
     unreadOnly: boolean = false,
   ): Promise<PaginatedNotificationsResponseDto> {
-    this.logger.log(`Fetching notifications for user ${userId} (page ${page}, limit ${limit})`);
+    this.logger.log(
+      `Fetching notifications for user ${userId} (page ${page}, limit ${limit})`,
+    );
 
     const where: any = { userId };
     if (unreadOnly) {
@@ -172,7 +257,10 @@ export class NotificationsService {
   /**
    * Get single notification
    */
-  async findOne(notificationId: string, userId: string): Promise<NotificationResponseDto> {
+  async findOne(
+    notificationId: string,
+    userId: string,
+  ): Promise<NotificationResponseDto> {
     const notification = await this.prisma.notification.findFirst({
       where: {
         id: notificationId,
@@ -190,7 +278,10 @@ export class NotificationsService {
   /**
    * Mark notification as read
    */
-  async markAsRead(notificationId: string, userId: string): Promise<NotificationResponseDto> {
+  async markAsRead(
+    notificationId: string,
+    userId: string,
+  ): Promise<NotificationResponseDto> {
     this.logger.log(`Marking notification ${notificationId} as read`);
 
     // Verify ownership
@@ -213,7 +304,10 @@ export class NotificationsService {
   /**
    * Mark notification as unread
    */
-  async markAsUnread(notificationId: string, userId: string): Promise<NotificationResponseDto> {
+  async markAsUnread(
+    notificationId: string,
+    userId: string,
+  ): Promise<NotificationResponseDto> {
     this.logger.log(`Marking notification ${notificationId} as unread`);
 
     // Verify ownership
@@ -303,7 +397,9 @@ export class NotificationsService {
   /**
    * Map Prisma entity to response DTO
    */
-  private mapToResponseDto(notification: Notification): NotificationResponseDto {
+  private mapToResponseDto(
+    notification: Notification,
+  ): NotificationResponseDto {
     return {
       id: notification.id,
       userId: notification.userId,

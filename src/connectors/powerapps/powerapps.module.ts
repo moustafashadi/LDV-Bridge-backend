@@ -8,6 +8,8 @@ import { PrismaModule } from '../../prisma/prisma.module';
 import { WebSocketModule } from '../../websocket/websocket.module';
 import { AppsModule } from '../../apps/apps.module';
 import { GitHubModule } from '../../github/github.module';
+import { ChangesModule } from '../../changes/changes.module';
+import { NotificationsModule } from '../../notifications/notifications.module';
 
 @Module({
   imports: [
@@ -16,6 +18,8 @@ import { GitHubModule } from '../../github/github.module';
     WebSocketModule,
     AppsModule,
     forwardRef(() => GitHubModule),
+    forwardRef(() => ChangesModule),
+    forwardRef(() => NotificationsModule),
   ],
   controllers: [PowerAppsController],
   providers: [PowerAppsService, OAuthService, TokenManagerService],

@@ -19,7 +19,10 @@ import { JsonDiffService } from './diff/json-diff.service';
 import { ImpactAnalyzerService } from './analyzers/impact-analyzer.service';
 import { PolicyRiskEvaluatorService } from '../risk/policy-risk-evaluator.service';
 import { FormulaAnalyzerService } from '../risk/formula-analyzer.service';
-import { RiskScorerService } from '../risk/risk-scorer.service';
+import {
+  RiskScorerService,
+  EnhancedRiskAssessment,
+} from '../risk/risk-scorer.service';
 import type { Change, ChangeType, ChangeStatus } from '@prisma/client';
 
 @Injectable()
@@ -314,6 +317,83 @@ export class ChangesService {
         `Failed to analyze impact: ${error.message}`,
         error.stack,
       );
+    }
+  }
+
+  /**
+   * Analyze change impact synchronously and return the assessment
+   * Used by sync flow to determine staging vs main branch and notifications
+   */
+  async analyzeChangeImpactSync(
+    changeId: string,
+  ): Promise<EnhancedRiskAssessment | null> {
+    try {
+      const change = await this.prisma.change.findUnique({
+        where: { id: changeId },
+      });
+
+      if (!change) {
+        this.logger.warn(`Change ${changeId} not found for sync analysis`);
+        return null;
+      }
+
+      // Step 1: Analyze impact using existing analyzer
+      const impactAnalysis = await this.impactAnalyzer.analyzeImpact(change);
+
+      // Step 2: Evaluate policy-based risk rules
+      const policyResult = await this.policyRiskEvaluator.evaluatePolicies(
+        change,
+        change.organizationId,
+      );
+
+      // Step 3: Analyze formula complexity if code changed
+      let formulaAnalysis: any = null;
+      if (change.beforeCode || change.afterCode) {
+        const app = await this.prisma.app.findUnique({
+          where: { id: change.appId },
+          select: { platform: true },
+        });
+
+        const code = change.afterCode || change.beforeCode;
+        const platform = (
+          app?.platform?.toLowerCase() === 'mendix' ? 'mendix' : 'powerapps'
+        ) as 'powerapps' | 'mendix';
+
+        formulaAnalysis = await this.formulaAnalyzer.analyzeFormula(
+          code,
+          platform,
+        );
+      }
+
+      // Step 4: Calculate enhanced risk score
+      const enhancedAssessment = this.riskScorer.calculateEnhancedRiskScore(
+        change,
+        policyResult,
+        formulaAnalysis,
+        impactAnalysis,
+      );
+
+      // Step 5: Update change with enhanced assessment
+      await this.prisma.change.update({
+        where: { id: changeId },
+        data: {
+          riskScore: enhancedAssessment.score,
+          riskAssessment: enhancedAssessment as any,
+          status: 'PENDING', // All changes are pending until pro dev review
+        },
+      });
+
+      this.logger.log(
+        `Sync risk analysis for change ${changeId}: score=${enhancedAssessment.score}, level=${enhancedAssessment.level}`,
+      );
+
+      return enhancedAssessment;
+    } catch (error) {
+      this.logger.error(
+        `Failed to analyze change for sync: ${error.message}`,
+        error.stack,
+      );
+      return null;
     }
   }
 
