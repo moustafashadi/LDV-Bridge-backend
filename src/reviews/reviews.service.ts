@@ -4,9 +4,12 @@ import {
   NotFoundException,
   BadRequestException,
   ForbiddenException,
+  Inject,
+  forwardRef,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { NotificationsService } from '../notifications/notifications.service';
+import { GitHubService } from '../github/github.service';
 import { ReviewStatus, UserRole } from '@prisma/client';
 import { CreateReviewDto } from './dto/create-review.dto';
 import { SubmitForReviewDto } from './dto/submit-for-review.dto';
@@ -32,6 +35,8 @@ export class ReviewsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly notificationsService: NotificationsService,
+    @Inject(forwardRef(() => GitHubService))
+    private readonly githubService: GitHubService,
   ) {}
 
   /**
@@ -454,6 +459,33 @@ export class ReviewsService {
         data: { status: 'APPROVED' },
       });
       changeStatus = 'APPROVED';
+
+      // Merge staging branch to main
+      try {
+        const change = await this.prisma.change.findUnique({
+          where: { id: review.changeId },
+          include: { app: true },
+        });
+
+        if (change?.app) {
+          this.logger.log(
+            `Merging staging branch to main for change ${review.changeId}`,
+          );
+          await this.githubService.mergeStagingToMain(
+            change.app,
+            review.changeId,
+            `Approved: ${review.change.title} - Reviewed by ${updatedReview.reviewer.name}`,
+          );
+          this.logger.log(
+            `Successfully merged staging branch for change ${review.changeId}`,
+          );
+        }
+      } catch (mergeError) {
+        this.logger.error(
+          `Failed to merge staging branch: ${mergeError.message}`,
+        );
+        // Don't fail the approval if merge fails - it can be retried
+      }
 
       // Notify change author of approval (if known)
       if (review.change.authorId) {

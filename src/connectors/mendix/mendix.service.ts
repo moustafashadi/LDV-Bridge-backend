@@ -3,9 +3,14 @@ import {
   Logger,
   BadRequestException,
   UnauthorizedException,
+  Inject,
+  forwardRef,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import axios, { AxiosInstance } from 'axios';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
 import {
   IBaseConnector,
   OAuth2Token,
@@ -17,6 +22,10 @@ import { TokenManagerService } from '../services/token-manager.service';
 import { ConnectorsWebSocketGateway } from '../../websocket/websocket.gateway';
 import { AppStatus } from '@prisma/client';
 import { AppsService } from '../../apps/apps.service';
+import { ChangesService } from '../../changes/changes.service';
+import { NotificationsService } from '../../notifications/notifications.service';
+import { GitHubService } from '../../github/github.service';
+import { MendixModelSdkService } from './mendix-model-sdk.service';
 
 /**
  * Mendix Connector Service
@@ -55,6 +64,13 @@ export class MendixService implements IBaseConnector {
     private tokenManager: TokenManagerService,
     private websocketGateway: ConnectorsWebSocketGateway,
     private appsService: AppsService,
+    @Inject(forwardRef(() => ChangesService))
+    private changesService: ChangesService,
+    @Inject(forwardRef(() => NotificationsService))
+    private notificationsService: NotificationsService,
+    @Inject(forwardRef(() => GitHubService))
+    private githubService: GitHubService,
+    private mendixModelSdkService: MendixModelSdkService,
   ) {
     // Initialize Mendix API URLs
     this.mendixConfig = {
@@ -552,7 +568,179 @@ export class MendixService implements IBaseConnector {
   }
 
   /**
-   * Sync app to database (placeholder for Task 9)
+   * Export app metadata to a directory structure for GitHub commit
+   * Creates JSON files that are diffable
+   */
+  async exportAppMetadata(
+    userId: string,
+    organizationId: string,
+    appId: string,
+  ): Promise<string> {
+    this.logger.log(`[EXPORT] Exporting Mendix app ${appId} metadata`);
+
+    const client = await this.getAuthenticatedClient(userId, organizationId);
+
+    // Create temp directory for export
+    const exportDir = path.join(
+      os.tmpdir(),
+      `mendix-export-${appId}-${Date.now()}`,
+    );
+    fs.mkdirSync(exportDir, { recursive: true });
+
+    try {
+      // 1. Export app details
+      const appResponse = await client.get(
+        `${this.mendixConfig.apiUrl}/apps/${appId}`,
+      );
+      const appData = appResponse.data;
+
+      fs.writeFileSync(
+        path.join(exportDir, 'app.json'),
+        JSON.stringify(
+          {
+            appId: appData.AppId,
+            projectId: appData.ProjectId,
+            name: appData.Name,
+            description: appData.Description,
+            url: appData.Url,
+            exportedAt: new Date().toISOString(),
+          },
+          null,
+          2,
+        ),
+      );
+      this.logger.debug(`[EXPORT] Wrote app.json`);
+
+      // 2. Export environments
+      const envDir = path.join(exportDir, 'environments');
+      fs.mkdirSync(envDir, { recursive: true });
+
+      try {
+        const envResponse = await client.get(
+          `${this.mendixConfig.apiUrl}/apps/${appId}/environments`,
+        );
+        const environments = envResponse.data || [];
+
+        for (const env of environments) {
+          const envFileName = `${(env.Mode || env.Name || 'unknown').toLowerCase().replace(/[^a-z0-9]/g, '_')}.json`;
+          fs.writeFileSync(
+            path.join(envDir, envFileName),
+            JSON.stringify(
+              {
+                mode: env.Mode,
+                url: env.Url,
+                status: env.Status,
+                modelVersion: env.ModelVersion,
+                mendixVersion: env.MendixVersion,
+                runtime: env.Runtime,
+              },
+              null,
+              2,
+            ),
+          );
+        }
+        this.logger.debug(
+          `[EXPORT] Wrote ${environments.length} environment files`,
+        );
+      } catch (error) {
+        this.logger.warn(
+          `[EXPORT] Could not fetch environments: ${error.message}`,
+        );
+        // Write empty environments marker
+        fs.writeFileSync(
+          path.join(envDir, '_no_environments.json'),
+          JSON.stringify({ message: 'No environments available' }, null, 2),
+        );
+      }
+
+      // 3. Export Team Server info (branches)
+      const branchesDir = path.join(exportDir, 'branches');
+      fs.mkdirSync(branchesDir, { recursive: true });
+
+      try {
+        const teamServerResponse = await client.get(
+          `${this.mendixConfig.apiUrl}/apps/${appId}/teamserver`,
+        );
+        const teamServer = teamServerResponse.data;
+
+        fs.writeFileSync(
+          path.join(branchesDir, 'teamserver.json'),
+          JSON.stringify(
+            {
+              url: teamServer?.url,
+              type: teamServer?.type || 'svn',
+              latestRevision: teamServer?.latestRevision,
+            },
+            null,
+            2,
+          ),
+        );
+
+        // Try to get branches
+        try {
+          const branchesResponse = await client.get(
+            `${this.mendixConfig.apiUrl}/apps/${appId}/branches`,
+          );
+          const branches = branchesResponse.data || [];
+
+          fs.writeFileSync(
+            path.join(branchesDir, 'branches.json'),
+            JSON.stringify(
+              branches.map((b: any) => ({
+                name: b.Name,
+                latestCommit: b.LatestCommit,
+                latestRevision: b.LatestRevision,
+              })),
+              null,
+              2,
+            ),
+          );
+          this.logger.debug(`[EXPORT] Wrote ${branches.length} branches`);
+        } catch (err) {
+          this.logger.debug(`[EXPORT] No branches API available`);
+        }
+      } catch (error) {
+        this.logger.warn(
+          `[EXPORT] Could not fetch team server info: ${error.message}`,
+        );
+      }
+
+      // 4. Create summary file
+      fs.writeFileSync(
+        path.join(exportDir, 'README.md'),
+        `# ${appData.Name || appId}
+
+Mendix App Export
+
+- **App ID:** ${appData.AppId}
+- **Project ID:** ${appData.ProjectId}
+- **Exported:** ${new Date().toISOString()}
+
+## Structure
+
+- \`app.json\` - App metadata
+- \`environments/\` - Deployment environments
+- \`branches/\` - Team Server branches
+
+---
+*Exported by LDV Bridge*
+`,
+      );
+
+      this.logger.log(`[EXPORT] Export complete: ${exportDir}`);
+      return exportDir;
+    } catch (error) {
+      // Clean up on failure
+      try {
+        fs.rmSync(exportDir, { recursive: true, force: true });
+      } catch {}
+      throw error;
+    }
+  }
+
+  /**
+   * Sync app to database with policy-driven flow
+   * All changes go to staging branch until pro dev approves
    */
   async syncApp(
     userId: string,
@@ -560,6 +748,11 @@ export class MendixService implements IBaseConnector {
     appId: string,
   ): Promise<ISyncResult> {
     this.logger.log(`Syncing Mendix app ${appId} for user ${userId}`);
+
+    // Declare variables at this scope for return
+    let changeResult: any = null;
+    let riskAssessment: any = null;
+    let stagingBranch: string | undefined = undefined;
 
     try {
       // Get app details from Mendix
@@ -621,11 +814,166 @@ export class MendixService implements IBaseConnector {
         this.logger.log(`Created new app ${app.name} (${app.id})`);
       }
 
+      // === CHANGE DETECTION AND RISK ANALYSIS ===
+      try {
+        this.logger.log(`[SYNC] Detecting changes for app ${app.id}...`);
+        changeResult = await this.changesService.detectChanges(
+          app.id,
+          userId,
+          organizationId,
+        );
+
+        if (changeResult.change) {
+          // Run risk analysis synchronously
+          this.logger.log(
+            `[SYNC] Running risk analysis for change ${changeResult.change.id}...`,
+          );
+          riskAssessment = await this.changesService.analyzeChangeImpactSync(
+            changeResult.change.id,
+          );
+
+          if (riskAssessment) {
+            this.logger.log(
+              `[SYNC] Risk level: ${riskAssessment.level}, score: ${riskAssessment.score}`,
+            );
+          }
+        }
+      } catch (changeError) {
+        this.logger.warn(
+          `[SYNC] Change detection failed: ${changeError.message}`,
+        );
+        // Continue with sync even if change detection fails
+      }
+
+      // === GITHUB INTEGRATION (if configured) ===
+      try {
+        const organization = await this.appsService[
+          'prisma'
+        ].organization.findUnique({
+          where: { id: organizationId },
+        });
+
+        if (organization?.githubInstallationId && app.githubRepoUrl) {
+          this.logger.log(
+            `[GITHUB] Organization has GitHub connected, exporting full model and committing to staging branch...`,
+          );
+
+          // Get PAT token for SDK access
+          const token = await this.tokenManager.getToken(userId, 'MENDIX');
+          const pat = token?.metadata?.pat;
+
+          if (!pat) {
+            this.logger.warn(
+              `[GITHUB] No PAT available for SDK export, falling back to metadata export`,
+            );
+            // Fall back to metadata export
+            let exportPath: string | null = null;
+            try {
+              exportPath = await this.exportAppMetadata(
+                userId,
+                organizationId,
+                appId,
+              );
+              const changeId = changeResult?.change?.id || `temp-${Date.now()}`;
+              const commitResult =
+                await this.githubService.commitToStagingBranch(
+                  app,
+                  exportPath,
+                  changeId,
+                  `Sync: ${app.name} - ${new Date().toISOString()}`,
+                );
+              stagingBranch = commitResult.branch;
+            } finally {
+              if (exportPath) {
+                try {
+                  fs.rmSync(exportPath, { recursive: true, force: true });
+                } catch {}
+              }
+            }
+          } else {
+            // Use SDK to export full model
+            let exportPath: string | null = null;
+            try {
+              this.logger.log(`[SDK] Exporting full model using SDK...`);
+              exportPath = await this.mendixModelSdkService.exportFullModel(
+                appId, // Mendix app ID
+                pat,
+                'main', // Branch name
+              );
+              this.logger.log(`[SDK] Exported full model to: ${exportPath}`);
+
+              // Commit to staging branch
+              const changeId = changeResult?.change?.id || `temp-${Date.now()}`;
+              const commitResult =
+                await this.githubService.commitToStagingBranch(
+                  app,
+                  exportPath,
+                  changeId,
+                  `Sync: ${app.name} (Full Model) - ${new Date().toISOString()}`,
+                );
+
+              stagingBranch = commitResult.branch;
+              this.logger.log(
+                `[GITHUB] Committed full model to staging branch: ${stagingBranch}`,
+              );
+            } finally {
+              // Clean up temp directory
+              if (exportPath) {
+                try {
+                  fs.rmSync(exportPath, { recursive: true, force: true });
+                  this.logger.debug(
+                    `[GITHUB] Cleaned up temp export: ${exportPath}`,
+                  );
+                } catch {}
+              }
+            }
+          }
+        }
+      } catch (githubError) {
+        this.logger.warn(`[GITHUB] GitHub sync failed: ${githubError.message}`);
+      }
+
+      // === NOTIFY PRO DEVELOPERS FOR HIGH RISK ===
+      if (
+        riskAssessment &&
+        (riskAssessment.level === 'high' || riskAssessment.level === 'critical')
+      ) {
+        try {
+          this.logger.log(
+            `[NOTIFY] Notifying pro developers of high-risk change`,
+          );
+          await this.notificationsService.notifyProDevelopers(
+            organizationId,
+            'HIGH_RISK_CHANGE_DETECTED',
+            `High-risk change detected in ${app.name}`,
+            {
+              changeId: changeResult?.change?.id,
+              appId: app.id,
+              appName: app.name,
+              riskLevel: riskAssessment.level,
+              riskScore: riskAssessment.score,
+              stagingBranch,
+              platform: 'MENDIX',
+            },
+          );
+        } catch (notifyError) {
+          this.logger.warn(
+            `[NOTIFY] Failed to notify pro developers: ${notifyError.message}`,
+          );
+        }
+      }
+
+      // Return enhanced sync result
       return {
         success: true,
         appId: app.id,
         componentsCount: 0,
-        changesDetected: 0,
+        changesDetected: changeResult?.totalChanges || 0,
+        changeId: changeResult?.change?.id,
+        riskLevel: riskAssessment?.level,
+        riskScore: riskAssessment?.score,
+        requiresReview: true, // All changes require pro dev review
+        stagingBranch,
         syncedAt: new Date(),
       };
     } catch (error) {

@@ -5,9 +5,9 @@ import {
   ConflictException,
   BadRequestException,
 } from '@nestjs/common';
-import { PrismaService } from '../prisma/prisma.service';
-import { PowerAppsService } from '../connectors/powerapps/powerapps.service';
-import { AuditService } from '../common/audit/audit.service';
+import { PrismaService } from '../../../prisma/prisma.service';
+import { PowerAppsService } from '../powerapps.service';
+import { AuditService } from '../../../common/audit/audit.service';
 import {
   CreateLinkedEnvironmentDto,
   LinkedEnvironmentPlatform,

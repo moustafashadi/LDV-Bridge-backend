@@ -1,12 +1,13 @@
-import { Module } from '@nestjs/common';
+import { Module, forwardRef } from '@nestjs/common';
 import { ReviewsService } from './reviews.service';
 import { CommentsService } from './comments.service';
 import { ReviewsController } from './reviews.controller';
 import { PrismaModule } from '../prisma/prisma.module';
 import { NotificationsModule } from '../notifications/notifications.module';
+import { GitHubModule } from '../github/github.module';
 
 @Module({
-  imports: [PrismaModule, NotificationsModule],
+  imports: [PrismaModule, NotificationsModule, forwardRef(() => GitHubModule)],
   controllers: [ReviewsController],
   providers: [ReviewsService, CommentsService],
   exports: [ReviewsService, CommentsService],

@@ -24,7 +24,7 @@ import { ChangesModule } from './changes/changes.module';
 import { ReviewsModule } from './reviews/reviews.module';
 import { SandboxesModule } from './sandboxes/sandboxes.module';
 import { AppsModule } from './apps/apps.module';
-import { LinkedEnvironmentsModule } from './linked-environments/linked-environments.module';
+import { LinkedEnvironmentsModule } from './connectors/powerapps/linked-environments/linked-environments.module';
 import { GitHubModule } from './github/github.module';
 
 @Module({

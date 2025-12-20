@@ -1,9 +1,9 @@
 import { Module } from '@nestjs/common';
 import { LinkedEnvironmentsController } from './linked-environments.controller';
 import { LinkedEnvironmentsService } from './linked-environments.service';
-import { PrismaModule } from '../prisma/prisma.module';
-import { AuditModule } from '../common/audit/audit.module';
-import { ConnectorsModule } from '../connectors/connectors.module';
+import { PrismaModule } from '../../../prisma/prisma.module';
+import { AuditModule } from '../../../common/audit/audit.module';
+import { ConnectorsModule } from '../../connectors.module';
 
 @Module({
   imports: [
