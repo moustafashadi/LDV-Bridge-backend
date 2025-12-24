@@ -13,6 +13,12 @@ import {
 /**
  * Mendix Sandbox Provisioner
  * Handles creation and management of Mendix free sandbox environments
+ *
+ * @deprecated For creating new Mendix apps, use POST /api/v1/apps/mendix/create endpoint
+ * which properly separates app creation from sandbox provisioning.
+ * This provisioner creates both a new Mendix app AND a sandbox, which is the old behavior.
+ * Going forward, apps should be created first via MendixService.createMendixApp(),
+ * and sandboxes should only be created for existing apps.
  */
 @Injectable()
 export class MendixProvisioner implements IEnvironmentProvisioner {
@@ -26,16 +32,30 @@ export class MendixProvisioner implements IEnvironmentProvisioner {
 
   /**
    * Provision a new Mendix sandbox environment
+   *
+   * @deprecated This method creates a new Mendix app if no sourceAppId is provided.
+   * For new app creation, use POST /api/v1/apps/mendix/create instead.
+   * Use this method only when you need to create a sandbox for an EXISTING Mendix app.
    */
   async provision(config: MendixSandboxConfig): Promise<EnvironmentDetails> {
+    // Log deprecation warning when creating new apps (not cloning)
+    if (!config.sourceAppId) {
+      this.logger.warn(
+        `[DEPRECATED] Creating new Mendix app via sandbox provisioning. ` +
+          `This flow is deprecated. Use POST /api/v1/apps/mendix/create instead.`,
+      );
+    }
+
     this.logger.log(`Provisioning Mendix sandbox: ${config.name}`);
 
     try {
       // If cloning, look up the external Mendix app ID
       let externalAppId: string | undefined;
       if (config.sourceAppId) {
-        this.logger.log(`Looking up external app ID for internal ID: ${config.sourceAppId}`);
-        
+        this.logger.log(
+          `Looking up external app ID for internal ID: ${config.sourceAppId}`,
+        );
+
         const sourceApp = await this.prisma.app.findUnique({
           where: { id: config.sourceAppId },
           select: { externalId: true, name: true },
@@ -54,7 +74,9 @@ export class MendixProvisioner implements IEnvironmentProvisioner {
         }
 
         externalAppId = sourceApp.externalId;
-        this.logger.log(`Found external app ID: ${externalAppId} for app "${sourceApp.name}"`);
+        this.logger.log(
+          `Found external app ID: ${externalAppId} for app "${sourceApp.name}"`,
+        );
       }
 
       // Create sandbox via Mendix Cloud Portal API
@@ -82,9 +104,7 @@ export class MendixProvisioner implements IEnvironmentProvisioner {
         },
       };
     } catch (error) {
-      this.logger.error(
-        `Failed to provision Mendix sandbox: ${error.message}`,
-      );
+      this.logger.error(`Failed to provision Mendix sandbox: ${error.message}`);
       throw new BadRequestException(
         `Failed to provision Mendix sandbox: ${error.message}`,
       );
@@ -102,7 +122,11 @@ export class MendixProvisioner implements IEnvironmentProvisioner {
     this.logger.log(`Deprovisioning Mendix sandbox: ${environmentId}`);
 
     try {
-      await this.mendixService.deleteSandbox(userId, organizationId, environmentId);
+      await this.mendixService.deleteSandbox(
+        userId,
+        organizationId,
+        environmentId,
+      );
       this.logger.log(`Successfully deprovisioned sandbox: ${environmentId}`);
     } catch (error) {
       this.logger.error(
@@ -125,7 +149,11 @@ export class MendixProvisioner implements IEnvironmentProvisioner {
     this.logger.log(`Starting Mendix environment: ${environmentId}`);
 
     try {
-      await this.mendixService.startEnvironment(userId, organizationId, environmentId);
+      await this.mendixService.startEnvironment(
+        userId,
+        organizationId,
+        environmentId,
+      );
       this.logger.log(`Successfully started environment: ${environmentId}`);
     } catch (error) {
       this.logger.error(
@@ -148,7 +176,11 @@ export class MendixProvisioner implements IEnvironmentProvisioner {
     this.logger.log(`Stopping Mendix environment: ${environmentId}`);
 
     try {
-      await this.mendixService.stopEnvironment(userId, organizationId, environmentId);
+      await this.mendixService.stopEnvironment(
+        userId,
+        organizationId,
+        environmentId,
+      );
       this.logger.log(`Successfully stopped environment: ${environmentId}`);
     } catch (error) {
       this.logger.error(
@@ -245,7 +277,11 @@ export class MendixProvisioner implements IEnvironmentProvisioner {
       await this.stop(userId, organizationId, environmentId);
 
       // Clear database
-      await this.mendixService.clearEnvironmentData(userId, organizationId, environmentId);
+      await this.mendixService.clearEnvironmentData(
+        userId,
+        organizationId,
+        environmentId,
+      );
 
       // Restart environment
       await this.start(userId, organizationId, environmentId);

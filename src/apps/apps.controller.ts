@@ -17,6 +17,7 @@ import {
   ApiBearerAuth,
 } from '@nestjs/swagger';
 import { AppsService } from './apps.service';
+import { MendixService } from '../connectors/mendix/mendix.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
@@ -28,6 +29,10 @@ import {
 } from './dto/grant-app-access.dto';
 import { CreateAppDto } from './dto/create-app.dto';
 import {
+  CreateMendixAppDto,
+  CreateMendixAppResponseDto,
+} from './dto/create-mendix-app.dto';
+import {
   AppPermissionResponseDto,
   UserAppAccessResponseDto,
 } from './dto/app-access-response.dto';
@@ -38,7 +43,10 @@ import { UserRole } from '@prisma/client';
 @UseGuards(JwtAuthGuard, RolesGuard)
 @Controller('apps')
 export class AppsController {
-  constructor(private readonly appsService: AppsService) {}
+  constructor(
+    private readonly appsService: AppsService,
+    private readonly mendixService: MendixService,
+  ) {}
 
   // ============================================
   // APP CRUD
@@ -62,6 +70,48 @@ export class AppsController {
       );
     }
     return this.appsService.createApp(user.id, user.organizationId, dto);
+  }
+
+  @Post('mendix/create')
+  @Roles(UserRole.ADMIN, UserRole.PRO_DEVELOPER, UserRole.CITIZEN_DEVELOPER)
+  @ApiOperation({
+    summary: 'Create a new Mendix app',
+    description: `Creates a new Mendix app with full integration:
+    1. Creates Mendix project via Build API
+    2. Creates GitHub repository for version control (if org has GitHub integration)
+    3. Performs initial sync using Model SDK
+    
+    NOTE: This does NOT create a sandbox/environment. Use the sandbox creation
+    endpoint separately if you need a deployed environment.`,
+  })
+  @ApiResponse({
+    status: 201,
+    description: 'Mendix app created successfully',
+    type: CreateMendixAppResponseDto,
+  })
+  @ApiResponse({
+    status: 400,
+    description:
+      'Bad request - validation failed, no connector, or Mendix API error',
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized - Invalid or missing PAT token',
+  })
+  async createMendixApp(
+    @Body() dto: CreateMendixAppDto,
+    @CurrentUser() user: AuthenticatedUser,
+  ): Promise<CreateMendixAppResponseDto> {
+    if (!user.id || !user.organizationId) {
+      throw new Error(
+        'User must be authenticated and belong to an organization',
+      );
+    }
+    return this.mendixService.createMendixApp(user.id, user.organizationId, {
+      name: dto.name,
+      description: dto.description,
+      connectorId: dto.connectorId,
+    });
   }
 
   @Get()

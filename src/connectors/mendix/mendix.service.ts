@@ -1195,10 +1195,446 @@ Mendix App Export
     this.logger.log(`Mendix connection established for user ${userId}`);
   }
 
+  // ==================== APP CREATION METHODS ====================
+
+  /**
+   * Create a new Mendix app WITHOUT creating a sandbox.
+   * This is the recommended method for creating new Mendix apps.
+   *
+   * Flow:
+   * 1. Creates Mendix project via Build API (PAT authentication)
+   * 2. Deploys app via Deploy API to get AppId (subdomain)
+   * 3. Creates GitHub repository for version control
+   * 4. Performs initial sync using Model SDK
+   * 5. Returns app details for UI
+   *
+   * NOTE: This creates the app and deploys it but does NOT create a separate
+   * sandbox record. The app itself becomes available at its URL.
+   *
+   * @param userId User ID
+   * @param organizationId Organization ID
+   * @param config App configuration
+   */
+  async createMendixApp(
+    userId: string,
+    organizationId: string,
+    config: {
+      name: string;
+      description?: string;
+      connectorId?: string;
+    },
+  ): Promise<{
+    id: string;
+    name: string;
+    description?: string;
+    projectId: string;
+    appId?: string;
+    appUrl?: string;
+    githubRepoUrl?: string;
+    portalUrl: string;
+    status: 'created' | 'deployed' | 'synced';
+    syncCompleted: boolean;
+    syncMessage?: string;
+    createdAt: Date;
+  }> {
+    this.logger.log(`[CREATE_APP] Creating Mendix app: ${config.name}`);
+
+    try {
+      // Get both API clients
+      const patClient = await this.getPatAuthenticatedClient(
+        userId,
+        organizationId,
+      );
+      const apiKeyClient = await this.getAuthenticatedClient(
+        userId,
+        organizationId,
+      );
+
+      // Step 1: Create Mendix project via Build API
+      this.logger.log(
+        `[CREATE_APP] Step 1: Creating Mendix project via Build API...`,
+      );
+
+      const createResponse = await patClient.post(
+        `${this.mendixConfig.buildApiUrl}/projects`,
+        { name: config.name },
+      );
+
+      const jobData = createResponse.data;
+      this.logger.log(
+        `[CREATE_APP] App creation job submitted: ${JSON.stringify(jobData)}`,
+      );
+
+      if (!jobData.jobId) {
+        throw new BadRequestException(
+          `Unexpected response from Mendix Build API. Expected jobId but got: ${JSON.stringify(jobData)}`,
+        );
+      }
+
+      // Poll job status until completion
+      const projectId = await this.pollJobUntilComplete(
+        patClient,
+        jobData.jobId,
+      );
+      this.logger.log(
+        `[CREATE_APP] Mendix project created with ID: ${projectId}`,
+      );
+
+      // Step 2: Deploy app via Deploy API to get AppId (subdomain)
+      // This is required for the Model SDK and other operations to work
+      this.logger.log(`[CREATE_APP] Step 2: Deploying app via Deploy API...`);
+
+      let appId: string | undefined;
+      let appUrl: string | undefined;
+
+      try {
+        const createAppResponse = await apiKeyClient.post(
+          `${this.mendixConfig.apiUrl}/apps`,
+          { ProjectId: projectId },
+        );
+
+        const deployedApp = createAppResponse.data;
+        appId = deployedApp.AppId;
+        appUrl = deployedApp.Url;
+        this.logger.log(
+          `[CREATE_APP] App deployed! AppId: ${appId}, URL: ${appUrl}`,
+        );
+      } catch (deployError) {
+        // Handle case where app environment already exists
+        if (
+          deployError.response?.status === 409 ||
+          deployError.response?.data?.errorCode === 'ALREADY_EXISTS'
+        ) {
+          this.logger.log(
+            `[CREATE_APP] App environment already exists, looking up...`,
+          );
+
+          try {
+            const appsResponse = await apiKeyClient.get(
+              `${this.mendixConfig.apiUrl}/apps`,
+            );
+            const apps = appsResponse.data || [];
+
+            const matchingApp = apps.find(
+              (a: any) =>
+                a.ProjectId === projectId ||
+                a.projectId === projectId ||
+                a.Name === config.name,
+            );
+
+            if (matchingApp?.AppId) {
+              appId = matchingApp.AppId;
+              appUrl = matchingApp.Url;
+              this.logger.log(
+                `[CREATE_APP] Found existing deployment: AppId=${appId}`,
+              );
+            }
+          } catch (lookupError) {
+            this.logger.warn(
+              `[CREATE_APP] Could not find existing app: ${lookupError.message}`,
+            );
+          }
+        } else {
+          // Log but don't fail - app is created, just not deployed yet
+          this.logger.warn(
+            `[CREATE_APP] Failed to deploy app: ${deployError.message}. ` +
+              `App created but needs manual deployment in Mendix Portal.`,
+          );
+        }
+      }
+
+      // Step 3: Get or find connector
+      let connectorId = config.connectorId;
+      if (!connectorId) {
+        const connector = await this.tokenManager[
+          'prisma'
+        ].platformConnector.findFirst({
+          where: {
+            organizationId,
+            platform: 'MENDIX',
+            isActive: true,
+          },
+        });
+        connectorId = connector?.id;
+      }
+
+      if (!connectorId) {
+        throw new BadRequestException(
+          'No active Mendix connector found. Please connect to Mendix first.',
+        );
+      }
+
+      // Step 4: Create app record in database
+      this.logger.log(
+        `[CREATE_APP] Step 3: Creating app record in database...`,
+      );
+
+      // Use appId (subdomain) as externalId if available, otherwise projectId
+      const externalId = appId || projectId;
+
+      const app = await this.appsService.createApp(userId, organizationId, {
+        name: config.name,
+        description: config.description,
+        platform: 'MENDIX' as any,
+        externalId,
+        connectorId,
+        status: appId ? ('LIVE' as any) : ('DRAFT' as any),
+        metadata: {
+          projectId,
+          appId,
+          appUrl,
+          portalUrl: `https://sprintr.home.mendix.com/link/project/${projectId}`,
+          createdVia: 'LDV-Bridge',
+          createdAt: new Date().toISOString(),
+          deployed: !!appId,
+        },
+      });
+
+      this.logger.log(`[CREATE_APP] App record created: ${app.id}`);
+
+      // Step 5: Create GitHub repository (if org has GitHub integration)
+      this.logger.log(`[CREATE_APP] Step 4: Checking GitHub integration...`);
+
+      const organization = await this.appsService[
+        'prisma'
+      ].organization.findUnique({
+        where: { id: organizationId },
+      });
+
+      let githubRepoUrl: string | undefined;
+
+      if (organization?.githubInstallationId) {
+        this.logger.log(
+          `[CREATE_APP] Organization has GitHub, creating repository...`,
+        );
+        try {
+          const repo = await this.githubService.createAppRepository(app);
+          githubRepoUrl = repo.html_url;
+          this.logger.log(
+            `[CREATE_APP] GitHub repository created: ${githubRepoUrl}`,
+          );
+
+          // Re-fetch app to get updated githubRepoUrl
+          const updatedApp = await this.appsService['prisma'].app.findUnique({
+            where: { id: app.id },
+          });
+          if (updatedApp?.githubRepoUrl) {
+            githubRepoUrl = updatedApp.githubRepoUrl;
+          }
+        } catch (repoError) {
+          this.logger.warn(
+            `[CREATE_APP] Failed to create GitHub repo: ${repoError.message}`,
+          );
+          // Continue without GitHub - not a fatal error
+        }
+      } else {
+        this.logger.log(
+          `[CREATE_APP] Organization does not have GitHub integration`,
+        );
+      }
+
+      // Step 6: Perform initial sync using Model SDK (only if deployed)
+      this.logger.log(
+        `[CREATE_APP] Step 5: Performing initial sync via Model SDK...`,
+      );
+
+      let syncCompleted = false;
+      let syncMessage: string | undefined;
+
+      if (!appId) {
+        syncMessage =
+          'Sync skipped: App not yet deployed. Deploy in Mendix Portal first.';
+        this.logger.log(`[CREATE_APP] ${syncMessage}`);
+      } else {
+        try {
+          const token = await this.tokenManager.getToken(userId, 'MENDIX');
+          const pat = token?.metadata?.pat;
+
+          if (pat && githubRepoUrl) {
+            // Export model and commit to GitHub
+            let exportPath: string | null = null;
+            try {
+              this.logger.log(
+                `[CREATE_APP] Exporting full model for project ${projectId}...`,
+              );
+              exportPath = await this.mendixModelSdkService.exportFullModel(
+                projectId,
+                pat,
+                'main',
+              );
+              this.logger.log(`[CREATE_APP] Model exported to: ${exportPath}`);
+
+              // Commit to main branch (initial commit)
+              const refetchedApp = await this.appsService[
+                'prisma'
+              ].app.findUnique({
+                where: { id: app.id },
+              });
+
+              if (refetchedApp) {
+                await this.githubService.commitAppSnapshot(
+                  refetchedApp,
+                  exportPath,
+                  'Initial sync from Mendix',
+                );
+                syncCompleted = true;
+                syncMessage = 'Initial sync completed successfully';
+                this.logger.log(
+                  `[CREATE_APP] Initial sync committed to GitHub`,
+                );
+              }
+            } finally {
+              // Clean up temp directory
+              if (exportPath) {
+                try {
+                  fs.rmSync(exportPath, { recursive: true, force: true });
+                } catch {}
+              }
+            }
+          } else if (!pat) {
+            syncMessage = 'Sync skipped: No PAT available for Model SDK export';
+            this.logger.log(`[CREATE_APP] ${syncMessage}`);
+          } else if (!githubRepoUrl) {
+            syncMessage = 'Sync skipped: No GitHub repository connected';
+            this.logger.log(`[CREATE_APP] ${syncMessage}`);
+          }
+        } catch (syncError) {
+          syncMessage = `Sync failed: ${syncError.message}`;
+          this.logger.warn(
+            `[CREATE_APP] Initial sync failed: ${syncError.message}`,
+          );
+          // Continue - app is created even if sync fails
+        }
+      }
+
+      // Update app status based on results
+      const finalStatus = syncCompleted
+        ? AppStatus.LIVE
+        : appId
+          ? AppStatus.LIVE
+          : AppStatus.DRAFT;
+
+      await this.appsService['prisma'].app.update({
+        where: { id: app.id },
+        data: {
+          status: finalStatus,
+          lastSyncedAt: syncCompleted ? new Date() : null,
+        },
+      });
+
+      const portalUrl = `https://sprintr.home.mendix.com/link/project/${projectId}`;
+
+      this.logger.log(
+        `[CREATE_APP] Mendix app creation complete: ${app.name} (${app.id})`,
+      );
+
+      return {
+        id: app.id,
+        name: app.name,
+        description: config.description,
+        projectId,
+        appId,
+        appUrl,
+        githubRepoUrl,
+        portalUrl,
+        status: syncCompleted ? 'synced' : appId ? 'deployed' : 'created',
+        syncCompleted,
+        syncMessage,
+        createdAt: app.createdAt,
+      };
+    } catch (error) {
+      this.logger.error(
+        `[CREATE_APP] Failed to create Mendix app: ${error.message}`,
+        error.stack,
+      );
+
+      if (error instanceof BadRequestException) {
+        throw error;
+      }
+
+      throw new BadRequestException(
+        `Failed to create Mendix app: ${error.message}. ` +
+          `Please ensure your PAT has 'mx:projects:write' permission.`,
+      );
+    }
+  }
+
+  /**
+   * Poll a Mendix Build API job until completion
+   */
+  private async pollJobUntilComplete(
+    patClient: AxiosInstance,
+    jobId: string,
+    maxWaitMs: number = 2 * 60 * 1000,
+  ): Promise<string> {
+    const startTime = Date.now();
+    let pollInterval = 3000;
+    const maxPollInterval = 15000;
+
+    while (Date.now() - startTime < maxWaitMs) {
+      await new Promise((resolve) => setTimeout(resolve, pollInterval));
+
+      try {
+        this.logger.debug(`[POLL] Checking job status: ${jobId}`);
+        const jobStatusResponse = await patClient.get(
+          `${this.mendixConfig.buildApiUrl}/projects/jobs/${jobId}`,
+        );
+
+        const jobStatus = jobStatusResponse.data;
+        this.logger.debug(`[POLL] Job status: ${JSON.stringify(jobStatus)}`);
+
+        if (
+          jobStatus.status === 'completed' ||
+          jobStatus.state === 'completed'
+        ) {
+          const projectId = jobStatus.projectId || jobStatus.result?.projectId;
+          if (!projectId) {
+            throw new BadRequestException(
+              'Job completed but no projectId returned',
+            );
+          }
+          return projectId;
+        } else if (
+          jobStatus.status === 'failed' ||
+          jobStatus.state === 'failed'
+        ) {
+          throw new BadRequestException(
+            `App creation failed: ${jobStatus.error || jobStatus.message || 'Unknown error'}`,
+          );
+        }
+
+        pollInterval = Math.min(pollInterval * 1.3, maxPollInterval);
+      } catch (pollError) {
+        if (pollError.response?.status === 404) {
+          pollInterval = Math.min(pollInterval * 1.3, maxPollInterval);
+        } else if (pollError instanceof BadRequestException) {
+          throw pollError;
+        } else {
+          this.logger.warn(
+            `[POLL] Error checking job status: ${pollError.message}`,
+          );
+          if (Date.now() - startTime >= maxWaitMs) {
+            throw pollError;
+          }
+        }
+      }
+    }
+
+    throw new BadRequestException(
+      `App creation timed out after ${Math.round(maxWaitMs / 1000)}s. ` +
+        `The app may still be creating. Check Mendix Portal.`,
+    );
+  }
+
   // ==================== SANDBOX MANAGEMENT METHODS ====================
 
   /**
    * Create a new Mendix Free Sandbox
+   *
+   * @deprecated For new app creation, use createMendixApp() instead which
+   * properly separates app creation from sandbox provisioning.
+   * This method is kept for backward compatibility with existing flows.
+   *
    * @param userId User ID
    * @param organizationId Organization ID
    * @param config Sandbox configuration

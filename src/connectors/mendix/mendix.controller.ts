@@ -324,6 +324,12 @@ export class MendixController {
     },
   })
   @ApiBearerAuth()
+  /**
+   * @deprecated Use the sandbox-based workflow instead:
+   * 1. Create a feature sandbox via POST /sandboxes/feature
+   * 2. Sync the sandbox via POST /sandboxes/:id/sync
+   * This endpoint syncs to main branch directly, bypassing the review workflow.
+   */
   async syncApp(
     @CurrentUser() user: AuthenticatedUser,
     @Param('id') appId: string,

@@ -358,6 +358,50 @@ export class SandboxesController {
     return this.sandboxesService.submitForReview(id, userId, organizationId);
   }
 
+  @Post(':id/sync')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Sync sandbox - Export from Team Server and commit to GitHub',
+    description:
+      'Exports the current state from Mendix Team Server and commits it to the GitHub sandbox branch. Triggers change detection and CI/CD pipeline.',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Sync completed',
+    schema: {
+      type: 'object',
+      properties: {
+        success: { type: 'boolean' },
+        message: { type: 'string' },
+        commitSha: { type: 'string' },
+        commitUrl: { type: 'string' },
+        changesDetected: { type: 'number' },
+        pipelineTriggered: { type: 'boolean' },
+      },
+    },
+  })
+  @ApiResponse({ status: 404, description: 'Sandbox not found' })
+  async syncSandbox(
+    @Param('id') id: string,
+    @Body() dto: { changeTitle?: string },
+    @CurrentUser('id') userId: string,
+    @CurrentUser('organizationId') organizationId: string,
+  ): Promise<{
+    success: boolean;
+    message: string;
+    commitSha?: string;
+    commitUrl?: string;
+    changesDetected: number;
+    pipelineTriggered: boolean;
+  }> {
+    return this.sandboxesService.syncSandbox(
+      id,
+      userId,
+      organizationId,
+      dto.changeTitle,
+    );
+  }
+
   @Post(':id/check-conflicts')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({

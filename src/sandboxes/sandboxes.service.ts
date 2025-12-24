@@ -101,12 +101,29 @@ export class SandboxesService {
 
   /**
    * Create sandbox with environment provisioning
+   *
+   * @deprecated For Mendix platform: This method creates both a new Mendix app AND
+   * a sandbox when sourceAppId is not provided. For creating new Mendix apps,
+   * use POST /api/v1/apps/mendix/create instead, which properly separates app
+   * creation from sandbox provisioning.
+   *
+   * For PowerApps platform: This method is still the recommended approach.
    */
   async create(
     dto: CreateSandboxDto,
     userId: string,
     organizationId: string,
   ): Promise<SandboxResponseDto> {
+    // Log deprecation warning for Mendix new app creation
+    if (dto.platform === 'MENDIX' && !dto.sourceAppId) {
+      this.logger.warn(
+        `[DEPRECATED] Creating new Mendix sandbox without sourceAppId. ` +
+          `This creates a new Mendix app which is deprecated behavior. ` +
+          `Use POST /api/v1/apps/mendix/create to create apps first, ` +
+          `then create sandboxes for existing apps.`,
+      );
+    }
+
     this.logger.log(
       `Creating ${dto.platform} sandbox "${dto.name}" for org ${organizationId}`,
     );
@@ -1204,6 +1221,13 @@ export class SandboxesService {
     }
 
     // Step 2: Create sandbox record (before GitHub to get sandbox ID)
+    // Build Mendix Portal URL for opening in Studio Pro
+    // Note: Get project ID from app metadata
+    const appMetadata = app.metadata as any;
+    const projectId =
+      appMetadata?.projectId || appMetadata?.metadata?.projectId || mendixAppId;
+    const studioUrl = `https://home.mendix.com/link/project/${projectId}/branchline/${encodeURIComponent(mendixBranch)}`;
+
     const sandbox = await this.prisma.sandbox.create({
       data: {
         organizationId,
@@ -1220,6 +1244,7 @@ export class SandboxesService {
           platform: 'MENDIX',
           featureBased: true,
           mendixBranchCreatedAt: mendixBranchInfo.createdAt,
+          studioUrl, // URL to open branch in Mendix Portal
         },
       },
       include: {
@@ -1520,6 +1545,153 @@ export class SandboxesService {
     });
 
     return this.toResponseDto(updated);
+  }
+
+  /**
+   * Sync sandbox - Export from Team Server and commit to GitHub
+   * Mirrors the current state of the Mendix branch to GitHub
+   */
+  async syncSandbox(
+    sandboxId: string,
+    userId: string,
+    organizationId: string,
+    changeTitle?: string,
+  ): Promise<{
+    success: boolean;
+    message: string;
+    commitSha?: string;
+    commitUrl?: string;
+    changesDetected: number;
+    pipelineTriggered: boolean;
+  }> {
+    const sandbox = await this.getRawSandbox(sandboxId, organizationId);
+
+    if (!['ACTIVE', 'CHANGES_REQUESTED'].includes(sandbox.status)) {
+      throw new BadRequestException(
+        `Cannot sync sandbox in ${sandbox.status} status`,
+      );
+    }
+
+    // Get app details
+    const app = sandbox.appId
+      ? await this.prisma.app.findFirst({
+          where: { id: sandbox.appId, organizationId },
+        })
+      : null;
+
+    if (!app) {
+      throw new BadRequestException('Sandbox is not linked to an app');
+    }
+
+    // Get Mendix PAT
+    const userConnection = await this.prisma.userConnection.findFirst({
+      where: { userId, platform: 'MENDIX', isActive: true },
+    });
+
+    if (!userConnection) {
+      throw new BadRequestException('No Mendix connection found');
+    }
+
+    const metadata = userConnection.metadata as any;
+    const mendixPat = metadata?.pat || userConnection.accessToken;
+    const mendixAppId = app.externalId;
+
+    if (!mendixAppId || !mendixPat) {
+      throw new BadRequestException('Missing Mendix app ID or PAT');
+    }
+
+    // Step 1: Export current state from Team Server
+    let exportPath: string;
+    try {
+      this.logger.log(
+        `Syncing: Exporting from Team Server branch ${sandbox.mendixBranch}`,
+      );
+      exportPath = await this.mendixModelSdkService.exportFullModel(
+        mendixAppId,
+        mendixPat,
+        sandbox.mendixBranch || 'main',
+      );
+      this.logger.log(`Export complete: ${exportPath}`);
+    } catch (error) {
+      this.logger.error(`Export failed: ${error.message}`);
+      return {
+        success: false,
+        message: `Failed to export from Team Server: ${error.message}`,
+        changesDetected: 0,
+        pipelineTriggered: false,
+      };
+    }
+
+    // Step 2: Commit to GitHub
+    let commitInfo: { sha: string; html_url: string };
+    try {
+      this.logger.log(`Committing to GitHub branch ${sandbox.githubBranch}`);
+      commitInfo = await this.githubService.commitAppSnapshot(
+        app as any,
+        exportPath,
+        changeTitle || `[Sync] ${sandbox.name}`,
+        sandbox.githubBranch || undefined,
+      );
+      this.logger.log(`Committed: ${commitInfo.sha}`);
+    } catch (error) {
+      this.logger.error(`GitHub commit failed: ${error.message}`);
+      return {
+        success: false,
+        message: `Failed to commit to GitHub: ${error.message}`,
+        changesDetected: 0,
+        pipelineTriggered: false,
+      };
+    }
+
+    // Update sandbox with latest SHA
+    await this.prisma.sandbox.update({
+      where: { id: sandboxId },
+      data: {
+        latestGithubSha: commitInfo.sha,
+      },
+    });
+
+    // Step 3: Trigger change detection
+    let changeCount = 0;
+    try {
+      const result = await this.changesService.syncSandbox(
+        sandboxId,
+        userId,
+        organizationId,
+      );
+      changeCount = result.changeCount;
+    } catch (error) {
+      this.logger.warn(`Change detection failed: ${error.message}`);
+    }
+
+    // Step 4: CI/CD pipeline is triggered automatically by GitHub Actions on push
+
+    // Audit log
+    await this.auditService.createAuditLog({
+      userId,
+      organizationId,
+      action: 'UPDATE',
+      entityType: 'sandbox',
+      entityId: sandboxId,
+      details: {
+        action: 'sync',
+        commitSha: commitInfo.sha,
+        changesDetected: changeCount,
+      },
+    });
+
+    this.logger.log(
+      `Sandbox ${sandboxId} synced: ${commitInfo.sha}, ${changeCount} changes`,
+    );
+
+    return {
+      success: true,
+      message: `Sync complete. ${changeCount} changes detected.`,
+      commitSha: commitInfo.sha,
+      commitUrl: commitInfo.html_url,
+      changesDetected: changeCount,
+      pipelineTriggered: true, // GitHub Actions triggers on push
+    };
   }
 
   /**
