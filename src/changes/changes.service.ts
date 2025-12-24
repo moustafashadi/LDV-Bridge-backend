@@ -107,11 +107,10 @@ export class ChangesService {
       const changeType = this.determineChangeType(diffSummary);
 
       // Create change record
-      // Note: authorId can be null for system-detected changes, but Prisma requires author relation
-      // For system-detected changes without a valid user, we'll skip setting author
+      // Use direct field assignments instead of connect relations
       const changeCreateData: any = {
-        organization: { connect: { id: organizationId } },
-        app: { connect: { id: appId } },
+        organizationId,
+        appId,
         title: `Auto-detected changes from sync on ${new Date().toLocaleString()}`,
         description: `Detected ${diffSummary.totalChanges} changes: ${diffSummary.added} added, ${diffSummary.modified} modified, ${diffSummary.deleted} deleted`,
         changeType,
@@ -123,7 +122,7 @@ export class ChangesService {
 
       // Only set author if it's a valid user (not 'system')
       if (userId && userId !== 'system') {
-        changeCreateData.author = { connect: { id: userId } };
+        changeCreateData.authorId = userId;
       }
 
       const change = await this.prisma.change.create({

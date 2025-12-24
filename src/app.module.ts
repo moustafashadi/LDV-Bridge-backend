@@ -26,6 +26,7 @@ import { SandboxesModule } from './sandboxes/sandboxes.module';
 import { AppsModule } from './apps/apps.module';
 import { LinkedEnvironmentsModule } from './connectors/powerapps/linked-environments/linked-environments.module';
 import { GitHubModule } from './github/github.module';
+import { CicdModule } from './cicd/cicd.module';
 
 @Module({
   imports: [
@@ -62,12 +63,11 @@ import { GitHubModule } from './github/github.module';
     ComponentsModule, // Component management & reusable library
     ChangesModule, // Change detection engine with diff & impact analysis
     ReviewsModule, // Code review workflow with approval system
-    SandboxesModule, // Sandbox environments for testing
+    SandboxesModule, // Sandbox environments with provisioning
     AppsModule, // App access control and permissions
-    ReviewsModule, // Review workflow system with comments & approval
-    SandboxesModule, // Sandbox management with environment provisioning
     LinkedEnvironmentsModule, // Linked external environments (PowerApps)
     GitHubModule, // GitHub integration for version control
+    CicdModule, // CI/CD pipeline integration with GitHub Actions
   ],
   controllers: [AppController],
   providers: [

@@ -13,34 +13,65 @@ export enum SandboxPlatform {
 
 /**
  * Sandbox lifecycle status
+ * Now aligned with Prisma SandboxStatus enum for sandbox workflow
+ *
+ * LEGACY STATUSES (for backward compatibility):
+ * - PROVISIONING, SUSPENDED, EXPIRED, FAILED, DELETED
+ *
+ * NEW WORKFLOW STATUSES:
+ * - ACTIVE: Citizen dev is actively working
+ * - PENDING_REVIEW: Submitted for Pro Dev review
+ * - CHANGES_REQUESTED: Pro Dev requested changes
+ * - MERGED: Approved and merged to main
+ * - REJECTED: Declined by Pro Dev
+ * - ABANDONED: Discarded by user
  */
 export enum SandboxStatus {
+  // Legacy provisioning statuses
   PROVISIONING = 'PROVISIONING', // Initial state, waiting for environment creation
-  ACTIVE = 'ACTIVE',             // Environment ready and accessible
-  SUSPENDED = 'SUSPENDED',       // Temporarily disabled (quota exceeded, etc.)
-  EXPIRED = 'EXPIRED',           // Past expiration date, awaiting cleanup
-  FAILED = 'FAILED',             // Provisioning or operation failed
-  DELETED = 'DELETED',           // Soft deleted, environment deprovisioned
+  SUSPENDED = 'SUSPENDED', // Temporarily disabled (quota exceeded, etc.)
+  EXPIRED = 'EXPIRED', // Past expiration date, awaiting cleanup
+  FAILED = 'FAILED', // Provisioning or operation failed
+  DELETED = 'DELETED', // Soft deleted, environment deprovisioned
+
+  // Workflow statuses (aligned with Prisma SandboxStatus)
+  ACTIVE = 'ACTIVE', // Environment ready / Citizen dev actively working
+  PENDING_REVIEW = 'PENDING_REVIEW', // Submitted for Pro Dev review
+  CHANGES_REQUESTED = 'CHANGES_REQUESTED', // Pro Dev requested changes
+  MERGED = 'MERGED', // Approved and merged to main
+  REJECTED = 'REJECTED', // Declined by Pro Dev
+  ABANDONED = 'ABANDONED', // Discarded by user
+}
+
+/**
+ * Conflict status for sandbox merge conflicts
+ * Aligned with Prisma ConflictStatus enum
+ */
+export enum ConflictStatus {
+  NONE = 'NONE', // No conflicts
+  POTENTIAL = 'POTENTIAL', // Overlapping files with other sandboxes (warning)
+  NEEDS_RESOLUTION = 'NEEDS_RESOLUTION', // Main diverged, Pro Dev must resolve
+  RESOLVED = 'RESOLVED', // Pro Dev resolved conflict
 }
 
 /**
  * Sandbox types with different resource quotas and permissions
  */
 export enum SandboxType {
-  PERSONAL = 'PERSONAL',   // Individual developer sandbox (limited resources)
-  TEAM = 'TEAM',           // Shared team sandbox (more resources)
-  TRAINING = 'TRAINING',   // Training/learning environment (medium term)
-  DEMO = 'DEMO',           // Demonstration environment (short term)
+  PERSONAL = 'PERSONAL', // Individual developer sandbox (limited resources)
+  TEAM = 'TEAM', // Shared team sandbox (more resources)
+  TRAINING = 'TRAINING', // Training/learning environment (medium term)
+  DEMO = 'DEMO', // Demonstration environment (short term)
 }
 
 /**
  * Environment provisioning status (tracks async provisioning progress)
  */
 export enum ProvisioningStatus {
-  PENDING = 'PENDING',         // Queued, not started
+  PENDING = 'PENDING', // Queued, not started
   IN_PROGRESS = 'IN_PROGRESS', // Actively provisioning
-  COMPLETED = 'COMPLETED',     // Successfully provisioned
-  FAILED = 'FAILED',           // Provisioning failed
+  COMPLETED = 'COMPLETED', // Successfully provisioned
+  FAILED = 'FAILED', // Provisioning failed
 }
 
 /**
@@ -48,11 +79,11 @@ export enum ProvisioningStatus {
  * Enforced at creation and monitored during runtime
  */
 export interface SandboxQuota {
-  maxApps: number;       // Maximum number of apps allowed
-  maxApiCalls: number;   // API calls per day limit
-  maxStorage: number;    // Storage in MB
-  maxUsers: number;      // Maximum concurrent/assigned users
-  maxDuration: number;   // Days before automatic expiration
+  maxApps: number; // Maximum number of apps allowed
+  maxApiCalls: number; // API calls per day limit
+  maxStorage: number; // Storage in MB
+  maxUsers: number; // Maximum concurrent/assigned users
+  maxDuration: number; // Days before automatic expiration
 }
 
 /**
@@ -60,9 +91,9 @@ export interface SandboxQuota {
  * Returned by provisioners to track consumption
  */
 export interface SandboxResources {
-  appsCount: number;         // Current number of apps deployed
-  apiCallsUsed: number;      // API calls consumed today
-  storageUsed: number;       // Storage used in MB
+  appsCount: number; // Current number of apps deployed
+  apiCallsUsed: number; // API calls consumed today
+  storageUsed: number; // Storage used in MB
 }
 
 /**
@@ -70,12 +101,12 @@ export interface SandboxResources {
  * Returned after successful provisioning
  */
 export interface EnvironmentDetails {
-  environmentId: string;              // Platform-specific environment identifier
-  environmentUrl: string;             // Direct access URL for the environment
-  region?: string;                    // Geographic region/datacenter
-  metadata?: Record<string, any>;     // Platform-specific extra data
-  appId?: string;                     // External platform app ID (for cloned apps)
-  isCloned?: boolean;                 // Whether this was created via cloning
+  environmentId: string; // Platform-specific environment identifier
+  environmentUrl: string; // Direct access URL for the environment
+  region?: string; // Geographic region/datacenter
+  metadata?: Record<string, any>; // Platform-specific extra data
+  appId?: string; // External platform app ID (for cloned apps)
+  isCloned?: boolean; // Whether this was created via cloning
 }
 
 /**
@@ -83,15 +114,15 @@ export interface EnvironmentDetails {
  * Used when provisioning PowerApps developer environments
  */
 export interface PowerAppsEnvironmentConfig {
-  userId: string;                     // User requesting the environment
-  organizationId: string;             // Organization owning the environment
-  displayName: string;                // Human-readable name
+  userId: string; // User requesting the environment
+  organizationId: string; // Organization owning the environment
+  displayName: string; // Human-readable name
   environmentType: 'Developer' | 'Trial' | 'Production' | 'Sandbox';
-  region: string;                     // Azure region (e.g., 'unitedstates')
-  securityGroupId?: string;           // Optional Azure AD security group
-  languageCode?: number;              // LCID language code (default: 1033 = English)
-  currencyCode?: string;              // Currency code (default: 'USD')
-  sourceAppId?: string;               // Optional: LDV-Bridge app ID to clone from
+  region: string; // Azure region (e.g., 'unitedstates')
+  securityGroupId?: string; // Optional Azure AD security group
+  languageCode?: number; // LCID language code (default: 1033 = English)
+  currencyCode?: string; // Currency code (default: 'USD')
+  sourceAppId?: string; // Optional: LDV-Bridge app ID to clone from
 }
 
 /**
@@ -99,13 +130,13 @@ export interface PowerAppsEnvironmentConfig {
  * Used when provisioning Mendix free sandbox environments
  */
 export interface MendixSandboxConfig {
-  userId: string;                     // User requesting the sandbox
-  organizationId: string;             // Organization owning the sandbox
-  name: string;                       // Sandbox/app name
-  template?: string;                  // Optional template app to clone from
-  mode: 'sandbox' | 'free';           // Sandbox mode (free tier)
-  mendixVersion?: string;             // Mendix runtime version (e.g., '10.0')
-  sourceAppId?: string;               // Optional: LDV-Bridge app ID to clone from
+  userId: string; // User requesting the sandbox
+  organizationId: string; // Organization owning the sandbox
+  name: string; // Sandbox/app name
+  template?: string; // Optional template app to clone from
+  mode: 'sandbox' | 'free'; // Sandbox mode (free tier)
+  mendixVersion?: string; // Mendix runtime version (e.g., '10.0')
+  sourceAppId?: string; // Optional: LDV-Bridge app ID to clone from
 }
 
 /**
@@ -118,7 +149,9 @@ export interface IEnvironmentProvisioner {
    * @param config Platform-specific configuration object
    * @returns Environment details including ID and URL
    */
-  provision(config: PowerAppsEnvironmentConfig | MendixSandboxConfig): Promise<EnvironmentDetails>;
+  provision(
+    config: PowerAppsEnvironmentConfig | MendixSandboxConfig,
+  ): Promise<EnvironmentDetails>;
 
   /**
    * Deprovision/delete an environment
@@ -126,7 +159,11 @@ export interface IEnvironmentProvisioner {
    * @param organizationId Organization context
    * @param environmentId Platform-specific environment ID to delete
    */
-  deprovision(userId: string, organizationId: string, environmentId: string): Promise<void>;
+  deprovision(
+    userId: string,
+    organizationId: string,
+    environmentId: string,
+  ): Promise<void>;
 
   /**
    * Start a stopped environment (Mendix only, PowerApps throws error)
@@ -134,7 +171,11 @@ export interface IEnvironmentProvisioner {
    * @param organizationId Organization context
    * @param environmentId Environment to start
    */
-  start(userId: string, organizationId: string, environmentId: string): Promise<void>;
+  start(
+    userId: string,
+    organizationId: string,
+    environmentId: string,
+  ): Promise<void>;
 
   /**
    * Stop a running environment (Mendix only, PowerApps throws error)
@@ -142,7 +183,11 @@ export interface IEnvironmentProvisioner {
    * @param organizationId Organization context
    * @param environmentId Environment to stop
    */
-  stop(userId: string, organizationId: string, environmentId: string): Promise<void>;
+  stop(
+    userId: string,
+    organizationId: string,
+    environmentId: string,
+  ): Promise<void>;
 
   /**
    * Get current provisioning/runtime status
@@ -151,7 +196,11 @@ export interface IEnvironmentProvisioner {
    * @param environmentId Environment to check
    * @returns Current provisioning status
    */
-  getStatus(userId: string, organizationId: string, environmentId: string): Promise<ProvisioningStatus>;
+  getStatus(
+    userId: string,
+    organizationId: string,
+    environmentId: string,
+  ): Promise<ProvisioningStatus>;
 
   /**
    * Get resource usage metrics
@@ -160,7 +209,11 @@ export interface IEnvironmentProvisioner {
    * @param environmentId Environment to check
    * @returns Resource usage statistics
    */
-  getResourceUsage(userId: string, organizationId: string, environmentId: string): Promise<SandboxResources>;
+  getResourceUsage(
+    userId: string,
+    organizationId: string,
+    environmentId: string,
+  ): Promise<SandboxResources>;
 
   /**
    * Reset environment data (delete all apps/data, keep environment)
@@ -168,7 +221,11 @@ export interface IEnvironmentProvisioner {
    * @param organizationId Organization context
    * @param environmentId Environment to reset
    */
-  reset(userId: string, organizationId: string, environmentId: string): Promise<void>;
+  reset(
+    userId: string,
+    organizationId: string,
+    environmentId: string,
+  ): Promise<void>;
 }
 
 /**
@@ -179,29 +236,29 @@ export const SANDBOX_QUOTAS: Record<SandboxType, SandboxQuota> = {
   [SandboxType.PERSONAL]: {
     maxApps: 3,
     maxApiCalls: 1000,
-    maxStorage: 100,      // 100 MB
+    maxStorage: 100, // 100 MB
     maxUsers: 1,
-    maxDuration: 30,      // 30 days
+    maxDuration: 30, // 30 days
   },
   [SandboxType.TEAM]: {
     maxApps: 10,
     maxApiCalls: 5000,
-    maxStorage: 500,      // 500 MB
+    maxStorage: 500, // 500 MB
     maxUsers: 10,
-    maxDuration: 90,      // 90 days
+    maxDuration: 90, // 90 days
   },
   [SandboxType.TRAINING]: {
     maxApps: 5,
     maxApiCalls: 2000,
-    maxStorage: 200,      // 200 MB
+    maxStorage: 200, // 200 MB
     maxUsers: 50,
-    maxDuration: 60,      // 60 days
+    maxDuration: 60, // 60 days
   },
   [SandboxType.DEMO]: {
     maxApps: 5,
     maxApiCalls: 500,
-    maxStorage: 100,      // 100 MB
+    maxStorage: 100, // 100 MB
     maxUsers: 3,
-    maxDuration: 7,       // 7 days
+    maxDuration: 7, // 7 days
   },
 };

@@ -59,14 +59,14 @@ export class PolicyEvaluationResultDto {
  * Request DTO for evaluating policies
  */
 export class EvaluatePolicyDto {
-  @ApiProperty({ 
-    description: 'Context data for policy evaluation', 
+  @ApiProperty({
+    description: 'Context data for policy evaluation',
     example: {
       appId: 'abc-123',
       environment: 'production',
       changeType: 'update',
-      userId: 'user-456'
-    }
+      userId: 'user-456',
+    },
   })
   context: Record<string, any>;
 }

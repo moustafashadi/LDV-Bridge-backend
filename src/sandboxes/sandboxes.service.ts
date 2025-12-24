@@ -4,6 +4,8 @@ import {
   NotFoundException,
   BadRequestException,
   ForbiddenException,
+  Inject,
+  forwardRef,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { Cron, CronExpression } from '@nestjs/schedule';
@@ -27,15 +29,25 @@ import { PowerAppsProvisioner } from './provisioners/powerapps.provisioner';
 import { MendixProvisioner } from './provisioners/mendix.provisioner';
 import { NotificationsService } from '../notifications/notifications.service';
 import { AuditService } from '../common/audit/audit.service';
+import { MendixService } from '../connectors/mendix/mendix.service';
+import { MendixModelSdkService } from '../connectors/mendix/mendix-model-sdk.service';
+import { GitHubService } from '../github/github.service';
+import { ChangesService } from '../changes/changes.service';
 
 // Type helper for Sandbox with new schema fields
 type SandboxWithRelations = {
   id: string;
   organizationId: string;
   createdById: string;
+  appId: string | null;
   name: string;
   description: string | null;
   status: string;
+  conflictStatus: string | null;
+  mendixBranch: string | null;
+  baseMendixRevision: string | null;
+  githubBranch: string | null;
+  baseGithubSha: string | null;
   environment: any;
   expiresAt: Date | null;
   createdAt: Date;
@@ -66,6 +78,13 @@ export class SandboxesService {
     private readonly mendixProvisioner: MendixProvisioner,
     private readonly notificationsService: NotificationsService,
     private readonly auditService: AuditService,
+    @Inject(forwardRef(() => MendixService))
+    private readonly mendixService: MendixService,
+    @Inject(forwardRef(() => GitHubService))
+    private readonly githubService: GitHubService,
+    private readonly mendixModelSdkService: MendixModelSdkService,
+    @Inject(forwardRef(() => ChangesService))
+    private readonly changesService: ChangesService,
   ) {
     // Initialize provisioners map
     this.provisioners = new Map<SandboxPlatform, IEnvironmentProvisioner>([
@@ -121,7 +140,7 @@ export class SandboxesService {
           provisioningStatus: ProvisioningStatus.PENDING,
           platformConfig: dto.platformConfig || {},
         },
-      } as any,
+      },
       include: {
         createdBy: {
           select: {
@@ -130,8 +149,8 @@ export class SandboxesService {
             name: true,
           },
         },
-      } as any,
-    })) as any as SandboxWithRelations;
+      },
+    })) as SandboxWithRelations;
 
     // Audit log
     await this.auditService.createAuditLog({
@@ -185,17 +204,22 @@ export class SandboxesService {
     let environmentDetails: any;
     try {
       if (dto.platform === SandboxPlatform.POWERAPPS) {
-        // Use PowerAppsService directly to get environment details
+        // Get environment details through the provisioner's public interface
+        // The provisioner internally uses PowerAppsService
         const powerAppsProvisioner = this.provisioners.get(
           SandboxPlatform.POWERAPPS,
         ) as PowerAppsProvisioner;
-        environmentDetails = await (
-          powerAppsProvisioner as any
-        ).powerAppsService.getEnvironment(
+        // Use getStatus to verify environment exists (it will throw if not found)
+        await powerAppsProvisioner.getStatus(
           userId,
           organizationId,
           dto.environmentId,
         );
+        environmentDetails = {
+          name: dto.name,
+          url: null,
+          environmentId: dto.environmentId,
+        };
       } else {
         // Mendix environment verification would go here
         environmentDetails = { name: dto.name, url: null };
@@ -234,7 +258,7 @@ export class SandboxesService {
               environmentDetails.properties?.displayName,
           },
         },
-      } as any,
+      },
       include: {
         createdBy: {
           select: {
@@ -243,8 +267,8 @@ export class SandboxesService {
             name: true,
           },
         },
-      } as any,
-    })) as any as SandboxWithRelations;
+      },
+    })) as SandboxWithRelations;
 
     // Audit log
     await this.auditService.createAuditLog({
@@ -329,17 +353,13 @@ export class SandboxesService {
 
           // Determine connector type based on platform
           const platformType =
-            platform === SandboxPlatform.MENDIX
-              ? 'MENDIX'
-              : platform === SandboxPlatform.POWERAPPS
-                ? 'POWERAPPS'
-                : 'OTHER';
+            platform === SandboxPlatform.MENDIX ? 'MENDIX' : 'POWERAPPS';
 
           // Find the organization's platform connector for this platform
           const connector = await this.prisma.platformConnector.findFirst({
             where: {
               organizationId,
-              platform: platformType as any,
+              platform: platformType,
               isActive: true,
             },
             select: {
@@ -358,7 +378,7 @@ export class SandboxesService {
               data: {
                 name: dto.name,
                 externalId: envDetails.appId,
-                platform: platformType as any,
+                platform: platformType,
                 organizationId,
                 ownerId: userId,
                 connectorId: connector.id,
@@ -665,7 +685,7 @@ export class SandboxesService {
     userId: string,
   ): Promise<void> {
     const sandbox = await this.getRawSandbox(id, organizationId);
-    const env = sandbox.environment as any;
+    const env = sandbox.environment;
 
     if (!env?.environmentId) {
       throw new BadRequestException('Sandbox has no provisioned environment');
@@ -688,9 +708,10 @@ export class SandboxesService {
     await this.auditService.createAuditLog({
       userId,
       organizationId,
-      action: 'START_SANDBOX' as any,
+      action: 'UPDATE',
       entityType: 'sandbox',
       entityId: id,
+      details: { operation: 'start' },
     });
 
     this.logger.log(`Started sandbox ${id}`);
@@ -705,7 +726,7 @@ export class SandboxesService {
     userId: string,
   ): Promise<void> {
     const sandbox = await this.getRawSandbox(id, organizationId);
-    const env = sandbox.environment as any;
+    const env = sandbox.environment;
 
     if (!env?.environmentId) {
       throw new BadRequestException('Sandbox has no provisioned environment');
@@ -728,9 +749,10 @@ export class SandboxesService {
     await this.auditService.createAuditLog({
       userId,
       organizationId,
-      action: 'STOP_SANDBOX' as any,
+      action: 'UPDATE',
       entityType: 'sandbox',
       entityId: id,
+      details: { operation: 'stop' },
     });
 
     this.logger.log(`Stopped sandbox ${id}`);
@@ -741,7 +763,7 @@ export class SandboxesService {
    */
   async getStats(id: string, organizationId: string): Promise<SandboxStatsDto> {
     const sandbox = await this.getRawSandbox(id, organizationId);
-    const env = sandbox.environment as any;
+    const env = sandbox.environment;
 
     if (!env?.environmentId) {
       return {
@@ -805,10 +827,10 @@ export class SandboxesService {
     await this.auditService.createAuditLog({
       userId,
       organizationId,
-      action: 'EXTEND_SANDBOX_EXPIRATION' as any,
+      action: 'UPDATE',
       entityType: 'sandbox',
       entityId: id,
-      details: { newExpiration: expiresAt },
+      details: { operation: 'extend_expiration', newExpiration: expiresAt },
     });
 
     return this.toResponseDto(updated);
@@ -1009,7 +1031,7 @@ export class SandboxesService {
       throw new NotFoundException(`Sandbox ${id} not found`);
     }
 
-    return sandbox as any as SandboxWithRelations;
+    return sandbox as SandboxWithRelations;
   }
 
   /**
@@ -1047,7 +1069,7 @@ export class SandboxesService {
    * Helper: Convert Prisma model to response DTO
    */
   private toResponseDto(sandbox: any): SandboxResponseDto {
-    const env = sandbox.environment as any;
+    const env = sandbox.environment;
 
     return {
       id: sandbox.id,
@@ -1069,5 +1091,699 @@ export class SandboxesService {
       createdAt: sandbox.createdAt,
       updatedAt: sandbox.updatedAt,
     };
+  }
+
+  // ========================================
+  // MENDIX SANDBOX WORKFLOW METHODS
+  // ========================================
+
+  /**
+   * Create a feature sandbox for Mendix apps
+   * Creates branches in both Mendix Team Server and GitHub
+   * @param appId - LDV-Bridge app ID to create sandbox for
+   * @param featureName - Name of the feature (used for branch names)
+   */
+  async createFeatureSandbox(
+    appId: string,
+    featureName: string,
+    userId: string,
+    organizationId: string,
+    description?: string,
+  ): Promise<SandboxResponseDto> {
+    this.logger.log(
+      `Creating feature sandbox "${featureName}" for app ${appId}`,
+    );
+
+    // Get the app
+    const app = await this.prisma.app.findFirst({
+      where: { id: appId, organizationId },
+      include: { owner: true },
+    });
+
+    if (!app) {
+      throw new NotFoundException(`App ${appId} not found`);
+    }
+
+    // Check if user has access (owner or has permission)
+    const hasAccess =
+      app.ownerId === userId ||
+      (await this.prisma.appPermission.findFirst({
+        where: { appId, userId, accessLevel: { in: ['EDITOR', 'OWNER'] } },
+      }));
+
+    if (!hasAccess) {
+      throw new ForbiddenException(
+        'You do not have access to create sandboxes for this app',
+      );
+    }
+
+    // Generate branch names from feature name
+    const slug = featureName
+      .toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, '')
+      .replace(/\s+/g, '-')
+      .substring(0, 50);
+    const mendixBranch = `feature/${slug}`;
+    const githubBranch = `sandbox/${slug}`;
+
+    // Check if branch already exists
+    const existingSandbox = await this.prisma.sandbox.findFirst({
+      where: {
+        appId,
+        organizationId,
+        mendixBranch,
+        status: {
+          notIn: [
+            SandboxStatus.MERGED,
+            SandboxStatus.ABANDONED,
+            SandboxStatus.REJECTED,
+          ],
+        },
+      },
+    });
+
+    if (existingSandbox) {
+      throw new BadRequestException(
+        `A sandbox with branch "${mendixBranch}" already exists for this app`,
+      );
+    }
+
+    // Get app external ID for Mendix API calls
+    const mendixAppId = app.externalId;
+    if (!mendixAppId) {
+      throw new BadRequestException(
+        'App does not have a Mendix external ID. Cannot create sandbox branches.',
+      );
+    }
+
+    // Step 1: Create Mendix branch
+    let mendixBranchInfo: {
+      branchName: string;
+      revision: number;
+      createdAt: string;
+    } | null = null;
+    try {
+      this.logger.log(
+        `Creating Mendix branch "${mendixBranch}" for app ${mendixAppId}`,
+      );
+      mendixBranchInfo = await this.mendixService.createBranch(
+        userId,
+        organizationId,
+        mendixAppId,
+        mendixBranch,
+        'main', // Source branch
+      );
+      this.logger.log(
+        `Mendix branch created at revision ${mendixBranchInfo.revision}`,
+      );
+    } catch (error) {
+      this.logger.error(`Failed to create Mendix branch: ${error.message}`);
+      throw new BadRequestException(
+        `Failed to create Mendix branch: ${error.message}`,
+      );
+    }
+
+    // Step 2: Create sandbox record (before GitHub to get sandbox ID)
+    const sandbox = await this.prisma.sandbox.create({
+      data: {
+        organizationId,
+        createdById: userId,
+        appId,
+        name: featureName,
+        description: description || `Feature: ${featureName}`,
+        status: SandboxStatus.ACTIVE,
+        mendixBranch,
+        baseMendixRevision: String(mendixBranchInfo.revision),
+        latestMendixRevision: String(mendixBranchInfo.revision),
+        githubBranch,
+        environment: {
+          platform: 'MENDIX',
+          featureBased: true,
+          mendixBranchCreatedAt: mendixBranchInfo.createdAt,
+        },
+      },
+      include: {
+        createdBy: {
+          select: { id: true, email: true, name: true },
+        },
+        app: true,
+      },
+    });
+
+    // Step 3: Create GitHub branch
+    let githubBranchInfo: { name: string; commit: { sha: string } } | null =
+      null;
+    try {
+      this.logger.log(
+        `Creating GitHub branch "${githubBranch}" for sandbox ${sandbox.id}`,
+      );
+      // GitHubService.createSandboxBranch expects a Sandbox object
+      githubBranchInfo = await this.githubService.createSandboxBranch(
+        sandbox as any,
+      );
+
+      // Update sandbox with GitHub SHA
+      await this.prisma.sandbox.update({
+        where: { id: sandbox.id },
+        data: {
+          baseGithubSha: githubBranchInfo.commit.sha,
+          latestGithubSha: githubBranchInfo.commit.sha,
+        },
+      });
+
+      this.logger.log(
+        `GitHub branch created with SHA ${githubBranchInfo.commit.sha}`,
+      );
+    } catch (error) {
+      this.logger.error(`Failed to create GitHub branch: ${error.message}`);
+      // Clean up: delete the sandbox record since GitHub failed
+      await this.prisma.sandbox.delete({ where: { id: sandbox.id } });
+      // Clean up: delete Mendix branch
+      try {
+        await this.mendixService.deleteBranch(
+          userId,
+          organizationId,
+          mendixAppId,
+          mendixBranch,
+        );
+      } catch (cleanupError) {
+        this.logger.warn(
+          `Failed to cleanup Mendix branch: ${cleanupError.message}`,
+        );
+      }
+      throw new BadRequestException(
+        `Failed to create GitHub branch: ${error.message}`,
+      );
+    }
+
+    this.logger.log(
+      `Created feature sandbox ${sandbox.id} with branches: ${mendixBranch} (rev ${mendixBranchInfo.revision}) / ${githubBranch} (${githubBranchInfo.commit.sha})`,
+    );
+
+    // Audit log
+    await this.auditService.createAuditLog({
+      userId,
+      organizationId,
+      action: 'CREATE',
+      entityType: 'sandbox',
+      entityId: sandbox.id,
+      details: {
+        featureName,
+        mendixBranch,
+        mendixRevision: mendixBranchInfo.revision,
+        githubBranch,
+        githubSha: githubBranchInfo.commit.sha,
+      },
+    });
+
+    // Refetch sandbox with updated GitHub info
+    const updatedSandbox = await this.prisma.sandbox.findUnique({
+      where: { id: sandbox.id },
+      include: {
+        createdBy: { select: { id: true, email: true, name: true } },
+      },
+    });
+
+    return this.toResponseDto(updatedSandbox);
+  }
+
+  /**
+   * Submit sandbox for review
+   * Exports model, commits to GitHub, runs change detection + policy + CI
+   */
+  async submitForReview(
+    sandboxId: string,
+    userId: string,
+    organizationId: string,
+  ): Promise<SandboxResponseDto> {
+    this.logger.log(`Submitting sandbox ${sandboxId} for review`);
+
+    const sandbox = await this.getRawSandbox(sandboxId, organizationId);
+
+    // Validate status
+    if (
+      sandbox.status !== SandboxStatus.ACTIVE &&
+      sandbox.status !== SandboxStatus.CHANGES_REQUESTED
+    ) {
+      throw new BadRequestException(
+        `Cannot submit sandbox in status ${sandbox.status}. Sandbox must be ACTIVE or CHANGES_REQUESTED.`,
+      );
+    }
+
+    // Check for conflicts first
+    const conflictCheck = await this.checkConflicts(
+      sandboxId,
+      userId,
+      organizationId,
+    );
+    if (conflictCheck.hasConflicts) {
+      // Update status to NEEDS_RESOLUTION
+      await this.prisma.sandbox.update({
+        where: { id: sandboxId },
+        data: { conflictStatus: 'NEEDS_RESOLUTION' },
+      });
+
+      throw new BadRequestException(
+        'Cannot submit: main branch has changed and conflicts were detected. A Pro Developer will help resolve this.',
+      );
+    }
+
+    // Get app details for Mendix/GitHub operations
+    const app = sandbox.appId
+      ? await this.prisma.app.findFirst({
+          where: { id: sandbox.appId, organizationId },
+        })
+      : null;
+
+    if (!app) {
+      throw new BadRequestException(
+        'Sandbox is not linked to an app. Cannot submit for review.',
+      );
+    }
+
+    // Get user's Mendix PAT for API calls
+    const userConnection = await this.prisma.userConnection.findFirst({
+      where: {
+        userId,
+        platform: 'MENDIX',
+        isActive: true,
+      },
+    });
+
+    if (!userConnection) {
+      throw new BadRequestException(
+        'No Mendix connection found. Please connect your Mendix account.',
+      );
+    }
+
+    // Get PAT from metadata (Mendix stores PAT there) or fallback to accessToken
+    const metadata = userConnection.metadata as any;
+    const mendixPat = metadata?.pat || userConnection.accessToken;
+    const mendixAppId = app.externalId;
+
+    if (!mendixAppId || !mendixPat) {
+      throw new BadRequestException(
+        'Missing Mendix app ID or PAT. Cannot export model.',
+      );
+    }
+
+    // Step 1: Export Mendix model via SDK
+    let exportPath: string;
+    try {
+      this.logger.log(
+        `Exporting Mendix model for app ${mendixAppId} branch ${sandbox.mendixBranch}`,
+      );
+      exportPath = await this.mendixModelSdkService.exportFullModel(
+        mendixAppId,
+        mendixPat,
+        sandbox.mendixBranch || 'main',
+      );
+      this.logger.log(`Model exported to ${exportPath}`);
+    } catch (error) {
+      this.logger.error(`Failed to export Mendix model: ${error.message}`);
+      throw new BadRequestException(
+        `Failed to export Mendix model: ${error.message}`,
+      );
+    }
+
+    // Step 2: Commit to GitHub sandbox branch
+    let commitResult: {
+      commit: { sha: string; html_url: string };
+      branch: string;
+    };
+    try {
+      this.logger.log(
+        `Committing model to GitHub branch ${sandbox.githubBranch}`,
+      );
+      const commitInfo = await this.githubService.commitAppSnapshot(
+        app as any,
+        exportPath,
+        `[Sandbox] Submit for review: ${sandbox.name}`,
+        sandbox.githubBranch || undefined,
+      );
+      commitResult = {
+        commit: commitInfo,
+        branch: sandbox.githubBranch || 'main',
+      };
+      this.logger.log(`Committed to GitHub: ${commitInfo.sha}`);
+    } catch (error) {
+      this.logger.error(`Failed to commit to GitHub: ${error.message}`);
+      throw new BadRequestException(
+        `Failed to commit to GitHub: ${error.message}`,
+      );
+    }
+
+    // Update sandbox with latest GitHub SHA
+    await this.prisma.sandbox.update({
+      where: { id: sandboxId },
+      data: {
+        latestGithubSha: commitResult.commit.sha,
+      },
+    });
+
+    // Step 3: Trigger change detection (creates Change records with before/after diffs)
+    let changeDetectionResult: { success: boolean; changeCount: number };
+    try {
+      this.logger.log(`Triggering change detection for sandbox ${sandboxId}`);
+      changeDetectionResult = await this.changesService.syncSandbox(
+        sandboxId,
+        userId,
+        organizationId,
+      );
+      this.logger.log(
+        `Change detection complete: ${changeDetectionResult.changeCount} changes`,
+      );
+    } catch (error) {
+      this.logger.warn(`Change detection failed: ${error.message}`);
+      // Don't fail the submission if change detection fails
+      changeDetectionResult = { success: false, changeCount: 0 };
+    }
+
+    // Update status to PENDING_REVIEW
+    const updated = await this.prisma.sandbox.update({
+      where: { id: sandboxId },
+      data: {
+        status: SandboxStatus.PENDING_REVIEW,
+        submittedAt: new Date(),
+        environment: {
+          ...(sandbox.environment as any),
+          lastSubmission: {
+            commitSha: commitResult.commit.sha,
+            commitUrl: commitResult.commit.html_url,
+            changesDetected: changeDetectionResult.changeCount,
+            submittedAt: new Date().toISOString(),
+          },
+        },
+      },
+      include: {
+        createdBy: {
+          select: { id: true, email: true, name: true },
+        },
+      },
+    });
+
+    // CI/CD pipeline will be triggered automatically by GitHub Actions on push to sandbox/* branch
+
+    // Notify Pro Developers about new submission
+    const proDevelopers = await this.prisma.user.findMany({
+      where: {
+        organizationId,
+        role: { in: ['PRO_DEVELOPER', 'ADMIN'] },
+      },
+    });
+
+    for (const proDev of proDevelopers) {
+      await this.notificationsService.create({
+        userId: proDev.id,
+        type: 'REVIEW_ASSIGNED',
+        title: 'New Sandbox Submission',
+        message: `${updated.createdBy?.name || updated.createdBy?.email} has submitted sandbox "${sandbox.name}" for review. ${changeDetectionResult.changeCount} changes detected.`,
+      });
+    }
+
+    this.logger.log(
+      `Sandbox ${sandboxId} submitted for review with ${changeDetectionResult.changeCount} changes`,
+    );
+
+    // Audit log with details
+    await this.auditService.createAuditLog({
+      userId,
+      organizationId,
+      action: 'UPDATE',
+      entityType: 'sandbox',
+      entityId: sandboxId,
+      details: {
+        action: 'submit_for_review',
+        commitSha: commitResult.commit.sha,
+        changesDetected: changeDetectionResult.changeCount,
+      },
+    });
+
+    return this.toResponseDto(updated);
+  }
+
+  /**
+   * Check for conflicts with main branch
+   * Returns true if main has diverged and conflicts exist
+   */
+  async checkConflicts(
+    sandboxId: string,
+    userId: string,
+    organizationId: string,
+  ): Promise<{
+    hasConflicts: boolean;
+    conflictStatus: string;
+    conflictingFiles: string[];
+    message: string;
+  }> {
+    const sandbox = await this.getRawSandbox(sandboxId, organizationId);
+
+    // Log who is checking for conflicts (useful for audit trail)
+    this.logger.log(
+      `User ${userId} checking conflicts for sandbox ${sandboxId}`,
+    );
+
+    // TODO: Implement actual conflict detection:
+    // 1. Get current main branch revision from Mendix/GitHub
+    // 2. Compare with sandbox's baseMendixRevision/baseGithubSha
+    // 3. If main has advanced, check if modified files overlap
+    // For now, use the stored conflictStatus from database
+
+    const conflictStatus = sandbox.conflictStatus || 'NONE';
+    const hasConflicts = conflictStatus === 'NEEDS_RESOLUTION';
+
+    // Get list of potentially conflicting files (from sandbox environment metadata)
+    const env = sandbox.environment as any;
+    const conflictingFiles: string[] = env?.conflictingFiles || [];
+
+    return {
+      hasConflicts,
+      conflictStatus,
+      conflictingFiles,
+      message: hasConflicts
+        ? 'Conflicts detected with main branch. A Pro Developer will assist with resolution.'
+        : conflictStatus === 'POTENTIAL'
+          ? 'Potential conflicts detected. Review recommended before submitting.'
+          : 'No conflicts detected. Ready to submit.',
+    };
+  }
+
+  /**
+   * Mark conflict as resolved by Pro Developer
+   * @param sandboxId - The sandbox ID
+   * @param userId - Pro Developer user ID
+   * @param organizationId - Organization context
+   * @param resolution - Description of how the conflict was resolved
+   * @param mergeCommitSha - Git commit SHA after merge resolution (if applicable)
+   */
+  async resolveConflict(
+    sandboxId: string,
+    userId: string,
+    organizationId: string,
+    resolution?: string,
+    mergeCommitSha?: string,
+  ): Promise<SandboxResponseDto> {
+    this.logger.log(
+      `Pro Developer ${userId} resolving conflict for sandbox ${sandboxId}`,
+    );
+
+    // Verify user is a Pro Developer or Admin
+    const user = await this.prisma.user.findFirst({
+      where: { id: userId, organizationId },
+    });
+
+    if (!user || (user.role !== 'PRO_DEVELOPER' && user.role !== 'ADMIN')) {
+      throw new ForbiddenException(
+        'Only Pro Developers or Admins can resolve conflicts',
+      );
+    }
+
+    const sandbox = await this.getRawSandbox(sandboxId, organizationId);
+
+    if (sandbox.conflictStatus !== 'NEEDS_RESOLUTION') {
+      throw new BadRequestException(
+        'Sandbox does not have conflicts to resolve',
+      );
+    }
+
+    // Build update data including resolution metadata
+    const env = sandbox.environment;
+    const updatedEnvironment = {
+      ...env,
+      conflictResolution: {
+        resolvedBy: userId,
+        resolvedAt: new Date().toISOString(),
+        resolution: resolution || 'Conflict resolved by Pro Developer',
+        mergeCommitSha: mergeCommitSha || null,
+      },
+      // Clear conflicting files list after resolution
+      conflictingFiles: [],
+    };
+
+    // Update sandbox with resolution details
+    const updated = await this.prisma.sandbox.update({
+      where: { id: sandboxId },
+      data: {
+        conflictStatus: 'RESOLVED',
+        status: SandboxStatus.ACTIVE, // Back to ACTIVE so citizen dev can resubmit
+        // Update GitHub SHA if merge commit was provided
+        ...(mergeCommitSha && { latestGithubSha: mergeCommitSha }),
+        environment: updatedEnvironment,
+      },
+      include: {
+        createdBy: {
+          select: { id: true, email: true, name: true },
+        },
+      },
+    });
+
+    // Notify citizen developer with resolution details
+    await this.notificationsService.create({
+      userId: sandbox.createdById,
+      type: 'SYSTEM',
+      title: 'Conflict Resolved',
+      message: `The conflicts in your sandbox "${sandbox.name}" have been resolved by ${user.name || user.email}. ${resolution ? `Resolution: ${resolution}` : 'You can now resubmit for review.'}`,
+    });
+
+    // Audit log with full resolution details
+    await this.auditService.createAuditLog({
+      userId,
+      organizationId,
+      action: 'UPDATE',
+      entityType: 'sandbox',
+      entityId: sandboxId,
+      details: {
+        action: 'resolve_conflict',
+        resolution: resolution || 'Conflict resolved',
+        mergeCommitSha: mergeCommitSha || null,
+        resolvedBy: user.email,
+      },
+    });
+
+    this.logger.log(
+      `Sandbox ${sandboxId} conflict resolved. Resolution: ${resolution || 'N/A'}, Merge SHA: ${mergeCommitSha || 'N/A'}`,
+    );
+
+    return this.toResponseDto(updated);
+  }
+
+  /**
+   * Abandon a sandbox (discard changes)
+   */
+  async abandonSandbox(
+    sandboxId: string,
+    userId: string,
+    organizationId: string,
+  ): Promise<SandboxResponseDto> {
+    this.logger.log(`Abandoning sandbox ${sandboxId}`);
+
+    const sandbox = await this.getRawSandbox(sandboxId, organizationId);
+
+    // Only owner or admin can abandon
+    if (sandbox.createdById !== userId) {
+      const user = await this.prisma.user.findFirst({
+        where: { id: userId, organizationId },
+      });
+      if (!user || user.role !== 'ADMIN') {
+        throw new ForbiddenException(
+          'Only the sandbox owner or admin can abandon it',
+        );
+      }
+    }
+
+    // Get the app to find the Mendix external ID
+    const app = sandbox.appId
+      ? await this.prisma.app.findFirst({
+          where: { id: sandbox.appId, organizationId },
+        })
+      : null;
+
+    // Update status first
+    const updated = await this.prisma.sandbox.update({
+      where: { id: sandboxId },
+      data: { status: SandboxStatus.ABANDONED },
+      include: {
+        createdBy: {
+          select: { id: true, email: true, name: true },
+        },
+      },
+    });
+
+    // Delete Mendix branch (if it exists)
+    if (sandbox.mendixBranch && app?.externalId) {
+      try {
+        this.logger.log(`Deleting Mendix branch "${sandbox.mendixBranch}"`);
+        await this.mendixService.deleteBranch(
+          userId,
+          organizationId,
+          app.externalId,
+          sandbox.mendixBranch,
+        );
+        this.logger.log(`Mendix branch "${sandbox.mendixBranch}" deleted`);
+      } catch (error) {
+        this.logger.warn(`Failed to delete Mendix branch: ${error.message}`);
+        // Don't fail the abandon operation if branch deletion fails
+      }
+    }
+
+    // Delete GitHub branch (if it exists)
+    if (sandbox.githubBranch) {
+      try {
+        this.logger.log(`Deleting GitHub branch "${sandbox.githubBranch}"`);
+        await this.githubService.deleteSandboxBranch(sandbox as any);
+        this.logger.log(`GitHub branch deleted`);
+      } catch (error) {
+        this.logger.warn(`Failed to delete GitHub branch: ${error.message}`);
+        // Don't fail the abandon operation if branch deletion fails
+      }
+    }
+
+    // Audit log
+    await this.auditService.createAuditLog({
+      userId,
+      organizationId,
+      action: 'DELETE',
+      entityType: 'sandbox',
+      entityId: sandboxId,
+      details: {
+        action: 'abandon',
+        mendixBranchDeleted: sandbox.mendixBranch || null,
+        githubBranchDeleted: sandbox.githubBranch || null,
+      },
+    });
+
+    this.logger.log(`Sandbox ${sandboxId} abandoned`);
+
+    return this.toResponseDto(updated);
+  }
+
+  /**
+   * Get all active sandboxes for an app
+   */
+  async getAppSandboxes(
+    appId: string,
+    organizationId: string,
+  ): Promise<SandboxResponseDto[]> {
+    const sandboxes = await this.prisma.sandbox.findMany({
+      where: {
+        appId,
+        organizationId,
+        status: {
+          notIn: [
+            SandboxStatus.MERGED,
+            SandboxStatus.ABANDONED,
+            SandboxStatus.DELETED,
+          ],
+        },
+      },
+      include: {
+        createdBy: {
+          select: { id: true, email: true, name: true },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    return sandboxes.map((s) => this.toResponseDto(s));
   }
 }

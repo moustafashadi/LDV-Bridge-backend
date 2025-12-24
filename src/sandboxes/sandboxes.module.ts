@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { Module, forwardRef } from '@nestjs/common';
 import { ScheduleModule } from '@nestjs/schedule';
 import { SandboxesController } from './sandboxes.controller';
 import { SandboxesService } from './sandboxes.service';
@@ -8,21 +8,21 @@ import { PrismaModule } from '../prisma/prisma.module';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { AuditModule } from '../common/audit/audit.module';
 import { ConnectorsModule } from '../connectors/connectors.module';
+import { GitHubModule } from '../github/github.module';
+import { ChangesModule } from '../changes/changes.module';
 
 @Module({
   imports: [
     PrismaModule,
     NotificationsModule,
     AuditModule,
-    ConnectorsModule, // Provides PowerAppsService and MendixService
+    forwardRef(() => ConnectorsModule), // Provides PowerAppsService, MendixService, MendixModelSdkService
+    forwardRef(() => GitHubModule), // Provides GitHubService
+    forwardRef(() => ChangesModule), // Provides ChangesService
     ScheduleModule.forRoot(), // Enable cron jobs
   ],
   controllers: [SandboxesController],
-  providers: [
-    SandboxesService,
-    PowerAppsProvisioner,
-    MendixProvisioner,
-  ],
+  providers: [SandboxesService, PowerAppsProvisioner, MendixProvisioner],
   exports: [SandboxesService],
 })
 export class SandboxesModule {}

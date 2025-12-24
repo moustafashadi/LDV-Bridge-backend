@@ -309,10 +309,25 @@ export class MendixController {
   @Post('apps/:id/sync')
   @ApiOperation({ summary: 'Sync Mendix app to database' })
   @ApiResponse({ status: 200, description: 'Sync result' })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: {
+        changeTitle: {
+          type: 'string',
+          description:
+            'Title describing what has changed (max 75 chars). Used for version tracking.',
+          example: 'Add new login page',
+          maxLength: 75,
+        },
+      },
+    },
+  })
   @ApiBearerAuth()
   async syncApp(
     @CurrentUser() user: AuthenticatedUser,
     @Param('id') appId: string,
+    @Body() body?: { changeTitle?: string },
   ) {
     this.logger.log(
       `User ${user.id} syncing Mendix app: ${appId} for organization ${user.organizationId}`,
@@ -328,6 +343,7 @@ export class MendixController {
       user.id,
       user.organizationId,
       appId,
+      body?.changeTitle,
     );
 
     return result;

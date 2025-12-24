@@ -55,6 +55,13 @@ export class MendixModelSdkService {
       this.logger.log(`[SDK] Opening model...`);
       const model = await workingCopy.openModel();
 
+      // Log all modules for debugging
+      const allModules = model.allModules();
+      const moduleNames = allModules.map((m) => m.name);
+      this.logger.log(
+        `[SDK] Found ${moduleNames.length} modules: ${moduleNames.join(', ')}`,
+      );
+
       // Create subdirectories
       const dirs = {
         domainModel: path.join(exportDir, 'domain-model'),
@@ -68,13 +75,48 @@ export class MendixModelSdkService {
         fs.mkdirSync(dir, { recursive: true });
       }
 
-      // Export domain models (entities)
+      // Track exported counts and skipped counts
+      let exportedDomainModels = 0;
+      let exportedPages = 0;
+      let exportedMicroflows = 0;
+      let exportedNanoflows = 0;
+      let exportedConstants = 0;
+      let skippedElements = 0;
+
+      // Helper to safely get module name from element
+      // Uses containerAsModule if available, otherwise extracts from qualifiedName
+      const getModuleName = (element: any): string => {
+        try {
+          // First try containerAsModule
+          if (element.containerAsModule?.name) {
+            return element.containerAsModule.name;
+          }
+        } catch {
+          // containerAsModule threw an error, try qualifiedName
+        }
+
+        try {
+          // Fallback: extract from qualifiedName (format: "ModuleName.ElementName")
+          if (element.qualifiedName) {
+            const parts = element.qualifiedName.split('.');
+            if (parts.length >= 2) {
+              return parts[0];
+            }
+          }
+        } catch {
+          // qualifiedName also failed
+        }
+
+        return 'unknown';
+      };
+
+      // Export domain models (entities) - try all, skip on failure
       this.logger.log(`[SDK] Exporting domain models...`);
       const domainModels = model.allDomainModels();
       for (const dm of domainModels) {
         try {
           const loadedDm = await dm.load();
-          const moduleName = (dm as any).containerAsModule?.name || 'unknown';
+          const moduleName = getModuleName(dm) || 'unknown';
           const dmData = loadedDm as any;
 
           const entities = (dmData.entities || []).map((entity: any) => ({
@@ -101,20 +143,22 @@ export class MendixModelSdkService {
             path.join(dirs.domainModel, `${moduleName}.json`),
             JSON.stringify({ moduleName, entities, associations }, null, 2),
           );
+          exportedDomainModels++;
         } catch (err) {
+          skippedElements++;
           this.logger.debug(
-            `[SDK] Could not load domain model: ${(err as any).message}`,
+            `[SDK] Skipped domain model (not accessible): ${(err as any).message}`,
           );
         }
       }
 
-      // Export pages
+      // Export pages - try all, skip on failure
       this.logger.log(`[SDK] Exporting pages...`);
       const pages = model.allPages();
       for (const page of pages) {
         try {
           const loadedPage = await page.load();
-          const moduleName = (page as any).containerAsModule?.name || 'unknown';
+          const moduleName = getModuleName(page) || 'unknown';
           const moduleDir = path.join(dirs.pages, moduleName);
           fs.mkdirSync(moduleDir, { recursive: true });
 
@@ -135,26 +179,26 @@ export class MendixModelSdkService {
               2,
             ),
           );
+          exportedPages++;
         } catch (err) {
+          skippedElements++;
           this.logger.debug(
-            `[SDK] Could not load page ${page.name}: ${(err as any).message}`,
+            `[SDK] Skipped page ${page.name}: ${(err as any).message}`,
           );
         }
       }
 
-      // Export microflows
+      // Export microflows - try all, skip on failure
       this.logger.log(`[SDK] Exporting microflows...`);
       const microflows = model.allMicroflows();
       for (const mf of microflows) {
         try {
           const loadedMf = await mf.load();
-          const moduleName = (mf as any).containerAsModule?.name || 'unknown';
+          const moduleName = getModuleName(mf) || 'unknown';
           const moduleDir = path.join(dirs.microflows, moduleName);
           fs.mkdirSync(moduleDir, { recursive: true });
 
-          // Use any casts for dynamic SDK properties
           const mfData = loadedMf as any;
-
           fs.writeFileSync(
             path.join(moduleDir, `${mf.name}.json`),
             JSON.stringify(
@@ -174,20 +218,22 @@ export class MendixModelSdkService {
               2,
             ),
           );
+          exportedMicroflows++;
         } catch (err) {
+          skippedElements++;
           this.logger.debug(
-            `[SDK] Could not load microflow ${mf.name}: ${(err as any).message}`,
+            `[SDK] Skipped microflow ${mf.name}: ${(err as any).message}`,
           );
         }
       }
 
-      // Export nanoflows
+      // Export nanoflows - try all, skip on failure
       this.logger.log(`[SDK] Exporting nanoflows...`);
       const nanoflows = model.allNanoflows();
       for (const nf of nanoflows) {
         try {
           const loadedNf = await nf.load();
-          const moduleName = (nf as any).containerAsModule?.name || 'unknown';
+          const moduleName = getModuleName(nf) || 'unknown';
           const moduleDir = path.join(dirs.nanoflows, moduleName);
           fs.mkdirSync(moduleDir, { recursive: true });
 
@@ -198,27 +244,29 @@ export class MendixModelSdkService {
               {
                 name: nf.name,
                 documentation: nfData.documentation,
-                returnType: nfData.returnType?.constructor?.name,
+                // Use microflowReturnType (returnType was deprecated in Mendix 7.9.0)
+                returnType: nfData.microflowReturnType?.constructor?.name,
               },
               null,
               2,
             ),
           );
+          exportedNanoflows++;
         } catch (err) {
+          skippedElements++;
           this.logger.debug(
-            `[SDK] Could not load nanoflow ${nf.name}: ${(err as any).message}`,
+            `[SDK] Skipped nanoflow ${nf.name}: ${(err as any).message}`,
           );
         }
       }
 
-      // Export constants
+      // Export constants - try all, skip on failure
       this.logger.log(`[SDK] Exporting constants...`);
       const constants = model.allConstants();
       for (const constant of constants) {
         try {
           const loadedConst = await constant.load();
-          const moduleName =
-            (constant as any).containerAsModule?.name || 'unknown';
+          const moduleName = getModuleName(constant) || 'unknown';
           const moduleDir = path.join(dirs.constants, moduleName);
           fs.mkdirSync(moduleDir, { recursive: true });
 
@@ -236,25 +284,40 @@ export class MendixModelSdkService {
               2,
             ),
           );
+          exportedConstants++;
         } catch (err) {
+          skippedElements++;
           this.logger.debug(
-            `[SDK] Could not load constant ${constant.name}: ${(err as any).message}`,
+            `[SDK] Skipped constant ${constant.name}: ${(err as any).message}`,
           );
         }
       }
 
-      // Create summary file
+      // Create summary file with exported counts
+      this.logger.log(
+        `[SDK] Export complete: ${exportedDomainModels} domain models, ${exportedPages} pages, ${exportedMicroflows} microflows, ${exportedNanoflows} nanoflows, ${exportedConstants} constants. Skipped ${skippedElements} inaccessible elements.`,
+      );
+
       const summary = {
         appId: mendixAppId,
         branch: branchName,
         exportedAt: new Date().toISOString(),
+        modules: moduleNames,
         counts: {
+          domainModels: exportedDomainModels,
+          pages: exportedPages,
+          microflows: exportedMicroflows,
+          nanoflows: exportedNanoflows,
+          constants: exportedConstants,
+        },
+        totalElementsInProject: {
           domainModels: domainModels.length,
           pages: pages.length,
           microflows: microflows.length,
           nanoflows: nanoflows.length,
           constants: constants.length,
         },
+        skippedElements,
       };
 
       fs.writeFileSync(
@@ -271,15 +334,21 @@ export class MendixModelSdkService {
 **Branch:** ${branchName}
 **Exported:** ${summary.exportedAt}
 
-## Contents
+## Modules
 
-| Type | Count |
-|------|-------|
-| Domain Models | ${summary.counts.domainModels} |
-| Pages | ${summary.counts.pages} |
-| Microflows | ${summary.counts.microflows} |
-| Nanoflows | ${summary.counts.nanoflows} |
-| Constants | ${summary.counts.constants} |
+${summary.modules.length > 0 ? summary.modules.map((m: string) => `- ${m}`).join('\n') : '_No modules found_'}
+
+## Exported Contents
+
+| Type | Exported | Total in Project |
+|------|----------|------------------|
+| Domain Models | ${summary.counts.domainModels} | ${summary.totalElementsInProject.domainModels} |
+| Pages | ${summary.counts.pages} | ${summary.totalElementsInProject.pages} |
+| Microflows | ${summary.counts.microflows} | ${summary.totalElementsInProject.microflows} |
+| Nanoflows | ${summary.counts.nanoflows} | ${summary.totalElementsInProject.nanoflows} |
+| Constants | ${summary.counts.constants} | ${summary.totalElementsInProject.constants} |
+
+> **Note:** ${summary.skippedElements} elements were skipped because they are from system/marketplace modules that are not directly accessible via the Mendix Model SDK.
 
 ---
 *Exported by LDV Bridge using Mendix Model SDK*

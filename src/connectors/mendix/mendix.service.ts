@@ -515,6 +515,7 @@ export class MendixService implements IBaseConnector {
 
   /**
    * Get specific app details
+   * Handles both deployed apps (using AppId/subdomain) and undeployed apps (using ProjectId/UUID)
    */
   async getApp(
     userId: string,
@@ -526,39 +527,122 @@ export class MendixService implements IBaseConnector {
     try {
       const client = await this.getAuthenticatedClient(userId, organizationId);
 
-      // Get app details
-      const appResponse = await client.get(
-        `${this.mendixConfig.apiUrl}/apps/${appId}`,
-      );
-
-      const app = appResponse.data;
-
-      // Get environments for this app
-      let environments = [];
+      // Try to get app details from Deploy API
       try {
-        const envResponse = await client.get(
-          `${this.mendixConfig.apiUrl}/apps/${appId}/environments`,
+        const appResponse = await client.get(
+          `${this.mendixConfig.apiUrl}/apps/${appId}`,
         );
-        environments = envResponse.data || [];
-      } catch (error) {
-        this.logger.warn(`Could not fetch environments for app ${appId}`);
-      }
 
-      return {
-        id: app.AppId || app.ProjectId,
-        name: app.Name,
-        description: app.Description || undefined,
-        createdAt: new Date(),
-        modifiedAt: new Date(),
-        version: undefined,
-        environment: undefined,
-        metadata: {
-          projectId: app.ProjectId,
-          appId: app.AppId,
-          url: app.Url,
-          environments: environments,
-        },
-      };
+        const app = appResponse.data;
+
+        // Get environments for this app
+        let environments = [];
+        try {
+          const envResponse = await client.get(
+            `${this.mendixConfig.apiUrl}/apps/${appId}/environments`,
+          );
+          environments = envResponse.data || [];
+        } catch (error) {
+          this.logger.warn(`Could not fetch environments for app ${appId}`);
+        }
+
+        return {
+          id: app.AppId || app.ProjectId,
+          name: app.Name,
+          description: app.Description || undefined,
+          createdAt: new Date(),
+          modifiedAt: new Date(),
+          version: undefined,
+          environment: undefined,
+          metadata: {
+            projectId: app.ProjectId,
+            appId: app.AppId,
+            url: app.Url,
+            environments: environments,
+          },
+        };
+      } catch (deployApiError) {
+        // If Deploy API returns 404, the app might not be deployed yet
+        // Check if appId looks like a UUID (ProjectId) and try to find it in the app list
+        const isUUID =
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+            appId,
+          );
+
+        if (
+          deployApiError.response?.status === 404 ||
+          deployApiError.message?.includes('404')
+        ) {
+          this.logger.warn(
+            `App not found in Deploy API. ${isUUID ? 'Checking if this is an undeployed app...' : ''}`,
+          );
+
+          if (isUUID) {
+            // This might be a ProjectId for an undeployed app
+            // Try to find it in the list of all apps by ProjectId
+            try {
+              const appsResponse = await client.get(
+                `${this.mendixConfig.apiUrl}/apps`,
+              );
+              const apps = appsResponse.data || [];
+              const matchingApp = apps.find(
+                (a: any) => a.ProjectId === appId || a.projectId === appId,
+              );
+
+              if (matchingApp) {
+                this.logger.log(
+                  `Found app in Deploy API list by ProjectId: ${matchingApp.AppId}`,
+                );
+                return {
+                  id: matchingApp.AppId || matchingApp.ProjectId,
+                  name: matchingApp.Name,
+                  description: matchingApp.Description || undefined,
+                  createdAt: new Date(),
+                  modifiedAt: new Date(),
+                  version: undefined,
+                  environment: undefined,
+                  metadata: {
+                    projectId: matchingApp.ProjectId,
+                    appId: matchingApp.AppId,
+                    url: matchingApp.Url,
+                  },
+                };
+              }
+
+              // App exists as a project but hasn't been deployed yet
+              this.logger.warn(
+                `App with ProjectId ${appId} not found in Deploy API. ` +
+                  `This app may need to be deployed from Mendix Studio first.`,
+              );
+
+              // Return a placeholder for undeployed apps
+              return {
+                id: appId,
+                name: `Project ${appId.substring(0, 8)}...`,
+                description: 'This app has not been deployed yet.',
+                createdAt: new Date(),
+                modifiedAt: new Date(),
+                version: undefined,
+                environment: undefined,
+                metadata: {
+                  projectId: appId,
+                  isUndeployed: true,
+                  message:
+                    'This app needs to be deployed from Mendix Studio before it can be synced. ' +
+                    'Open the app in Mendix Studio Pro, make any changes, and click "Publish" to deploy.',
+                },
+              };
+            } catch (listError) {
+              this.logger.warn(
+                `Failed to search for app in list: ${listError.message}`,
+              );
+            }
+          }
+        }
+
+        // Re-throw the original error
+        throw deployApiError;
+      }
     } catch (error) {
       this.logger.error(`Failed to fetch Mendix app ${appId}:`, error.message);
       throw new BadRequestException(
@@ -741,11 +825,13 @@ Mendix App Export
   /**
    * Sync app to database with policy-driven flow
    * All changes go to staging branch until pro dev approves
+   * @param changeTitle - Optional user-provided title for this change (used for branch name)
    */
   async syncApp(
     userId: string,
     organizationId: string,
     appId: string,
+    changeTitle?: string,
   ): Promise<ISyncResult> {
     this.logger.log(`Syncing Mendix app ${appId} for user ${userId}`);
 
@@ -853,6 +939,27 @@ Mendix App Export
           where: { id: organizationId },
         });
 
+        // Auto-create GitHub repo if organization has GitHub but app doesn't have repo
+        if (organization?.githubInstallationId && !app.githubRepoUrl) {
+          this.logger.log(
+            `[GITHUB] Organization has GitHub connected but app has no repo. Creating repo...`,
+          );
+          try {
+            const repo = await this.githubService.createAppRepository(app);
+            this.logger.log(
+              `[GITHUB] Created GitHub repository: ${repo.full_name}`,
+            );
+            // Re-fetch app to get updated githubRepoUrl
+            app = await this.appsService['prisma'].app.findUnique({
+              where: { id: app.id },
+            });
+          } catch (repoError) {
+            this.logger.warn(
+              `[GITHUB] Failed to create repo: ${repoError.message}. Continuing without GitHub integration.`,
+            );
+          }
+        }
+
         if (organization?.githubInstallationId && app.githubRepoUrl) {
           this.logger.log(
             `[GITHUB] Organization has GitHub connected, exporting full model and committing to staging branch...`,
@@ -874,12 +981,14 @@ Mendix App Export
                 organizationId,
                 appId,
               );
-              const changeId = changeResult?.change?.id || `temp-${Date.now()}`;
+              // Use changeTitle from user, or generate default
+              const titleForBranch =
+                changeTitle || `sync-${new Date().toISOString().slice(0, 10)}`;
               const commitResult =
                 await this.githubService.commitToStagingBranch(
                   app,
                   exportPath,
-                  changeId,
+                  titleForBranch,
                   `Sync: ${app.name} - ${new Date().toISOString()}`,
                 );
               stagingBranch = commitResult.branch;
@@ -894,21 +1003,31 @@ Mendix App Export
             // Use SDK to export full model
             let exportPath: string | null = null;
             try {
-              this.logger.log(`[SDK] Exporting full model using SDK...`);
+              // The SDK needs the projectId (UUID), not the appId (subdomain)
+              // Extract projectId from app metadata
+              const metadata = app.metadata as any;
+              const projectId =
+                metadata?.projectId || metadata?.metadata?.projectId || appId;
+
+              this.logger.log(
+                `[SDK] Exporting full model using SDK for projectId: ${projectId}...`,
+              );
               exportPath = await this.mendixModelSdkService.exportFullModel(
-                appId, // Mendix app ID
+                projectId, // Use projectId (UUID) for SDK
                 pat,
                 'main', // Branch name
               );
               this.logger.log(`[SDK] Exported full model to: ${exportPath}`);
 
               // Commit to staging branch
-              const changeId = changeResult?.change?.id || `temp-${Date.now()}`;
+              // Use changeTitle from user, or generate default
+              const titleForBranch =
+                changeTitle || `sync-${new Date().toISOString().slice(0, 10)}`;
               const commitResult =
                 await this.githubService.commitToStagingBranch(
                   app,
                   exportPath,
-                  changeId,
+                  titleForBranch,
                   `Sync: ${app.name} (Full Model) - ${new Date().toISOString()}`,
                 );
 
@@ -1262,12 +1381,98 @@ Mendix App Export
               );
             }
 
-            // Job completed successfully, set the app with the projectId
-            app = {
-              appId: projectId,
-              projectId: projectId,
-              name: config.name,
-            };
+            // Job completed successfully, but projectId is a UUID
+            // Deploy API uses subdomain (AppId), not projectId (UUID)
+            // We need to create a Free App Environment to get the proper AppId
+            this.logger.log(
+              `Build API returned projectId: ${projectId}. Creating Free App Environment...`,
+            );
+
+            // Create Free App Environment using Deploy API
+            // This deploys the app and returns the proper AppId (subdomain)
+            try {
+              this.logger.log(
+                `Calling Create Free App Environment API for ProjectId: ${projectId}`,
+              );
+
+              const createAppResponse = await apiKeyClient.post(
+                `${this.mendixConfig.apiUrl}/apps`,
+                { ProjectId: projectId },
+              );
+
+              const deployedApp = createAppResponse.data;
+              this.logger.log(
+                `Free App Environment created successfully! AppId: ${deployedApp.AppId}, Url: ${deployedApp.Url}`,
+              );
+
+              app = {
+                appId: deployedApp.AppId, // Use the subdomain from Deploy API
+                projectId: deployedApp.ProjectId || projectId,
+                name: deployedApp.Name || config.name,
+                url: deployedApp.Url,
+              };
+            } catch (deployError) {
+              // If Create Free App fails, check if app already exists
+              if (
+                deployError.response?.status === 409 ||
+                deployError.response?.data?.errorCode === 'ALREADY_EXISTS'
+              ) {
+                this.logger.log(
+                  `App environment already exists, looking up in Deploy API...`,
+                );
+
+                // App already exists, try to find it in Deploy API list
+                try {
+                  const appsResponse = await apiKeyClient.get(
+                    `${this.mendixConfig.apiUrl}/apps`,
+                  );
+                  const apps = appsResponse.data || [];
+
+                  const matchingApp = apps.find(
+                    (a: any) =>
+                      a.ProjectId === projectId ||
+                      a.projectId === projectId ||
+                      a.Name === config.name,
+                  );
+
+                  if (matchingApp && matchingApp.AppId) {
+                    this.logger.log(
+                      `Found existing app: AppId=${matchingApp.AppId}`,
+                    );
+                    app = {
+                      appId: matchingApp.AppId,
+                      projectId: projectId,
+                      name: matchingApp.Name || config.name,
+                      url: matchingApp.Url,
+                    };
+                  } else {
+                    throw deployError; // Re-throw if we can't find it
+                  }
+                } catch (lookupError) {
+                  this.logger.warn(
+                    `Could not find existing app: ${lookupError.message}`,
+                  );
+                  // Fallback to projectId
+                  app = {
+                    appId: projectId,
+                    projectId: projectId,
+                    name: config.name,
+                  };
+                }
+              } else {
+                // Log the error but continue with projectId as fallback
+                this.logger.warn(
+                  `Failed to create Free App Environment: ${deployError.message}. ` +
+                    `Error details: ${JSON.stringify(deployError.response?.data)}. ` +
+                    `Using ProjectId as fallback. The app may need manual deployment.`,
+                );
+                app = {
+                  appId: projectId, // Fallback to projectId
+                  projectId: projectId,
+                  name: config.name,
+                };
+              }
+            }
           } else {
             // Unexpected response format
             throw new BadRequestException(
@@ -1768,6 +1973,248 @@ Mendix App Export
     } catch (error) {
       this.logger.error(`Failed to get app ID: ${error.message}`);
       throw error;
+    }
+  }
+
+  // ========================================
+  // BRANCH MANAGEMENT (Team Server)
+  // ========================================
+
+  /**
+   * List all branches for a Mendix app
+   * @param userId User ID
+   * @param organizationId Organization ID
+   * @param appId Mendix App ID
+   */
+  async listBranches(
+    userId: string,
+    organizationId: string,
+    appId: string,
+  ): Promise<
+    Array<{ name: string; latestRevision: number; createdDate?: string }>
+  > {
+    this.logger.log(`Listing branches for Mendix app ${appId}`);
+
+    try {
+      const client = await this.getAuthenticatedClient(userId, organizationId);
+
+      const response = await client.get(
+        `${this.mendixConfig.apiUrl}/apps/${appId}/branches`,
+      );
+
+      const branches = response.data || [];
+
+      return branches.map((branch: any) => ({
+        name: branch.Name || branch.name,
+        latestRevision:
+          branch.LatestRevisionNumber || branch.latestRevisionNumber || 0,
+        createdDate: branch.CreatedDate || branch.createdDate,
+      }));
+    } catch (error) {
+      this.logger.error(
+        `Failed to list branches for app ${appId}: ${error.message}`,
+      );
+      throw new BadRequestException(
+        `Failed to list branches: ${error.message}`,
+      );
+    }
+  }
+
+  /**
+   * Get info about a specific branch
+   * @param userId User ID
+   * @param organizationId Organization ID
+   * @param appId Mendix App ID
+   * @param branchName Branch name
+   */
+  async getBranchInfo(
+    userId: string,
+    organizationId: string,
+    appId: string,
+    branchName: string,
+  ): Promise<{
+    name: string;
+    latestRevision: number;
+    createdDate?: string;
+  } | null> {
+    try {
+      const branches = await this.listBranches(userId, organizationId, appId);
+      return branches.find((b) => b.name === branchName) || null;
+    } catch (error) {
+      this.logger.error(`Failed to get branch info: ${error.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Create a new branch for a Mendix app
+   * Creates a branch from main (trunk) or another source branch
+   * @param userId User ID
+   * @param organizationId Organization ID
+   * @param appId Mendix App ID
+   * @param branchName New branch name (e.g., "feature/add-login-page")
+   * @param sourceBranch Source branch to branch from (default: "main" or "trunk")
+   * @param sourceRevision Specific revision to branch from (optional, defaults to latest)
+   */
+  async createBranch(
+    userId: string,
+    organizationId: string,
+    appId: string,
+    branchName: string,
+    sourceBranch: string = 'main',
+    sourceRevision?: number,
+  ): Promise<{ branchName: string; revision: number; createdAt: string }> {
+    this.logger.log(
+      `Creating Mendix branch "${branchName}" for app ${appId} from ${sourceBranch}`,
+    );
+
+    try {
+      const client = await this.getAuthenticatedClient(userId, organizationId);
+
+      // Check if branch already exists
+      const existingBranch = await this.getBranchInfo(
+        userId,
+        organizationId,
+        appId,
+        branchName,
+      );
+
+      if (existingBranch) {
+        throw new BadRequestException(
+          `Branch "${branchName}" already exists for app ${appId}`,
+        );
+      }
+
+      // Get source branch info to get latest revision if not specified
+      let revisionToUse = sourceRevision;
+      if (!revisionToUse) {
+        const sourceBranchInfo = await this.getBranchInfo(
+          userId,
+          organizationId,
+          appId,
+          sourceBranch,
+        );
+
+        if (!sourceBranchInfo) {
+          // Try "trunk" if "main" doesn't exist (older Mendix projects)
+          const trunkInfo = await this.getBranchInfo(
+            userId,
+            organizationId,
+            appId,
+            'trunk',
+          );
+
+          if (!trunkInfo) {
+            throw new BadRequestException(
+              `Source branch "${sourceBranch}" not found for app ${appId}`,
+            );
+          }
+          revisionToUse = trunkInfo.latestRevision;
+        } else {
+          revisionToUse = sourceBranchInfo.latestRevision;
+        }
+      }
+
+      // Create the branch using Deploy API
+      // POST /apps/{appId}/branches
+      const response = await client.post(
+        `${this.mendixConfig.apiUrl}/apps/${appId}/branches`,
+        {
+          Name: branchName,
+          SourceRevision: revisionToUse,
+        },
+      );
+
+      const createdBranch = response.data;
+      const createdAt = new Date().toISOString();
+
+      this.logger.log(
+        `Successfully created Mendix branch "${branchName}" at revision ${revisionToUse}`,
+      );
+
+      return {
+        branchName: createdBranch.Name || branchName,
+        revision: createdBranch.LatestRevisionNumber || revisionToUse || 0,
+        createdAt,
+      };
+    } catch (error) {
+      this.logger.error(
+        `Failed to create Mendix branch "${branchName}": ${error.message}`,
+        error.stack,
+      );
+
+      if (error instanceof BadRequestException) {
+        throw error;
+      }
+
+      throw new BadRequestException(
+        `Failed to create Mendix branch: ${error.message}`,
+      );
+    }
+  }
+
+  /**
+   * Delete a Mendix branch
+   * @param userId User ID
+   * @param organizationId Organization ID
+   * @param appId Mendix App ID
+   * @param branchName Branch name to delete
+   */
+  async deleteBranch(
+    userId: string,
+    organizationId: string,
+    appId: string,
+    branchName: string,
+  ): Promise<void> {
+    this.logger.log(`Deleting Mendix branch "${branchName}" for app ${appId}`);
+
+    // Prevent deleting main/trunk branches
+    if (branchName === 'main' || branchName === 'trunk') {
+      throw new BadRequestException('Cannot delete main or trunk branch');
+    }
+
+    try {
+      const client = await this.getAuthenticatedClient(userId, organizationId);
+
+      // Check if branch exists
+      const branchInfo = await this.getBranchInfo(
+        userId,
+        organizationId,
+        appId,
+        branchName,
+      );
+
+      if (!branchInfo) {
+        this.logger.warn(
+          `Branch "${branchName}" not found for app ${appId}, nothing to delete`,
+        );
+        return;
+      }
+
+      // Delete the branch using Deploy API
+      // DELETE /apps/{appId}/branches/{branchName}
+      await client.delete(
+        `${this.mendixConfig.apiUrl}/apps/${appId}/branches/${encodeURIComponent(branchName)}`,
+      );
+
+      this.logger.log(`Successfully deleted Mendix branch "${branchName}"`);
+    } catch (error) {
+      this.logger.error(
+        `Failed to delete Mendix branch "${branchName}": ${error.message}`,
+        error.stack,
+      );
+
+      // Don't throw if branch doesn't exist or already deleted
+      if (error.response?.status === 404) {
+        this.logger.warn(
+          `Branch "${branchName}" not found, may already be deleted`,
+        );
+        return;
+      }
+
+      throw new BadRequestException(
+        `Failed to delete Mendix branch: ${error.message}`,
+      );
     }
   }
 }

@@ -392,6 +392,7 @@ model Change {
   id             String       @id @default(uuid())
   organizationId String
   appId          String
+  sandboxId      String?      // Link to sandbox if change came from sandbox
   authorId       String?      // Optional - can be null for system-detected changes
   title          String
   description    String?      @db.Text
@@ -407,10 +408,20 @@ model Change {
   submittedAt    DateTime?
   deletedAt      DateTime? // Soft delete timestamp
   deletedBy      String? // User who deleted/undid the change
+
+  // CI/CD Pipeline tracking
+  pipelineStatus      PipelineStatus?
+  pipelineRunId       String?
+  pipelineUrl         String?
+  pipelineStartedAt   DateTime?
+  pipelineCompletedAt DateTime?
+  pipelineResults     Json?          // { checks: [...], logs: "..." }
+
   createdAt      DateTime     @default(now())
   updatedAt      DateTime     @updatedAt
 
   app         App          @relation(fields: [appId], references: [id], onDelete: Cascade)
+  sandbox     Sandbox?     @relation(fields: [sandboxId], references: [id], onDelete: SetNull)
   author      User?        @relation("ChangeAuthor", fields: [authorId], references: [id])
   deletedByUser User?      @relation("ChangeDeleter", fields: [deletedBy], references: [id])
   reviews     Review[]
@@ -420,6 +431,7 @@ model Change {
 
   @@index([organizationId])
   @@index([appId])
+  @@index([sandboxId])
   @@index([authorId])
   @@index([status])
   @@index([deletedAt])
@@ -488,31 +500,85 @@ model Comment {
 // SANDBOX MANAGEMENT
 // ========================================
 
+// Sandbox status enum for feature-based development workflow
+// Includes both legacy provisioning statuses and new workflow statuses
+enum SandboxStatus {
+  // Legacy provisioning statuses (for backward compatibility)
+  PROVISIONING        // Initial state, waiting for environment creation
+  SUSPENDED           // Temporarily disabled (quota exceeded, etc.)
+  EXPIRED             // Past expiration date, awaiting cleanup
+  FAILED              // Provisioning or operation failed
+  DELETED             // Soft deleted, environment deprovisioned
+  
+  // Workflow statuses (for feature sandbox development)
+  ACTIVE              // Citizen dev is actively working
+  PENDING_REVIEW      // Submitted, waiting for Pro Dev review
+  CHANGES_REQUESTED   // Pro Dev requested changes
+  MERGED              // Approved and merged to main
+  REJECTED            // Declined by Pro Dev
+  ABANDONED           // Discarded by user
+}
+
+// Conflict status for sandbox merge conflicts
+enum ConflictStatus {
+  NONE                // No conflicts
+  POTENTIAL           // Overlapping files with other sandboxes (warning)
+  NEEDS_RESOLUTION    // Main diverged, Pro Dev must resolve
+  RESOLVED            // Pro Dev resolved conflict
+}
+
+// CI/CD Pipeline status
+enum PipelineStatus {
+  PENDING
+  RUNNING
+  PASSED
+  FAILED
+}
+
 model Sandbox {
-  id             String    @id @default(uuid())
+  id             String         @id @default(uuid())
   organizationId String
   createdById    String
-  appId          String? // ID of the app in LDV-Bridge (for tracking changes)
-  name           String
+  appId          String?        // ID of the app in LDV-Bridge
+  name           String         // Feature name (e.g., "Add Login Page")
   description    String?
-  status         String    @default("PROVISIONING") // PROVISIONING, ACTIVE, SUSPENDED, EXPIRED, FAILED, DELETED
-  environment    Json // Platform-specific environment details (includes external environmentId, appId)
+  
+  // Sandbox lifecycle status
+  status         SandboxStatus  @default(ACTIVE)
+  conflictStatus ConflictStatus @default(NONE)
+  
+  // Mendix branch tracking
+  mendixBranch        String?   // e.g., "feature/add-login-page"
+  baseMendixRevision  String?   // Revision when sandbox was created
+  latestMendixRevision String?  // Latest synced revision
+  
+  // GitHub branch tracking
+  githubBranch        String?   // e.g., "sandbox/add-login-page"
+  baseGithubSha       String?   // SHA when sandbox was created
+  latestGithubSha     String?   // Latest commit SHA
+  
+  // Legacy environment field (for backward compatibility)
+  environment    Json?          // Platform-specific environment details
+  
+  // Timestamps
   expiresAt      DateTime?
-  createdAt      DateTime  @default(now())
-  updatedAt      DateTime  @updatedAt
+  submittedAt    DateTime?      // When "Ready for Review" clicked
+  mergedAt       DateTime?
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
 
-  // GitHub Integration
-  githubBranch   String? // e.g., sandbox/abc123
-
+  // Relations
   organization Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   createdBy    User           @relation(fields: [createdById], references: [id])
   app          App?           @relation("SandboxApp", fields: [appId], references: [id], onDelete: SetNull)
   clones       SandboxClone[]
+  changes      Change[]
 
   @@index([organizationId])
   @@index([createdById])
   @@index([appId])
   @@index([status])
+  @@index([conflictStatus])
   @@index([expiresAt])
   @@map("sandboxes")
 }

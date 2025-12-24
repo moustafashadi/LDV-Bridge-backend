@@ -736,20 +736,37 @@ export class GitHubService {
   // ========================================
 
   /**
-   * Generate staging branch name for a change
+   * Generate staging branch name from a change title
+   * Sanitizes the title: lowercase, spaces to hyphens, remove special chars, max 75 chars
    */
-  getStagingBranchName(changeId: string): string {
-    return `staging/change-${changeId.slice(0, 8)}`;
+  getStagingBranchName(changeTitle: string): string {
+    // Sanitize: lowercase, replace spaces with hyphens, remove special chars
+    const sanitized = changeTitle
+      .toLowerCase()
+      .trim()
+      .replace(/\s+/g, '-')
+      .replace(/[^a-z0-9-]/g, '')
+      .replace(/-+/g, '-') // Remove consecutive hyphens
+      .replace(/^-|-$/g, '') // Remove leading/trailing hyphens
+      .slice(0, 75);
+
+    // Fallback if sanitization results in empty string
+    if (!sanitized) {
+      return `staging/change-${Date.now()}`;
+    }
+
+    return `staging/${sanitized}`;
   }
 
   /**
    * Commit app snapshot to a staging branch for review
-   * Creates the staging branch from main if it doesn't exist
+   * Creates the staging branch if it doesn't exist
+   * @param changeTitle - User-provided title for this change (used to create branch name)
    */
   async commitToStagingBranch(
     app: App,
     extractedPath: string,
-    changeId: string,
+    changeTitle: string,
     message: string,
   ): Promise<{ commit: GitHubCommit; branch: string }> {
     const org = await this.prisma.organization.findUnique({
@@ -765,47 +782,57 @@ export class GitHubService {
 
     const token = await this.getInstallationToken(app.organizationId);
     const repoFullName = `${org.githubOrgName}/${app.githubRepoName}`;
-    const stagingBranch = this.getStagingBranchName(changeId);
+    const stagingBranch = this.getStagingBranchName(changeTitle);
+
+    // Check if branch already exists - if so, return conflict error
+    try {
+      await this.getBranchRef(repoFullName, stagingBranch, token);
+      // If we get here, branch exists
+      throw new HttpException(
+        'A change with this title already exists. Please choose a different title.',
+        HttpStatus.CONFLICT,
+      );
+    } catch (error) {
+      // If it's our conflict error, rethrow it
+      if (
+        error instanceof HttpException &&
+        error.getStatus() === HttpStatus.CONFLICT
+      ) {
+        throw error;
+      }
+      // Otherwise, branch doesn't exist - this is expected, continue
+    }
 
     // Get default branch SHA to base staging branch on
     const repoInfo = await this.getRepoInfo(repoFullName, token);
     const defaultBranch = repoInfo.default_branch || 'main';
 
-    // Try to get staging branch; if not exists, create from default
+    // Create staging branch from default
     let branchRef: string | null = null;
     let baseTreeSha: string | null = null;
 
+    this.logger.log(
+      `[STAGING] Creating staging branch ${stagingBranch} from ${defaultBranch}`,
+    );
     try {
-      branchRef = await this.getBranchRef(repoFullName, stagingBranch, token);
+      const defaultRef = await this.getBranchRef(
+        repoFullName,
+        defaultBranch,
+        token,
+      );
+      await this.createBranchRef(
+        repoFullName,
+        stagingBranch,
+        defaultRef,
+        token,
+      );
+      branchRef = defaultRef;
       baseTreeSha = await this.getTreeSha(repoFullName, branchRef, token);
-      this.logger.debug(
-        `[STAGING] Using existing staging branch: ${stagingBranch}`,
+    } catch (createError) {
+      this.logger.warn(
+        `[STAGING] Could not create from ${defaultBranch}, creating orphan branch`,
       );
-    } catch {
-      // Staging branch doesn't exist, create from default branch
-      this.logger.log(
-        `[STAGING] Creating staging branch ${stagingBranch} from ${defaultBranch}`,
-      );
-      try {
-        const defaultRef = await this.getBranchRef(
-          repoFullName,
-          defaultBranch,
-          token,
-        );
-        await this.createBranchRef(
-          repoFullName,
-          stagingBranch,
-          defaultRef,
-          token,
-        );
-        branchRef = defaultRef;
-        baseTreeSha = await this.getTreeSha(repoFullName, branchRef, token);
-      } catch (createError) {
-        this.logger.warn(
-          `[STAGING] Could not create from ${defaultBranch}, creating orphan branch`,
-        );
-        // Default branch might not exist (empty repo), create orphan
-      }
+      // Default branch might not exist (empty repo), create orphan
     }
 
     // Create tree from files
@@ -1352,5 +1379,116 @@ export class GitHubService {
         HttpStatus.BAD_GATEWAY,
       );
     }
+  }
+
+  // ========================================
+  // WORKFLOW DISPATCH
+  // ========================================
+
+  /**
+   * Trigger a GitHub Actions workflow via workflow_dispatch event
+   * @param repoFullName Repository full name (owner/repo)
+   * @param workflowId Workflow filename or ID (e.g., 'lcnc-validation.yml')
+   * @param ref Branch or tag to run the workflow on
+   * @param inputs Workflow inputs (key-value pairs)
+   * @param token Installation token
+   * @returns Workflow run ID if available
+   */
+  async triggerWorkflowDispatch(
+    repoFullName: string,
+    workflowId: string,
+    ref: string,
+    inputs: Record<string, string> = {},
+    token: string,
+  ): Promise<{ triggered: boolean; runId?: string }> {
+    this.logger.log(
+      `Triggering workflow ${workflowId} on ${repoFullName}/${ref}`,
+    );
+
+    try {
+      // POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches
+      const response = await fetch(
+        `https://api.github.com/repos/${repoFullName}/actions/workflows/${workflowId}/dispatches`,
+        {
+          method: 'POST',
+          headers: {
+            Accept: 'application/vnd.github+json',
+            Authorization: `Bearer ${token}`,
+            'X-GitHub-Api-Version': '2022-11-28',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            ref,
+            inputs,
+          }),
+        },
+      );
+
+      // GitHub returns 204 No Content on success
+      if (response.status === 204) {
+        this.logger.log(`Workflow ${workflowId} triggered successfully`);
+
+        // GitHub doesn't return the run ID directly; we'd have to poll for it
+        // For now, return that it was triggered
+        return { triggered: true };
+      }
+
+      const error = await response.json().catch(() => ({}));
+      this.logger.error(
+        `Failed to trigger workflow: ${response.status} - ${JSON.stringify(error)}`,
+      );
+
+      return { triggered: false };
+    } catch (error) {
+      this.logger.error(`Error triggering workflow dispatch: ${error.message}`);
+      return { triggered: false };
+    }
+  }
+
+  /**
+   * Convenience method: Trigger LdV-Bridge CI/CD workflow for a change
+   * @param app The app containing the GitHub repo info
+   * @param changeId The change ID to validate
+   * @param branch The branch to run validation on
+   * @param organizationId For getting installation token
+   */
+  async triggerValidationWorkflow(
+    app: App,
+    changeId: string,
+    branch: string,
+    organizationId: string,
+  ): Promise<{ triggered: boolean; message: string }> {
+    // Build repo full name from app's GitHub repo info
+    // The format should be 'owner/repo'
+    const repoFullName = app.githubRepoName;
+
+    if (!repoFullName) {
+      return {
+        triggered: false,
+        message: 'App does not have a GitHub repository configured',
+      };
+    }
+
+    const token = await this.getInstallationToken(organizationId);
+
+    const result = await this.triggerWorkflowDispatch(
+      repoFullName,
+      'lcnc-validation.yml',
+      branch,
+      { changeId },
+      token,
+    );
+
+    if (result.triggered) {
+      return {
+        triggered: true,
+        message: `Validation workflow triggered for change ${changeId}`,
+      };
+    }
+
+    return {
+      triggered: false,
+      message: 'Failed to trigger validation workflow',
+    };
   }
 }

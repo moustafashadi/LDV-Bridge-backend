@@ -34,7 +34,11 @@ import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { UserRole } from '@prisma/client';
-import { SandboxPlatform, SandboxStatus, SandboxType } from './interfaces/sandbox-environment.interface';
+import {
+  SandboxPlatform,
+  SandboxStatus,
+  SandboxType,
+} from './interfaces/sandbox-environment.interface';
 
 @ApiTags('Sandboxes')
 @ApiBearerAuth()
@@ -44,7 +48,9 @@ export class SandboxesController {
   constructor(private readonly sandboxesService: SandboxesService) {}
 
   @Post()
-  @ApiOperation({ summary: 'Create a new sandbox with environment provisioning' })
+  @ApiOperation({
+    summary: 'Create a new sandbox with environment provisioning',
+  })
   @ApiResponse({
     status: 201,
     description: 'Sandbox created and provisioning started',
@@ -64,13 +70,18 @@ export class SandboxesController {
   }
 
   @Post('link-existing')
-  @ApiOperation({ summary: 'Link an existing PowerApps/Mendix environment to LDV-Bridge' })
+  @ApiOperation({
+    summary: 'Link an existing PowerApps/Mendix environment to LDV-Bridge',
+  })
   @ApiResponse({
     status: 201,
     description: 'Existing environment linked successfully',
     type: SandboxResponseDto,
   })
-  @ApiResponse({ status: 400, description: 'Bad Request - Environment not found or invalid' })
+  @ApiResponse({
+    status: 400,
+    description: 'Bad Request - Environment not found or invalid',
+  })
   async linkExisting(
     @Body() linkDto: LinkExistingEnvironmentDto,
     @CurrentUser('id') userId: string,
@@ -233,7 +244,7 @@ export class SandboxesController {
     // Calculate new expiration date by adding days to current date
     const newExpiresAt = new Date();
     newExpiresAt.setDate(newExpiresAt.getDate() + dto.days);
-    
+
     return this.sandboxesService.extendExpiration(
       id,
       organizationId,
@@ -283,5 +294,176 @@ export class SandboxesController {
     // TODO: Implement user listing (requires junction table)
     // This is placeholder for future implementation
     return [];
+  }
+
+  // ========================================
+  // FEATURE SANDBOX WORKFLOW ENDPOINTS
+  // ========================================
+
+  @Post('feature')
+  @ApiOperation({
+    summary: 'Create a feature sandbox with Mendix and GitHub branches',
+    description:
+      'Creates a new feature sandbox with corresponding Mendix and GitHub branches for feature development',
+  })
+  @ApiResponse({
+    status: 201,
+    description: 'Feature sandbox created with branches',
+    type: SandboxResponseDto,
+  })
+  @ApiResponse({
+    status: 400,
+    description: 'Bad Request - Invalid app or feature name',
+  })
+  @ApiResponse({
+    status: 403,
+    description: 'Forbidden - Not authorized to create sandbox for this app',
+  })
+  async createFeatureSandbox(
+    @Body() dto: { appId: string; featureName: string; description?: string },
+    @CurrentUser('id') userId: string,
+    @CurrentUser('organizationId') organizationId: string,
+  ): Promise<SandboxResponseDto> {
+    return this.sandboxesService.createFeatureSandbox(
+      dto.appId,
+      dto.featureName,
+      userId,
+      organizationId,
+      dto.description,
+    );
+  }
+
+  @Post(':id/submit-for-review')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Submit sandbox for Pro Developer review',
+    description:
+      'Transitions sandbox to PENDING_REVIEW status and notifies Pro Developers',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Sandbox submitted for review',
+    type: SandboxResponseDto,
+  })
+  @ApiResponse({ status: 404, description: 'Sandbox not found' })
+  @ApiResponse({
+    status: 400,
+    description: 'Bad Request - Sandbox not in valid state for submission',
+  })
+  async submitForReview(
+    @Param('id') id: string,
+    @CurrentUser('id') userId: string,
+    @CurrentUser('organizationId') organizationId: string,
+  ): Promise<SandboxResponseDto> {
+    return this.sandboxesService.submitForReview(id, userId, organizationId);
+  }
+
+  @Post(':id/check-conflicts')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Check for merge conflicts with main branch',
+    description:
+      'Detects if the sandbox has conflicts with the main branch that need resolution',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Conflict check completed',
+    schema: {
+      type: 'object',
+      properties: {
+        hasConflicts: { type: 'boolean' },
+        conflictStatus: {
+          type: 'string',
+          enum: ['NONE', 'POTENTIAL', 'NEEDS_RESOLUTION', 'RESOLVED'],
+        },
+        conflictingFiles: { type: 'array', items: { type: 'string' } },
+        message: { type: 'string' },
+      },
+    },
+  })
+  @ApiResponse({ status: 404, description: 'Sandbox not found' })
+  async checkConflicts(
+    @Param('id') id: string,
+    @CurrentUser('id') userId: string,
+    @CurrentUser('organizationId') organizationId: string,
+  ): Promise<{
+    hasConflicts: boolean;
+    conflictStatus: string;
+    conflictingFiles: string[];
+    message: string;
+  }> {
+    return this.sandboxesService.checkConflicts(id, userId, organizationId);
+  }
+
+  @Post(':id/resolve-conflict')
+  @Roles(UserRole.ADMIN, UserRole.PRO_DEVELOPER)
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Resolve merge conflicts (Pro Developer only)',
+    description:
+      'Pro Developer resolves merge conflicts after manual intervention',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Conflicts resolved',
+    type: SandboxResponseDto,
+  })
+  @ApiResponse({
+    status: 403,
+    description: 'Forbidden - Only Pro Developers can resolve conflicts',
+  })
+  @ApiResponse({ status: 404, description: 'Sandbox not found' })
+  async resolveConflict(
+    @Param('id') id: string,
+    @Body() dto: { resolution: string; mergeCommitSha?: string },
+    @CurrentUser('id') userId: string,
+    @CurrentUser('organizationId') organizationId: string,
+  ): Promise<SandboxResponseDto> {
+    return this.sandboxesService.resolveConflict(
+      id,
+      userId,
+      organizationId,
+      dto.resolution,
+      dto.mergeCommitSha,
+    );
+  }
+
+  @Post(':id/abandon')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Abandon sandbox',
+    description: 'Marks sandbox as abandoned and optionally cleans up branches',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Sandbox abandoned',
+    type: SandboxResponseDto,
+  })
+  @ApiResponse({ status: 404, description: 'Sandbox not found' })
+  async abandonSandbox(
+    @Param('id') id: string,
+    @CurrentUser('id') userId: string,
+    @CurrentUser('organizationId') organizationId: string,
+  ): Promise<SandboxResponseDto> {
+    return this.sandboxesService.abandonSandbox(id, userId, organizationId);
+  }
+
+  @Get('app/:appId')
+  @ApiOperation({
+    summary: 'Get all active sandboxes for an app',
+    description:
+      'Returns all sandboxes linked to an app that are not merged or abandoned',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'List of app sandboxes',
+    type: [SandboxResponseDto],
+  })
+  @ApiResponse({ status: 404, description: 'App not found' })
+  async getAppSandboxes(
+    @Param('appId') appId: string,
+    @CurrentUser('organizationId') organizationId: string,
+  ): Promise<SandboxResponseDto[]> {
+    return this.sandboxesService.getAppSandboxes(appId, organizationId);
   }
 }

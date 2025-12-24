@@ -750,11 +750,13 @@ export class PowerAppsService implements IBaseConnector {
   /**
    * Sync PowerApp to LDV-Bridge database
    * This will be integrated with sync service in Task 9
+   * @param changeTitle - Optional user-provided title for this change (used for branch name)
    */
   async syncApp(
     userId: string,
     organizationId: string,
     appId: string,
+    changeTitle?: string,
   ): Promise<ISyncResult> {
     try {
       this.logger.log(`Syncing PowerApp ${appId} for user ${userId}`);
@@ -952,11 +954,13 @@ export class PowerAppsService implements IBaseConnector {
               .promise();
 
             // Commit to STAGING branch (not main) - always pending review
-            const changeId = changeResult?.change?.id || `temp-${Date.now()}`;
+            // Use changeTitle from user, or generate default
+            const titleForBranch =
+              changeTitle || `sync-${new Date().toISOString().slice(0, 10)}`;
             const commitResult = await this.githubService.commitToStagingBranch(
               app,
               extractPath,
-              changeId,
+              titleForBranch,
               `Sync: ${app.name} - ${new Date().toISOString()}`,
             );
             stagingBranch = commitResult.branch;
