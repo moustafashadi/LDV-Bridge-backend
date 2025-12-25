@@ -10,6 +10,8 @@ import {
   UseGuards,
   HttpCode,
   HttpStatus,
+  Sse,
+  MessageEvent,
 } from '@nestjs/common';
 import {
   ApiTags,
@@ -18,7 +20,9 @@ import {
   ApiBearerAuth,
   ApiQuery,
 } from '@nestjs/swagger';
+import { Observable, map } from 'rxjs';
 import { SandboxesService } from './sandboxes.service';
+import { SyncProgressService, SyncProgressEvent } from './sync-progress.service';
 import { CreateSandboxDto } from './dto/create-sandbox.dto';
 import { UpdateSandboxDto } from './dto/update-sandbox.dto';
 import { LinkExistingEnvironmentDto } from './dto/link-existing-environment.dto';
@@ -45,7 +49,10 @@ import {
 @UseGuards(JwtAuthGuard, RolesGuard)
 @Controller('sandboxes')
 export class SandboxesController {
-  constructor(private readonly sandboxesService: SandboxesService) {}
+  constructor(
+    private readonly sandboxesService: SandboxesService,
+    private readonly syncProgressService: SyncProgressService,
+  ) {}
 
   @Post()
   @ApiOperation({
@@ -399,6 +406,37 @@ export class SandboxesController {
       userId,
       organizationId,
       dto.changeTitle,
+    );
+  }
+
+  @Sse(':id/sync/progress')
+  @ApiOperation({
+    summary: 'Stream sync progress updates via Server-Sent Events',
+    description:
+      'Subscribe to real-time progress updates for a sandbox sync operation. ' +
+      'Returns a stream of progress events with step number, status, and message.',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'SSE stream of progress events',
+    schema: {
+      type: 'object',
+      properties: {
+        sandboxId: { type: 'string' },
+        step: { type: 'number' },
+        totalSteps: { type: 'number' },
+        status: { type: 'string', enum: ['pending', 'in-progress', 'completed', 'error'] },
+        message: { type: 'string' },
+        details: { type: 'string' },
+        timestamp: { type: 'string', format: 'date-time' },
+      },
+    },
+  })
+  syncProgress(@Param('id') id: string): Observable<MessageEvent> {
+    return this.syncProgressService.getProgressStream(id).pipe(
+      map((event: SyncProgressEvent) => ({
+        data: event,
+      } as MessageEvent)),
     );
   }
 

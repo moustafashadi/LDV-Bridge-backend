@@ -499,13 +499,16 @@ export class GitHubService {
       // Empty repo - we'll create an orphan commit
     }
 
-    // Create tree from files
+    // Create tree from files (pass organizationId for token refresh during long operations)
     const tree = await this.createTreeFromDirectory(
       repoFullName,
       extractedPath,
       baseTreeSha, // null for empty repo
-      token,
+      app.organizationId,
     );
+
+    // Refresh token before commit (in case tree creation took a while)
+    const commitToken = await this.getInstallationToken(app.organizationId);
 
     // Create commit
     const commit = await this.createCommit(
@@ -513,15 +516,25 @@ export class GitHubService {
       tree.sha,
       branchRef, // null for empty repo (orphan commit)
       message,
-      token,
+      commitToken,
     );
 
     // Update or create branch reference
     if (branchRef) {
-      await this.updateBranchRef(repoFullName, targetBranch, commit.sha, token);
+      await this.updateBranchRef(
+        repoFullName,
+        targetBranch,
+        commit.sha,
+        commitToken,
+      );
     } else {
       // Create new branch for empty repo
-      await this.createBranchRef(repoFullName, targetBranch, commit.sha, token);
+      await this.createBranchRef(
+        repoFullName,
+        targetBranch,
+        commit.sha,
+        commitToken,
+      );
     }
 
     this.logger.log(`Committed app snapshot for ${app.id}: ${commit.sha}`);
@@ -1252,14 +1265,89 @@ export class GitHubService {
     return data.tree.sha;
   }
 
+  /**
+   * Check if a file is binary based on extension
+   */
+  private isBinaryFile(filePath: string): boolean {
+    const binaryExtensions = [
+      '.mxunit',
+      '.mpr',
+      '.mpk',
+      '.png',
+      '.jpg',
+      '.jpeg',
+      '.gif',
+      '.ico',
+      '.svg',
+      '.woff',
+      '.woff2',
+      '.ttf',
+      '.eot',
+      '.pdf',
+      '.zip',
+      '.jar',
+      '.class',
+      '.exe',
+      '.dll',
+      '.so',
+      '.dylib',
+    ];
+    const ext = path.extname(filePath).toLowerCase();
+    return binaryExtensions.includes(ext);
+  }
+
+  /**
+   * Create a blob for a file (needed for binary files)
+   */
+  private async createBlob(
+    repoFullName: string,
+    content: string,
+    encoding: 'utf-8' | 'base64',
+    token: string,
+  ): Promise<string> {
+    const response = await fetch(
+      `https://api.github.com/repos/${repoFullName}/git/blobs`,
+      {
+        method: 'POST',
+        headers: {
+          Accept: 'application/vnd.github+json',
+          Authorization: `Bearer ${token}`,
+          'X-GitHub-Api-Version': '2022-11-28',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ content, encoding }),
+      },
+    );
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new HttpException(
+        error.message || 'Failed to create blob',
+        HttpStatus.BAD_GATEWAY,
+      );
+    }
+
+    const data = await response.json();
+    return data.sha;
+  }
+
   private async createTreeFromDirectory(
     repoFullName: string,
     dirPath: string,
     baseTreeSha: string | null,
-    token: string,
+    organizationId: string,
   ): Promise<{ sha: string }> {
     const treeItems: any[] = [];
+    const binaryFiles: { relativePath: string; content: string }[] = [];
 
+    // Track files for logging
+    let textFileCount = 0;
+    let binaryFileCount = 0;
+
+    // Get initial token
+    let token = await this.getInstallationToken(organizationId);
+
+    // First pass: collect all files (don't create blobs yet)
     const processDir = (currentPath: string, prefix: string = '') => {
       const entries = fs.readdirSync(currentPath, { withFileTypes: true });
 
@@ -1272,18 +1360,85 @@ export class GitHubService {
         if (entry.isDirectory()) {
           processDir(fullPath, relativePath);
         } else {
-          const content = fs.readFileSync(fullPath, 'utf8');
-          treeItems.push({
-            path: relativePath,
-            mode: '100644',
-            type: 'blob',
-            content,
-          });
+          // Check if binary file
+          if (this.isBinaryFile(fullPath)) {
+            binaryFileCount++;
+            const content = fs.readFileSync(fullPath).toString('base64');
+            binaryFiles.push({ relativePath, content });
+          } else {
+            // For text files, include content directly
+            try {
+              const content = fs.readFileSync(fullPath, 'utf8');
+              textFileCount++;
+              treeItems.push({
+                path: relativePath,
+                mode: '100644',
+                type: 'blob',
+                content,
+              });
+            } catch (readError) {
+              // If UTF-8 read fails, treat as binary
+              binaryFileCount++;
+              const content = fs.readFileSync(fullPath).toString('base64');
+              binaryFiles.push({ relativePath, content });
+            }
+          }
         }
       }
     };
 
     processDir(dirPath);
+
+    this.logger.log(
+      `[TREE] Processing ${textFileCount} text files and ${binaryFileCount} binary files`,
+    );
+
+    // Second pass: create blobs for binary files in small sequential batches
+    const BATCH_SIZE = 10; // Smaller batches to avoid connection issues
+    for (let i = 0; i < binaryFiles.length; i += BATCH_SIZE) {
+      const batch = binaryFiles.slice(i, i + BATCH_SIZE);
+
+      // Get fresh token for each batch
+      token = await this.getInstallationToken(organizationId);
+
+      // Process batch sequentially to avoid overwhelming connections
+      for (const file of batch) {
+        try {
+          const sha = await this.createBlob(
+            repoFullName,
+            file.content,
+            'base64',
+            token,
+          );
+          treeItems.push({
+            path: file.relativePath,
+            mode: '100644',
+            type: 'blob',
+            sha,
+          });
+        } catch (blobError) {
+          this.logger.error(
+            `[TREE] Failed to create blob for ${file.relativePath}: ${(blobError as any).message}`,
+          );
+          throw blobError;
+        }
+      }
+
+      if (i + BATCH_SIZE < binaryFiles.length) {
+        this.logger.log(
+          `[TREE] Created ${Math.min(i + BATCH_SIZE, binaryFiles.length)}/${binaryFiles.length} blobs...`,
+        );
+        // Small delay between batches to avoid rate limiting
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    }
+
+    this.logger.log(
+      `[TREE] All blobs created. Building tree with ${treeItems.length} items...`,
+    );
+
+    // Get fresh token before creating tree (blob creation might have taken a while)
+    token = await this.getInstallationToken(organizationId);
 
     const response = await fetch(
       `https://api.github.com/repos/${repoFullName}/git/trees`,

@@ -33,6 +33,7 @@ import { MendixService } from '../connectors/mendix/mendix.service';
 import { MendixModelSdkService } from '../connectors/mendix/mendix-model-sdk.service';
 import { GitHubService } from '../github/github.service';
 import { ChangesService } from '../changes/changes.service';
+import { SyncProgressService, SYNC_STEPS } from './sync-progress.service';
 
 // Type helper for Sandbox with new schema fields
 type SandboxWithRelations = {
@@ -85,6 +86,7 @@ export class SandboxesService {
     private readonly mendixModelSdkService: MendixModelSdkService,
     @Inject(forwardRef(() => ChangesService))
     private readonly changesService: ChangesService,
+    private readonly syncProgressService: SyncProgressService,
   ) {
     // Initialize provisioners map
     this.provisioners = new Map<SandboxPlatform, IEnvironmentProvisioner>([
@@ -1406,10 +1408,44 @@ export class SandboxesService {
     const mendixPat = metadata?.pat || userConnection.accessToken;
     const mendixAppId = app.externalId;
 
+    // Get projectId from app metadata - required for Platform SDK
+    const appMetadata = app.metadata as any;
+    const projectId =
+      appMetadata?.projectId || appMetadata?.metadata?.projectId;
+
     if (!mendixAppId || !mendixPat) {
       throw new BadRequestException(
         'Missing Mendix app ID or PAT. Cannot export model.',
       );
+    }
+
+    this.logger.log(
+      `Sync: mendixAppId=${mendixAppId}, projectId=${projectId}, PAT length=${mendixPat?.length}`,
+    );
+
+    // Verify the Mendix branch exists before proceeding
+    try {
+      const branches = await this.mendixService.listBranches(
+        userId,
+        organizationId,
+        mendixAppId,
+      );
+      const branchExists = branches.some(
+        (b) => b.name === sandbox.mendixBranch,
+      );
+      if (!branchExists) {
+        throw new BadRequestException(
+          `Mendix branch "${sandbox.mendixBranch}" does not exist. The branch may have failed to create. Please abandon this sandbox and create a new one.`,
+        );
+      }
+    } catch (branchCheckError) {
+      if (branchCheckError instanceof BadRequestException) {
+        throw branchCheckError;
+      }
+      this.logger.warn(
+        `Could not verify branch existence: ${branchCheckError.message}`,
+      );
+      // Continue anyway - the export will fail if branch doesn't exist
     }
 
     // Step 1: Export Mendix model via SDK
@@ -1422,6 +1458,7 @@ export class SandboxesService {
         mendixAppId,
         mendixPat,
         sandbox.mendixBranch || 'main',
+        projectId, // Pass projectId for SDK (UUID required, not subdomain)
       );
       this.logger.log(`Model exported to ${exportPath}`);
     } catch (error) {
@@ -1564,9 +1601,22 @@ export class SandboxesService {
     changesDetected: number;
     pipelineTriggered: boolean;
   }> {
+    // Step 1: Validating
+    this.syncProgressService.emitStep(
+      sandboxId,
+      SYNC_STEPS.VALIDATING,
+      'in-progress',
+    );
+
     const sandbox = await this.getRawSandbox(sandboxId, organizationId);
 
     if (!['ACTIVE', 'CHANGES_REQUESTED'].includes(sandbox.status)) {
+      this.syncProgressService.emitError(
+        sandboxId,
+        SYNC_STEPS.VALIDATING.step,
+        'Validation failed',
+        `Cannot sync sandbox in ${sandbox.status} status`,
+      );
       throw new BadRequestException(
         `Cannot sync sandbox in ${sandbox.status} status`,
       );
@@ -1580,6 +1630,12 @@ export class SandboxesService {
       : null;
 
     if (!app) {
+      this.syncProgressService.emitError(
+        sandboxId,
+        SYNC_STEPS.VALIDATING.step,
+        'Validation failed',
+        'Sandbox is not linked to an app',
+      );
       throw new BadRequestException('Sandbox is not linked to an app');
     }
 
@@ -1589,6 +1645,12 @@ export class SandboxesService {
     });
 
     if (!userConnection) {
+      this.syncProgressService.emitError(
+        sandboxId,
+        SYNC_STEPS.VALIDATING.step,
+        'Validation failed',
+        'No Mendix connection found',
+      );
       throw new BadRequestException('No Mendix connection found');
     }
 
@@ -1596,24 +1658,129 @@ export class SandboxesService {
     const mendixPat = metadata?.pat || userConnection.accessToken;
     const mendixAppId = app.externalId;
 
+    // Get projectId from app metadata - required for Platform SDK
+    const appMetadata = app.metadata as any;
+    const projectId =
+      appMetadata?.projectId || appMetadata?.metadata?.projectId;
+
+    // Debug logging for PAT and IDs
+    this.logger.log(
+      `Sync: mendixAppId=${mendixAppId}, projectId=${projectId}, PAT length=${mendixPat?.length || 0}`,
+    );
+
     if (!mendixAppId || !mendixPat) {
+      this.syncProgressService.emitError(
+        sandboxId,
+        SYNC_STEPS.VALIDATING.step,
+        'Validation failed',
+        'Missing Mendix app ID or PAT',
+      );
       throw new BadRequestException('Missing Mendix app ID or PAT');
     }
 
-    // Step 1: Export current state from Team Server
+    this.syncProgressService.emitStep(
+      sandboxId,
+      SYNC_STEPS.VALIDATING,
+      'completed',
+    );
+
+    // Step 2: Verify the Mendix branch exists
+    this.syncProgressService.emitStep(
+      sandboxId,
+      SYNC_STEPS.VERIFYING_BRANCH,
+      'in-progress',
+    );
+    try {
+      const branches = await this.mendixService.listBranches(
+        userId,
+        organizationId,
+        mendixAppId,
+      );
+      const branchExists = branches.some(
+        (b) => b.name === sandbox.mendixBranch,
+      );
+      if (!branchExists) {
+        this.logger.error(
+          `Mendix branch "${sandbox.mendixBranch}" does not exist for app ${mendixAppId}`,
+        );
+        this.syncProgressService.emitError(
+          sandboxId,
+          SYNC_STEPS.VERIFYING_BRANCH.step,
+          'Branch not found',
+          `Branch "${sandbox.mendixBranch}" does not exist`,
+        );
+        return {
+          success: false,
+          message: `Mendix branch "${sandbox.mendixBranch}" does not exist. The branch may have failed to create. Please abandon this sandbox and create a new one.`,
+          changesDetected: 0,
+          pipelineTriggered: false,
+        };
+      }
+      this.syncProgressService.emitStep(
+        sandboxId,
+        SYNC_STEPS.VERIFYING_BRANCH,
+        'completed',
+        `Branch "${sandbox.mendixBranch}" verified`,
+      );
+    } catch (branchCheckError) {
+      this.logger.warn(
+        `Could not verify branch existence: ${branchCheckError.message}`,
+      );
+      this.syncProgressService.emitStep(
+        sandboxId,
+        SYNC_STEPS.VERIFYING_BRANCH,
+        'completed',
+        'Branch verification skipped',
+      );
+      // Continue anyway - the export will fail if branch doesn't exist
+    }
+
+    // Step 3: Export current state from Team Server using Git clone
+    this.syncProgressService.emitStep(
+      sandboxId,
+      SYNC_STEPS.CLONING_REPO,
+      'in-progress',
+      'Downloading from Mendix Team Server...',
+    );
     let exportPath: string;
     try {
       this.logger.log(
-        `Syncing: Exporting from Team Server branch ${sandbox.mendixBranch}`,
+        `Syncing: Exporting from Team Server branch ${sandbox.mendixBranch} via Git clone`,
       );
-      exportPath = await this.mendixModelSdkService.exportFullModel(
-        mendixAppId,
-        mendixPat,
-        sandbox.mendixBranch || 'main',
-      );
+
+      // Use Git clone if we have projectId (preferred), otherwise fall back to SDK
+      if (projectId) {
+        exportPath = await this.mendixModelSdkService.exportViaGitClone(
+          projectId,
+          mendixPat,
+          sandbox.mendixBranch || 'main',
+          mendixAppId,
+        );
+      } else {
+        // Fallback to SDK export if no projectId
+        this.logger.warn(`No projectId found, falling back to SDK export`);
+        exportPath = await this.mendixModelSdkService.exportFullModel(
+          mendixAppId,
+          mendixPat,
+          sandbox.mendixBranch || 'main',
+          projectId,
+        );
+      }
       this.logger.log(`Export complete: ${exportPath}`);
+      this.syncProgressService.emitStep(
+        sandboxId,
+        SYNC_STEPS.CLONING_REPO,
+        'completed',
+        'Repository cloned successfully',
+      );
     } catch (error) {
       this.logger.error(`Export failed: ${error.message}`);
+      this.syncProgressService.emitError(
+        sandboxId,
+        SYNC_STEPS.CLONING_REPO.step,
+        'Clone failed',
+        error.message,
+      );
       return {
         success: false,
         message: `Failed to export from Team Server: ${error.message}`,
@@ -1622,7 +1789,27 @@ export class SandboxesService {
       };
     }
 
-    // Step 2: Commit to GitHub
+    // Step 4: Processing files
+    this.syncProgressService.emitStep(
+      sandboxId,
+      SYNC_STEPS.PROCESSING_FILES,
+      'in-progress',
+      'Preparing files for upload...',
+    );
+    // Processing happens as part of the GitHub commit - this step marks the transition
+    this.syncProgressService.emitStep(
+      sandboxId,
+      SYNC_STEPS.PROCESSING_FILES,
+      'completed',
+    );
+
+    // Step 5 & 6: Upload to GitHub and create commit
+    this.syncProgressService.emitStep(
+      sandboxId,
+      SYNC_STEPS.UPLOADING_GITHUB,
+      'in-progress',
+      'Uploading files to GitHub...',
+    );
     let commitInfo: { sha: string; html_url: string };
     try {
       this.logger.log(`Committing to GitHub branch ${sandbox.githubBranch}`);
@@ -1632,9 +1819,26 @@ export class SandboxesService {
         changeTitle || `[Sync] ${sandbox.name}`,
         sandbox.githubBranch || undefined,
       );
+      this.syncProgressService.emitStep(
+        sandboxId,
+        SYNC_STEPS.UPLOADING_GITHUB,
+        'completed',
+      );
+      this.syncProgressService.emitStep(
+        sandboxId,
+        SYNC_STEPS.CREATING_COMMIT,
+        'completed',
+        `Commit: ${commitInfo.sha.substring(0, 7)}`,
+      );
       this.logger.log(`Committed: ${commitInfo.sha}`);
     } catch (error) {
       this.logger.error(`GitHub commit failed: ${error.message}`);
+      this.syncProgressService.emitError(
+        sandboxId,
+        SYNC_STEPS.UPLOADING_GITHUB.step,
+        'Upload failed',
+        error.message,
+      );
       return {
         success: false,
         message: `Failed to commit to GitHub: ${error.message}`,
@@ -1651,7 +1855,12 @@ export class SandboxesService {
       },
     });
 
-    // Step 3: Trigger change detection
+    // Step 7: Trigger change detection
+    this.syncProgressService.emitStep(
+      sandboxId,
+      SYNC_STEPS.DETECTING_CHANGES,
+      'in-progress',
+    );
     let changeCount = 0;
     try {
       const result = await this.changesService.syncSandbox(
@@ -1660,11 +1869,23 @@ export class SandboxesService {
         organizationId,
       );
       changeCount = result.changeCount;
+      this.syncProgressService.emitStep(
+        sandboxId,
+        SYNC_STEPS.DETECTING_CHANGES,
+        'completed',
+        `${changeCount} changes detected`,
+      );
     } catch (error) {
       this.logger.warn(`Change detection failed: ${error.message}`);
+      this.syncProgressService.emitStep(
+        sandboxId,
+        SYNC_STEPS.DETECTING_CHANGES,
+        'completed',
+        'Change detection skipped',
+      );
     }
 
-    // Step 4: CI/CD pipeline is triggered automatically by GitHub Actions on push
+    // Step 8: Complete - CI/CD pipeline is triggered automatically by GitHub Actions on push
 
     // Audit log
     await this.auditService.createAuditLog({
@@ -1682,6 +1903,12 @@ export class SandboxesService {
 
     this.logger.log(
       `Sandbox ${sandboxId} synced: ${commitInfo.sha}, ${changeCount} changes`,
+    );
+
+    // Emit completion
+    this.syncProgressService.emitComplete(
+      sandboxId,
+      `${changeCount} changes detected`,
     );
 
     return {

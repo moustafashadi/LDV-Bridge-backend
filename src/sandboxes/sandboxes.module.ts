@@ -2,6 +2,7 @@ import { Module, forwardRef } from '@nestjs/common';
 import { ScheduleModule } from '@nestjs/schedule';
 import { SandboxesController } from './sandboxes.controller';
 import { SandboxesService } from './sandboxes.service';
+import { SyncProgressService } from './sync-progress.service';
 import { PowerAppsProvisioner } from './provisioners/powerapps.provisioner';
 import { MendixProvisioner } from './provisioners/mendix.provisioner';
 import { PrismaModule } from '../prisma/prisma.module';
@@ -22,7 +23,12 @@ import { ChangesModule } from '../changes/changes.module';
     ScheduleModule.forRoot(), // Enable cron jobs
   ],
   controllers: [SandboxesController],
-  providers: [SandboxesService, PowerAppsProvisioner, MendixProvisioner],
-  exports: [SandboxesService],
+  providers: [
+    SandboxesService,
+    SyncProgressService,
+    PowerAppsProvisioner,
+    MendixProvisioner,
+  ],
+  exports: [SandboxesService, SyncProgressService],
 })
 export class SandboxesModule {}
