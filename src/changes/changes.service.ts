@@ -8,6 +8,7 @@ import {
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../common/audit/audit.service';
 import { ChangesGateway } from './changes.gateway';
+import { GitHubService } from '../github/github.service';
 import { CreateChangeDto } from './dto/create-change.dto';
 import { UpdateChangeDto } from './dto/update-change.dto';
 import {
@@ -25,6 +26,14 @@ import {
 } from '../risk/risk-scorer.service';
 import type { Change, ChangeType, ChangeStatus } from '@prisma/client';
 
+interface GitFileDiff {
+  filename: string;
+  status: 'added' | 'removed' | 'modified' | 'renamed';
+  additions: number;
+  deletions: number;
+  patch?: string;
+}
+
 @Injectable()
 export class ChangesService {
   private readonly logger = new Logger(ChangesService.name);
@@ -34,6 +43,8 @@ export class ChangesService {
     private readonly auditService: AuditService,
     @Inject(forwardRef(() => ChangesGateway))
     private readonly changesGateway: ChangesGateway,
+    @Inject(forwardRef(() => GitHubService))
+    private readonly githubService: GitHubService,
     private readonly jsonDiffService: JsonDiffService,
     private readonly impactAnalyzer: ImpactAnalyzerService,
     private readonly policyRiskEvaluator: PolicyRiskEvaluatorService,
@@ -184,20 +195,40 @@ export class ChangesService {
 
   /**
    * Manually sync changes from a sandbox environment
+   * Uses Git diff to detect actual file changes between commits
+   * @param previousSha - Optional SHA to compare from (if not provided, uses baseGithubSha)
+   * @param currentSha - Optional SHA to compare to (if not provided, uses latestGithubSha)
    */
   async syncSandbox(
     sandboxId: string,
     userId: string,
     organizationId: string,
+    previousSha?: string | null,
+    currentSha?: string | null,
   ): Promise<{ success: boolean; message: string; changeCount: number }> {
     try {
       this.logger.log(`Starting manual sync for sandbox ${sandboxId}`);
 
-      // Get sandbox details
+      // Get sandbox details with app info
       const sandbox = await this.prisma.sandbox.findUnique({
         where: {
           id: sandboxId,
           organizationId,
+        },
+        include: {
+          app: {
+            select: {
+              id: true,
+              name: true,
+              githubRepoName: true,
+              organizationId: true,
+              organization: {
+                select: {
+                  githubOrgName: true,
+                },
+              },
+            },
+          },
         },
       });
 
@@ -208,30 +239,105 @@ export class ChangesService {
       // Emit sync started event
       this.changesGateway.emitSyncStarted(sandboxId);
 
-      // Get the appId from sandbox (if linked)
-      const appId =
-        (sandbox as any).appId || (sandbox.environment as any)?.appId;
-
-      if (!appId) {
+      const app = (sandbox as any).app;
+      if (!app) {
         throw new NotFoundException(
           `Sandbox ${sandboxId} is not linked to an app`,
         );
       }
 
-      // Detect changes for the app
-      const result = await this.detectChanges(appId, userId, organizationId);
+      // Use Git diff to detect real file changes
+      let changeCount = 0;
+      let fileDiffs: GitFileDiff[] = [];
+
+      const baseGithubSha = (sandbox as any).baseGithubSha;
+      const latestGithubSha = currentSha || (sandbox as any).latestGithubSha;
+
+      // Determine what to compare:
+      // - If previousSha is provided, compare previous commit with current (incremental changes)
+      // - If no previousSha but we have baseGithubSha, compare from branch creation (all changes)
+      // - If previousSha equals baseGithubSha, this is the first sync (show all changes)
+      const fromSha = previousSha || baseGithubSha;
+
+      // If fromSha equals latestGithubSha, there are no new changes (same commit)
+      if (fromSha === latestGithubSha) {
+        this.logger.log(
+          `No new commits since last sync for sandbox ${sandboxId}`,
+        );
+        this.changesGateway.emitSyncCompleted(sandboxId, 0);
+        return {
+          success: true,
+          message: 'No new commits since last sync.',
+          changeCount: 0,
+        };
+      }
+
+      if (
+        app.githubRepoName &&
+        app.organization?.githubOrgName &&
+        fromSha &&
+        latestGithubSha
+      ) {
+        const repoFullName = `${app.organization.githubOrgName}/${app.githubRepoName}`;
+
+        try {
+          // Compare commits to find changed files
+          this.logger.log(
+            `Comparing ${fromSha.substring(0, 7)} -> ${latestGithubSha.substring(0, 7)} for sandbox ${sandboxId}`,
+          );
+
+          fileDiffs = await this.githubService.getFileDiff(
+            repoFullName,
+            fromSha,
+            latestGithubSha,
+            organizationId,
+          );
+
+          changeCount = fileDiffs.length;
+          this.logger.log(
+            `Git diff found ${changeCount} changed files for sandbox ${sandboxId}`,
+          );
+
+          // Create change record if there are changes
+          if (changeCount > 0) {
+            await this.createChangeFromGitDiff(
+              app.id,
+              sandbox,
+              fileDiffs,
+              userId,
+              organizationId,
+            );
+          }
+        } catch (error) {
+          this.logger.warn(
+            `Git diff failed, falling back to metadata comparison: ${error.message}`,
+          );
+          // Fall back to metadata-based detection
+          const result = await this.detectChanges(
+            app.id,
+            userId,
+            organizationId,
+          );
+          changeCount = result.totalChanges;
+        }
+      } else {
+        // No GitHub info available, use metadata-based detection
+        this.logger.log(`No GitHub SHA info, using metadata-based detection`);
+        const result = await this.detectChanges(app.id, userId, organizationId);
+        changeCount = result.totalChanges;
+      }
 
       // Emit sync completed event
-      this.changesGateway.emitSyncCompleted(sandboxId, result.totalChanges);
+      this.changesGateway.emitSyncCompleted(sandboxId, changeCount);
 
       this.logger.log(
-        `Manual sync completed for sandbox ${sandboxId}: ${result.totalChanges} changes`,
+        `Manual sync completed for sandbox ${sandboxId}: ${changeCount} changes`,
       );
 
       return {
         success: true,
-        message: `Sync completed. ${result.totalChanges} changes detected.`,
-        changeCount: result.totalChanges,
+        message: `Sync completed. ${changeCount} changes detected.`,
+        changeCount,
       };
     } catch (error) {
       this.logger.error(
@@ -240,6 +346,211 @@ export class ChangesService {
       );
       throw error;
     }
+  }
+
+  /**
+   * Create a change record from Git diff results
+   */
+  private async createChangeFromGitDiff(
+    appId: string,
+    sandbox: any,
+    fileDiffs: GitFileDiff[],
+    userId: string,
+    organizationId: string,
+  ): Promise<void> {
+    // Categorize changes by type
+    const addedFiles = fileDiffs.filter((f) => f.status === 'added');
+    const modifiedFiles = fileDiffs.filter((f) => f.status === 'modified');
+    const deletedFiles = fileDiffs.filter((f) => f.status === 'removed');
+
+    // Analyze what types of files changed (pages, microflows, domain models, etc.)
+    const categorizedChanges = this.categorizeFileChanges(fileDiffs);
+
+    // Determine overall change type based on file operations
+    let changeType: ChangeType = 'UPDATE';
+    if (
+      addedFiles.length > 0 &&
+      modifiedFiles.length === 0 &&
+      deletedFiles.length === 0
+    ) {
+      changeType = 'CREATE';
+    } else if (
+      deletedFiles.length > 0 &&
+      addedFiles.length === 0 &&
+      modifiedFiles.length === 0
+    ) {
+      changeType = 'DELETE';
+    }
+
+    // Calculate total additions and deletions
+    const totalAdditions = fileDiffs.reduce((sum, f) => sum + f.additions, 0);
+    const totalDeletions = fileDiffs.reduce((sum, f) => sum + f.deletions, 0);
+
+    // Build a summary of changes
+    const diffSummary = {
+      added: addedFiles.length,
+      modified: modifiedFiles.length,
+      deleted: deletedFiles.length,
+      totalChanges: fileDiffs.length,
+      totalAdditions,
+      totalDeletions,
+      categories: {
+        pages: categorizedChanges.pages.length,
+        microflows: categorizedChanges.microflows.length,
+        nanoflows: categorizedChanges.nanoflows.length,
+        domainModels: categorizedChanges.domainModels.length,
+        integrations: categorizedChanges.integrations.length,
+        resources: categorizedChanges.resources.length,
+        other: categorizedChanges.other.length,
+      },
+      files: fileDiffs.map((f) => ({
+        path: f.filename,
+        status: f.status,
+        additions: f.additions,
+        deletions: f.deletions,
+      })),
+    };
+
+    // Create description
+    const descriptionParts: string[] = [];
+    if (categorizedChanges.pages.length > 0) {
+      descriptionParts.push(`${categorizedChanges.pages.length} page(s)`);
+    }
+    if (categorizedChanges.microflows.length > 0) {
+      descriptionParts.push(
+        `${categorizedChanges.microflows.length} microflow(s)`,
+      );
+    }
+    if (categorizedChanges.nanoflows.length > 0) {
+      descriptionParts.push(
+        `${categorizedChanges.nanoflows.length} nanoflow(s)`,
+      );
+    }
+    if (categorizedChanges.domainModels.length > 0) {
+      descriptionParts.push(
+        `${categorizedChanges.domainModels.length} domain model(s)`,
+      );
+    }
+    if (categorizedChanges.integrations.length > 0) {
+      descriptionParts.push(
+        `${categorizedChanges.integrations.length} integration(s)`,
+      );
+    }
+
+    const description =
+      descriptionParts.length > 0
+        ? `Changed: ${descriptionParts.join(', ')}`
+        : `${fileDiffs.length} files changed (+${totalAdditions}/-${totalDeletions})`;
+
+    // Create change record
+    const changeCreateData: any = {
+      organizationId,
+      appId,
+      sandboxId: sandbox.id,
+      title: `Changes in ${sandbox.name} - ${new Date().toLocaleString()}`,
+      description,
+      changeType,
+      status: 'DRAFT',
+      beforeMetadata: { githubSha: sandbox.baseGithubSha },
+      afterMetadata: { githubSha: sandbox.latestGithubSha },
+      diffSummary,
+    };
+
+    if (userId && userId !== 'system') {
+      changeCreateData.authorId = userId;
+    }
+
+    const change = await this.prisma.change.create({
+      data: changeCreateData,
+    });
+
+    this.logger.log(
+      `Created change record ${change.id} with ${fileDiffs.length} file changes`,
+    );
+
+    // Analyze impact asynchronously
+    this.analyzeChangeImpact(change.id).catch((error) => {
+      this.logger.error(
+        `Failed to analyze impact for change ${change.id}: ${error.message}`,
+      );
+    });
+  }
+
+  /**
+   * Categorize file changes by Mendix component type
+   */
+  private categorizeFileChanges(fileDiffs: GitFileDiff[]): {
+    pages: GitFileDiff[];
+    microflows: GitFileDiff[];
+    nanoflows: GitFileDiff[];
+    domainModels: GitFileDiff[];
+    integrations: GitFileDiff[];
+    resources: GitFileDiff[];
+    other: GitFileDiff[];
+  } {
+    const categories = {
+      pages: [] as GitFileDiff[],
+      microflows: [] as GitFileDiff[],
+      nanoflows: [] as GitFileDiff[],
+      domainModels: [] as GitFileDiff[],
+      integrations: [] as GitFileDiff[],
+      resources: [] as GitFileDiff[],
+      other: [] as GitFileDiff[],
+    };
+
+    for (const file of fileDiffs) {
+      const path = file.filename.toLowerCase();
+
+      // Check model-json files first (human-readable exports)
+      if (
+        path.includes('model-json/pages/') ||
+        (path.includes('/pages/') && path.endsWith('.json'))
+      ) {
+        categories.pages.push(file);
+      } else if (
+        path.includes('model-json/microflows/') ||
+        (path.includes('/microflows/') && path.endsWith('.json'))
+      ) {
+        categories.microflows.push(file);
+      } else if (
+        path.includes('model-json/nanoflows/') ||
+        (path.includes('/nanoflows/') && path.endsWith('.json'))
+      ) {
+        categories.nanoflows.push(file);
+      } else if (
+        path.includes('model-json/domain-models/') ||
+        path.includes('/domainmodels/')
+      ) {
+        categories.domainModels.push(file);
+      } else if (
+        path.includes('/integrations/') ||
+        path.includes('/rest/') ||
+        path.includes('/webservices/')
+      ) {
+        categories.integrations.push(file);
+      } else if (
+        path.includes('/resources/') ||
+        path.includes('/images/') ||
+        path.includes('/documents/')
+      ) {
+        categories.resources.push(file);
+      } else if (path.endsWith('.mxunit') || path.endsWith('.mpr')) {
+        // Binary Mendix files - try to categorize by path
+        if (path.includes('pages')) {
+          categories.pages.push(file);
+        } else if (path.includes('microflow')) {
+          categories.microflows.push(file);
+        } else if (path.includes('nanoflow')) {
+          categories.nanoflows.push(file);
+        } else {
+          categories.other.push(file);
+        }
+      } else {
+        categories.other.push(file);
+      }
+    }
+
+    return categories;
   }
 
   /**

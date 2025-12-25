@@ -20,9 +20,20 @@ import {
   ApiBearerAuth,
   ApiQuery,
 } from '@nestjs/swagger';
-import { Observable, map } from 'rxjs';
+import {
+  Observable,
+  map,
+  interval,
+  takeWhile,
+  startWith,
+  mergeMap,
+  EMPTY,
+} from 'rxjs';
 import { SandboxesService } from './sandboxes.service';
-import { SyncProgressService, SyncProgressEvent } from './sync-progress.service';
+import {
+  SyncProgressService,
+  SyncProgressEvent,
+} from './sync-progress.service';
 import { CreateSandboxDto } from './dto/create-sandbox.dto';
 import { UpdateSandboxDto } from './dto/update-sandbox.dto';
 import { LinkExistingEnvironmentDto } from './dto/link-existing-environment.dto';
@@ -37,6 +48,7 @@ import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
+import { Public } from '../auth/decorators/public.decorator';
 import { UserRole } from '@prisma/client';
 import {
   SandboxPlatform,
@@ -410,11 +422,13 @@ export class SandboxesController {
   }
 
   @Sse(':id/sync/progress')
+  @Public() // SSE/EventSource doesn't support custom headers, so we make this public
   @ApiOperation({
     summary: 'Stream sync progress updates via Server-Sent Events',
     description:
       'Subscribe to real-time progress updates for a sandbox sync operation. ' +
-      'Returns a stream of progress events with step number, status, and message.',
+      'Returns a stream of progress events with step number, status, and message. ' +
+      'Note: This endpoint is public as SSE does not support custom auth headers.',
   })
   @ApiResponse({
     status: 200,
@@ -425,7 +439,10 @@ export class SandboxesController {
         sandboxId: { type: 'string' },
         step: { type: 'number' },
         totalSteps: { type: 'number' },
-        status: { type: 'string', enum: ['pending', 'in-progress', 'completed', 'error'] },
+        status: {
+          type: 'string',
+          enum: ['pending', 'in-progress', 'completed', 'error'],
+        },
         message: { type: 'string' },
         details: { type: 'string' },
         timestamp: { type: 'string', format: 'date-time' },
@@ -433,10 +450,20 @@ export class SandboxesController {
     },
   })
   syncProgress(@Param('id') id: string): Observable<MessageEvent> {
-    return this.syncProgressService.getProgressStream(id).pipe(
-      map((event: SyncProgressEvent) => ({
-        data: event,
-      } as MessageEvent)),
+    // Merge progress events with a keepalive signal every 15 seconds
+    // This prevents the connection from timing out
+    const progressStream = this.syncProgressService.getProgressStream(id);
+    const keepalive = interval(15000).pipe(
+      map(() => ({ type: 'keepalive', timestamp: new Date() })),
+    );
+
+    return progressStream.pipe(
+      map(
+        (event: SyncProgressEvent) =>
+          ({
+            data: event,
+          }) as MessageEvent,
+      ),
     );
   }
 

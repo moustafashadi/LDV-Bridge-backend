@@ -1847,6 +1847,9 @@ export class SandboxesService {
       };
     }
 
+    // Save the previous SHA before updating (for change detection)
+    const previousGithubSha = (sandbox as any).latestGithubSha;
+
     // Update sandbox with latest SHA
     await this.prisma.sandbox.update({
       where: { id: sandboxId },
@@ -1867,6 +1870,8 @@ export class SandboxesService {
         sandboxId,
         userId,
         organizationId,
+        previousGithubSha, // Pass previous SHA to compare against
+        commitInfo.sha, // Pass new SHA
       );
       changeCount = result.changeCount;
       this.syncProgressService.emitStep(
