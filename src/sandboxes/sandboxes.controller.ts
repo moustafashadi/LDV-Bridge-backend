@@ -155,6 +155,43 @@ export class SandboxesController {
     return this.sandboxesService.findAll(organizationId, { userId });
   }
 
+  @Get('review-queue')
+  @Roles(UserRole.PRO_DEVELOPER, UserRole.ADMIN)
+  @ApiOperation({
+    summary: 'Get sandboxes pending review (Pro Developer queue)',
+    description:
+      'Returns sandboxes with PENDING_REVIEW status, enriched with change details, review assignments, and SLA information',
+  })
+  @ApiQuery({
+    name: 'page',
+    type: Number,
+    required: false,
+    example: 1,
+  })
+  @ApiQuery({
+    name: 'limit',
+    type: Number,
+    required: false,
+    example: 20,
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Review queue items',
+  })
+  async getReviewQueue(
+    @CurrentUser('organizationId') organizationId: string,
+    @CurrentUser('id') userId: string,
+    @Query('page') page?: number,
+    @Query('limit') limit?: number,
+  ) {
+    return this.sandboxesService.getReviewQueue(
+      organizationId,
+      userId,
+      page ? Number(page) : 1,
+      limit ? Number(limit) : 20,
+    );
+  }
+
   @Get(':id')
   @ApiOperation({ summary: 'Get sandbox by ID' })
   @ApiResponse({
@@ -168,6 +205,26 @@ export class SandboxesController {
     @CurrentUser('organizationId') organizationId: string,
   ): Promise<SandboxResponseDto> {
     return this.sandboxesService.findOne(id, organizationId);
+  }
+
+  @Get(':id/review-details')
+  @Roles(UserRole.PRO_DEVELOPER, UserRole.ADMIN)
+  @ApiOperation({
+    summary: 'Get sandbox review details for Pro Developer review page',
+    description:
+      'Returns comprehensive data including sandbox, latest change with diff, review assignment, comments, and submitter stats',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Sandbox review details',
+  })
+  @ApiResponse({ status: 404, description: 'Sandbox not found' })
+  async getReviewDetails(
+    @Param('id') id: string,
+    @CurrentUser('id') userId: string,
+    @CurrentUser('organizationId') organizationId: string,
+  ) {
+    return this.sandboxesService.getReviewDetails(id, userId, organizationId);
   }
 
   @Patch(':id')

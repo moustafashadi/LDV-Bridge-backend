@@ -581,6 +581,200 @@ export class SandboxesService {
   }
 
   /**
+   * Get sandboxes pending review (Pro Developer queue)
+   * Returns sandboxes with PENDING_REVIEW status, enriched with change details, review assignments, and SLA
+   */
+  async getReviewQueue(
+    organizationId: string,
+    currentUserId: string,
+    page = 1,
+    limit = 20,
+  ): Promise<{
+    data: any[];
+    total: number;
+    metrics: {
+      pending: number;
+      inProgress: number;
+      overdue: number;
+      approved: number;
+      rejected: number;
+    };
+  }> {
+    const skip = (page - 1) * limit;
+
+    // Fetch sandboxes with PENDING_REVIEW status, including related data
+    const [sandboxes, total] = await Promise.all([
+      this.prisma.sandbox.findMany({
+        where: {
+          organizationId,
+          status: SandboxStatus.PENDING_REVIEW,
+        },
+        include: {
+          createdBy: {
+            select: {
+              id: true,
+              email: true,
+              name: true,
+              role: true,
+            },
+          },
+          app: {
+            select: {
+              id: true,
+              name: true,
+              platform: true,
+              externalId: true,
+            },
+          },
+          changes: {
+            orderBy: { createdAt: 'desc' },
+            take: 1,
+            select: {
+              id: true,
+              title: true,
+              changeType: true,
+              riskScore: true,
+              riskAssessment: true,
+              diffSummary: true,
+              createdAt: true,
+              reviews: {
+                select: {
+                  id: true,
+                  status: true,
+                  reviewerId: true,
+                  reviewer: {
+                    select: {
+                      id: true,
+                      name: true,
+                      email: true,
+                    },
+                  },
+                  createdAt: true,
+                  startedAt: true,
+                },
+              },
+            },
+          },
+        },
+        orderBy: { submittedAt: 'asc' }, // Oldest first (FIFO queue)
+        skip,
+        take: limit,
+      }),
+      this.prisma.sandbox.count({
+        where: {
+          organizationId,
+          status: SandboxStatus.PENDING_REVIEW,
+        },
+      }),
+    ]);
+
+    // Calculate metrics
+    // Note: Review progress is tracked in Review model, not sandbox status
+    // Count reviews in progress (Review.status = IN_PROGRESS)
+    const [inProgressReviewsCount, approvedCount, rejectedCount] =
+      await Promise.all([
+        this.prisma.review.count({
+          where: {
+            change: { organizationId },
+            status: 'IN_PROGRESS',
+          },
+        }),
+        this.prisma.sandbox.count({
+          where: { organizationId, status: SandboxStatus.MERGED },
+        }),
+        this.prisma.sandbox.count({
+          where: {
+            organizationId,
+            status: { in: [SandboxStatus.REJECTED, SandboxStatus.ABANDONED] },
+          },
+        }),
+      ]);
+
+    // SLA thresholds in hours (based on risk level)
+    const SLA_THRESHOLDS = {
+      low: 48,
+      medium: 24,
+      high: 12,
+      critical: 6,
+    };
+
+    // Transform sandboxes into review queue items with SLA info
+    const reviewQueueItems = sandboxes.map((sandbox) => {
+      const latestChange = sandbox.changes[0];
+      const review = latestChange?.reviews?.[0];
+      const submittedAt = sandbox.submittedAt || sandbox.updatedAt;
+      const hoursWaiting =
+        (Date.now() - new Date(submittedAt).getTime()) / (1000 * 60 * 60);
+
+      // Determine risk level from change
+      const riskAssessment = latestChange?.riskAssessment as any;
+      const riskLevel = riskAssessment?.level || 'medium';
+      const slaThreshold = SLA_THRESHOLDS[riskLevel] || 24;
+      const isOverdue = hoursWaiting > slaThreshold;
+
+      return {
+        sandbox: {
+          id: sandbox.id,
+          name: sandbox.name,
+          status: sandbox.status,
+          submittedAt: submittedAt,
+          mendixBranch: sandbox.mendixBranch,
+          githubBranch: sandbox.githubBranch,
+          createdBy: sandbox.createdBy,
+        },
+        app: sandbox.app,
+        change: latestChange
+          ? {
+              id: latestChange.id,
+              title: latestChange.title,
+              changeType: latestChange.changeType,
+              riskScore: latestChange.riskScore,
+              riskLevel,
+              diffSummary: latestChange.diffSummary,
+              createdAt: latestChange.createdAt,
+            }
+          : null,
+        review: review
+          ? {
+              id: review.id,
+              status: review.status,
+              reviewerId: review.reviewerId,
+              reviewer: review.reviewer,
+              isAssignedToMe: review.reviewerId === currentUserId,
+              createdAt: review.createdAt,
+              startedAt: review.startedAt,
+            }
+          : null,
+        sla: {
+          isOverdue,
+          hoursWaiting: Math.round(hoursWaiting * 10) / 10,
+          threshold: slaThreshold,
+          expectedBy: new Date(
+            new Date(submittedAt).getTime() + slaThreshold * 60 * 60 * 1000,
+          ).toISOString(),
+        },
+      };
+    });
+
+    // Count overdue items
+    const overdueCount = reviewQueueItems.filter(
+      (item) => item.sla.isOverdue,
+    ).length;
+
+    return {
+      data: reviewQueueItems,
+      total,
+      metrics: {
+        pending: total,
+        inProgress: inProgressReviewsCount,
+        overdue: overdueCount,
+        approved: approvedCount,
+        rejected: rejectedCount,
+      },
+    };
+  }
+
+  /**
    * Get sandbox by ID
    */
   async findOne(
@@ -605,6 +799,207 @@ export class SandboxesService {
     }
 
     return this.toResponseDto(sandbox);
+  }
+
+  /**
+   * Get comprehensive review details for Pro Developer review page
+   * Returns sandbox, latest change (with diff and risk), review, comments, and submitter stats
+   */
+  async getReviewDetails(
+    sandboxId: string,
+    currentUserId: string,
+    organizationId: string,
+  ): Promise<{
+    sandbox: any;
+    app: any;
+    change: any;
+    review: any;
+    comments: any[];
+    submitterStats: {
+      totalSubmissions: number;
+      approvedCount: number;
+      rejectedCount: number;
+      approvalRate: number;
+    };
+  }> {
+    // Fetch sandbox with full details
+    const sandbox = await this.prisma.sandbox.findFirst({
+      where: { id: sandboxId, organizationId },
+      include: {
+        createdBy: {
+          select: {
+            id: true,
+            email: true,
+            name: true,
+            role: true,
+          },
+        },
+        app: {
+          select: {
+            id: true,
+            name: true,
+            platform: true,
+            externalId: true,
+            githubRepoUrl: true,
+          },
+        },
+        changes: {
+          orderBy: { createdAt: 'desc' },
+          take: 1,
+          include: {
+            reviews: {
+              include: {
+                reviewer: {
+                  select: {
+                    id: true,
+                    name: true,
+                    email: true,
+                  },
+                },
+              },
+            },
+            comments: {
+              include: {
+                user: {
+                  select: {
+                    id: true,
+                    name: true,
+                    email: true,
+                    role: true,
+                  },
+                },
+                replies: {
+                  include: {
+                    user: {
+                      select: {
+                        id: true,
+                        name: true,
+                        email: true,
+                        role: true,
+                      },
+                    },
+                  },
+                },
+              },
+              orderBy: { createdAt: 'asc' },
+            },
+          },
+        },
+      },
+    });
+
+    if (!sandbox) {
+      throw new NotFoundException(`Sandbox ${sandboxId} not found`);
+    }
+
+    const latestChange = sandbox.changes[0] || null;
+    const review = latestChange?.reviews?.[0] || null;
+    const comments = latestChange?.comments || [];
+
+    // Calculate submitter stats (how many submissions has this user made and approval rate)
+    const submitterId = sandbox.createdById;
+    const [totalSubmissions, approvedCount, rejectedCount] = await Promise.all([
+      // Total sandboxes submitted by this user
+      this.prisma.sandbox.count({
+        where: {
+          organizationId,
+          createdById: submitterId,
+          submittedAt: { not: null },
+        },
+      }),
+      // Approved (merged) sandboxes
+      this.prisma.sandbox.count({
+        where: {
+          organizationId,
+          createdById: submitterId,
+          status: 'MERGED',
+        },
+      }),
+      // Rejected sandboxes
+      this.prisma.sandbox.count({
+        where: {
+          organizationId,
+          createdById: submitterId,
+          status: 'REJECTED',
+        },
+      }),
+    ]);
+
+    const completedSubmissions = approvedCount + rejectedCount;
+    const approvalRate =
+      completedSubmissions > 0 ? approvedCount / completedSubmissions : 0;
+
+    return {
+      sandbox: {
+        id: sandbox.id,
+        name: sandbox.name,
+        description: sandbox.description,
+        status: sandbox.status,
+        conflictStatus: sandbox.conflictStatus,
+        mendixBranch: sandbox.mendixBranch,
+        githubBranch: sandbox.githubBranch,
+        submittedAt: (sandbox as any).submittedAt,
+        createdAt: sandbox.createdAt,
+        createdBy: sandbox.createdBy,
+      },
+      app: sandbox.app,
+      change: latestChange
+        ? {
+            id: latestChange.id,
+            title: latestChange.title,
+            description: latestChange.description,
+            changeType: latestChange.changeType,
+            status: latestChange.status,
+            riskScore: latestChange.riskScore,
+            riskAssessment: latestChange.riskAssessment,
+            diffSummary: latestChange.diffSummary,
+            beforeMetadata: latestChange.beforeMetadata,
+            afterMetadata: latestChange.afterMetadata,
+            pipelineStatus: latestChange.pipelineStatus,
+            pipelineUrl: latestChange.pipelineUrl,
+            pipelineResults: latestChange.pipelineResults,
+            createdAt: latestChange.createdAt,
+          }
+        : null,
+      review: review
+        ? {
+            id: review.id,
+            status: review.status,
+            decision: review.decision,
+            feedback: review.feedback,
+            reviewerId: review.reviewerId,
+            reviewer: review.reviewer,
+            isAssignedToMe: review.reviewerId === currentUserId,
+            startedAt: review.startedAt,
+            completedAt: review.completedAt,
+            createdAt: review.createdAt,
+          }
+        : null,
+      comments: comments.map((c: any) => ({
+        id: c.id,
+        content: c.content,
+        userId: c.userId,
+        user: c.user,
+        parentId: c.parentId,
+        isResolved: c.isResolved,
+        mentions: c.mentions,
+        createdAt: c.createdAt,
+        updatedAt: c.updatedAt,
+        replies: c.replies?.map((r: any) => ({
+          id: r.id,
+          content: r.content,
+          userId: r.userId,
+          user: r.user,
+          createdAt: r.createdAt,
+        })),
+      })),
+      submitterStats: {
+        totalSubmissions,
+        approvedCount,
+        rejectedCount,
+        approvalRate: Math.round(approvalRate * 100) / 100,
+      },
+    };
   }
 
   /**
@@ -1495,6 +1890,9 @@ export class SandboxesService {
       );
     }
 
+    // Save the previous SHA before updating (for incremental change detection)
+    const previousGithubSha = (sandbox as any).latestGithubSha;
+
     // Update sandbox with latest GitHub SHA
     await this.prisma.sandbox.update({
       where: { id: sandboxId },
@@ -1511,6 +1909,8 @@ export class SandboxesService {
         sandboxId,
         userId,
         organizationId,
+        previousGithubSha, // Pass previous SHA for incremental diff
+        commitResult.commit.sha, // Pass new SHA
       );
       this.logger.log(
         `Change detection complete: ${changeDetectionResult.changeCount} changes`,
