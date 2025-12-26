@@ -565,13 +565,16 @@ ${summary.modules.length > 0 ? summary.modules.map((m: string) => `- ${m}`).join
       // Now add JSON exports for human-readable diffs
       // This uses the Model SDK to extract structured data from the binary .mxunit files
       this.logger.log(`[GIT] Adding JSON model exports for diff-ability...`);
+      this.logger.log(`[GIT] ProjectId: ${projectId}, Branch: ${branchName}`);
       try {
         await this.addJsonModelExports(exportDir, projectId, pat, branchName);
         this.logger.log(`[GIT] JSON model exports added successfully`);
       } catch (jsonExportError) {
-        this.logger.warn(
-          `[GIT] Failed to add JSON exports: ${(jsonExportError as any).message}`,
-        );
+        const errorMessage =
+          (jsonExportError as any).message || String(jsonExportError);
+        const errorStack = (jsonExportError as any).stack || '';
+        this.logger.warn(`[GIT] Failed to add JSON exports: ${errorMessage}`);
+        this.logger.warn(`[GIT] JSON export error stack: ${errorStack}`);
         // Continue without JSON exports - Git clone still provides the raw files
       }
 
@@ -601,11 +604,14 @@ ${summary.modules.length > 0 ? summary.modules.map((m: string) => `- ${m}`).join
 ## Change Detection
 
 The \`model-json/\` folder contains human-readable JSON representations of:
-- **pages/** - Page definitions with titles, layouts, widgets
-- **microflows/** - Microflow logic
+- **pages/** - Page definitions with titles, layouts, widget hierarchy
+- **microflows/** - Microflow logic with actions, parameters, and flow structure
 - **nanoflows/** - Nanoflow logic
-- **domain-models/** - Entity definitions and associations
-- **constants/** - App constants
+- **domain-models/** - Entity definitions, attributes, associations, and validation rules
+- **constants/** - App constants with types and default values
+- **snippets/** - Reusable UI component definitions
+- **enumerations/** - Enum definitions with values and captions
+- **scheduled-events/** - Timer configurations and microflow bindings
 
 These JSON files enable meaningful diffs when changes are made in Mendix Studio.
 
@@ -726,21 +732,34 @@ These JSON files enable meaningful diffs when changes are made in Mendix Studio.
     pat: string,
     branchName: string,
   ): Promise<void> {
+    this.logger.log(
+      `[JSON] Starting JSON model export for projectId: ${projectId}, branch: ${branchName}`,
+    );
+
     const jsonDir = path.join(exportDir, 'model-json');
     fs.mkdirSync(jsonDir, { recursive: true });
+    this.logger.log(`[JSON] Created model-json directory at: ${jsonDir}`);
 
     const originalToken = process.env.MENDIX_TOKEN;
 
     try {
       // Configure the Platform SDK
+      this.logger.log(`[JSON] Configuring Platform SDK...`);
       setPlatformConfig({ mendixToken: pat });
       process.env.MENDIX_TOKEN = pat;
 
+      this.logger.log(`[JSON] Creating MendixPlatformClient...`);
       const client = new MendixPlatformClient();
+
+      this.logger.log(`[JSON] Getting app for projectId: ${projectId}...`);
       const app = await client.getApp(projectId);
 
-      this.logger.log(`[JSON] Creating working copy for JSON export...`);
+      this.logger.log(
+        `[JSON] Creating working copy for JSON export (branch: ${branchName})...`,
+      );
       const workingCopy = await app.createTemporaryWorkingCopy(branchName);
+
+      this.logger.log(`[JSON] Opening model...`);
       const model = await workingCopy.openModel();
 
       // Create subdirectories
@@ -749,12 +768,18 @@ These JSON files enable meaningful diffs when changes are made in Mendix Studio.
       const nanoflowsDir = path.join(jsonDir, 'nanoflows');
       const domainModelsDir = path.join(jsonDir, 'domain-models');
       const constantsDir = path.join(jsonDir, 'constants');
+      const snippetsDir = path.join(jsonDir, 'snippets');
+      const enumerationsDir = path.join(jsonDir, 'enumerations');
+      const scheduledEventsDir = path.join(jsonDir, 'scheduled-events');
 
       fs.mkdirSync(pagesDir, { recursive: true });
       fs.mkdirSync(microflowsDir, { recursive: true });
       fs.mkdirSync(nanoflowsDir, { recursive: true });
       fs.mkdirSync(domainModelsDir, { recursive: true });
       fs.mkdirSync(constantsDir, { recursive: true });
+      fs.mkdirSync(snippetsDir, { recursive: true });
+      fs.mkdirSync(enumerationsDir, { recursive: true });
+      fs.mkdirSync(scheduledEventsDir, { recursive: true });
 
       const allModules = model.allModules();
       let pagesExported = 0,
@@ -762,13 +787,16 @@ These JSON files enable meaningful diffs when changes are made in Mendix Studio.
         nanoflowsExported = 0;
       let domainModelsExported = 0,
         constantsExported = 0,
+        snippetsExported = 0;
+      let enumerationsExported = 0,
+        scheduledEventsExported = 0,
         skippedElements = 0;
 
       for (const module of allModules) {
         const moduleName = module.name;
         const safeModuleName = moduleName.replace(/[^a-zA-Z0-9_-]/g, '_');
 
-        // Export domain model
+        // Export domain model with detailed entity structure
         try {
           const domainModel = module.domainModel;
           if (domainModel) {
@@ -776,10 +804,21 @@ These JSON files enable meaningful diffs when changes are made in Mendix Studio.
             const entities = domainModel.entities.map((entity) => ({
               name: entity.name,
               documentation: entity.documentation || undefined,
+              generalization: (entity as any).generalization?.name || undefined,
               attributes: entity.attributes.map((attr) => ({
                 name: attr.name,
                 type: attr.type?.constructor?.name || 'Unknown',
+                documentation: (attr as any).documentation || undefined,
+                defaultValue: (attr as any).value?.defaultValue || undefined,
               })),
+              // Enhanced: Add associations
+              associations: this.extractAssociations(domainModel, entity.name),
+              // Enhanced: Add validation rules
+              validationRules: (entity as any).validationRules?.map((rule: any) => ({
+                attribute: rule.attribute?.name,
+                rule: rule.rule?.constructor?.name,
+                message: this.extractTextValue(rule.message),
+              })) || [],
             }));
 
             if (entities.length > 0) {
@@ -794,10 +833,19 @@ These JSON files enable meaningful diffs when changes are made in Mendix Studio.
           skippedElements++;
         }
 
-        // Export pages
+        // Helper function to safely get module name
+        const safeGetModuleName = (element: any): string | null => {
+          try {
+            return element.containerAsModule?.name || null;
+          } catch {
+            return null;
+          }
+        };
+
+        // Export pages with detailed widget structure
         const pages = model
           .allPages()
-          .filter((p) => p.containerAsModule?.name === moduleName);
+          .filter((p) => safeGetModuleName(p) === moduleName);
         for (const pageInterface of pages) {
           try {
             const page = await pageInterface.load();
@@ -808,6 +856,8 @@ These JSON files enable meaningful diffs when changes are made in Mendix Studio.
               url: (page as any).url || undefined,
               layoutCall: page.layoutCall?.layout?.name || undefined,
               allowedRoles: page.allowedRoles?.map((r) => r.name) || [],
+              // Enhanced: Extract widget structure for better diffs
+              widgets: this.extractWidgetStructure(page),
             };
 
             fs.writeFileSync(
@@ -820,10 +870,10 @@ These JSON files enable meaningful diffs when changes are made in Mendix Studio.
           }
         }
 
-        // Export microflows
+        // Export microflows with detailed action structure
         const microflows = model
           .allMicroflows()
-          .filter((m) => m.containerAsModule?.name === moduleName);
+          .filter((m) => safeGetModuleName(m) === moduleName);
         for (const mfInterface of microflows) {
           try {
             const microflow = await mfInterface.load();
@@ -834,7 +884,9 @@ These JSON files enable meaningful diffs when changes are made in Mendix Studio.
                 microflow.microflowReturnType?.constructor?.name || 'Unknown',
               allowedRoles:
                 microflow.allowedModuleRoles?.map((r) => r.name) || [],
-              objectCount: microflow.objectCollection?.objects?.length || 0,
+              // Enhanced: Extract action flow for better diffs
+              actions: this.extractMicroflowActions(microflow),
+              parameters: this.extractMicroflowParameters(microflow),
             };
 
             fs.writeFileSync(
@@ -853,7 +905,7 @@ These JSON files enable meaningful diffs when changes are made in Mendix Studio.
         // Export nanoflows
         const nanoflows = model
           .allNanoflows()
-          .filter((n) => n.containerAsModule?.name === moduleName);
+          .filter((n) => safeGetModuleName(n) === moduleName);
         for (const nfInterface of nanoflows) {
           try {
             const nanoflow = await nfInterface.load();
@@ -883,7 +935,7 @@ These JSON files enable meaningful diffs when changes are made in Mendix Studio.
         // Export constants
         const constants = model
           .allConstants()
-          .filter((c) => c.containerAsModule?.name === moduleName);
+          .filter((c) => safeGetModuleName(c) === moduleName);
         for (const constInterface of constants) {
           try {
             const constant = await constInterface.load();
@@ -906,6 +958,92 @@ These JSON files enable meaningful diffs when changes are made in Mendix Studio.
             skippedElements++;
           }
         }
+
+        // Export snippets
+        const snippets = model
+          .allSnippets()
+          .filter((s) => safeGetModuleName(s) === moduleName);
+        for (const snippetInterface of snippets) {
+          try {
+            const snippet = await snippetInterface.load();
+            const snippetData = {
+              name: snippet.name,
+              documentation: snippet.documentation || undefined,
+              widgets: this.extractWidgetStructure(snippet),
+            };
+
+            fs.writeFileSync(
+              path.join(
+                snippetsDir,
+                `${safeModuleName}_${snippet.name}.json`,
+              ),
+              JSON.stringify(snippetData, null, 2),
+            );
+            snippetsExported++;
+          } catch {
+            skippedElements++;
+          }
+        }
+
+        // Export enumerations
+        const enumerations = model
+          .allEnumerations()
+          .filter((e) => safeGetModuleName(e) === moduleName);
+        for (const enumInterface of enumerations) {
+          try {
+            const enumeration = await enumInterface.load();
+            const enumData = {
+              name: enumeration.name,
+              documentation: enumeration.documentation || undefined,
+              values: enumeration.values?.map((v: any) => ({
+                name: v.name,
+                caption: this.extractTextValue(v.caption),
+                image: v.image?.name,
+              })) || [],
+            };
+
+            fs.writeFileSync(
+              path.join(
+                enumerationsDir,
+                `${safeModuleName}_${enumeration.name}.json`,
+              ),
+              JSON.stringify(enumData, null, 2),
+            );
+            enumerationsExported++;
+          } catch {
+            skippedElements++;
+          }
+        }
+
+        // Export scheduled events
+        const scheduledEvents = model
+          .allScheduledEvents()
+          .filter((se) => safeGetModuleName(se) === moduleName);
+        for (const seInterface of scheduledEvents) {
+          try {
+            const scheduledEvent = await seInterface.load();
+            const seData = {
+              name: scheduledEvent.name,
+              documentation: scheduledEvent.documentation || undefined,
+              enabled: (scheduledEvent as any).enabled,
+              startDateTime: (scheduledEvent as any).startDateTime,
+              intervalType: (scheduledEvent as any).intervalType?.name,
+              interval: (scheduledEvent as any).interval,
+              microflow: (scheduledEvent as any).microflow?.name,
+            };
+
+            fs.writeFileSync(
+              path.join(
+                scheduledEventsDir,
+                `${safeModuleName}_${scheduledEvent.name}.json`,
+              ),
+              JSON.stringify(seData, null, 2),
+            );
+            scheduledEventsExported++;
+          } catch {
+            skippedElements++;
+          }
+        }
       }
 
       // Write summary
@@ -919,6 +1057,9 @@ These JSON files enable meaningful diffs when changes are made in Mendix Studio.
           nanoflows: nanoflowsExported,
           domainModels: domainModelsExported,
           constants: constantsExported,
+          snippets: snippetsExported,
+          enumerations: enumerationsExported,
+          scheduledEvents: scheduledEventsExported,
         },
         skippedElements,
       };
@@ -931,7 +1072,9 @@ These JSON files enable meaningful diffs when changes are made in Mendix Studio.
       this.logger.log(
         `[JSON] Exported: ${pagesExported} pages, ${microflowsExported} microflows, ` +
           `${nanoflowsExported} nanoflows, ${domainModelsExported} domain models, ` +
-          `${constantsExported} constants (${skippedElements} skipped)`,
+          `${constantsExported} constants, ${snippetsExported} snippets, ` +
+          `${enumerationsExported} enums, ${scheduledEventsExported} scheduled events ` +
+          `(${skippedElements} skipped)`,
       );
     } finally {
       // Restore original token
@@ -966,6 +1109,221 @@ These JSON files enable meaningful diffs when changes are made in Mendix Studio.
       return undefined;
     } catch {
       return undefined;
+    }
+  }
+
+  /**
+   * Extract widget structure from a page for detailed diffs
+   */
+  private extractWidgetStructure(page: any): any[] {
+    try {
+      const widgets: any[] = [];
+      
+      // Get the layout call content
+      const layoutCall = page.layoutCall;
+      if (!layoutCall) return widgets;
+
+      // Extract widgets from layout parameters
+      const parameters = layoutCall.arguments || [];
+      for (const param of parameters) {
+        try {
+          const widget = param.widget || param.widgets?.[0];
+          if (widget) {
+            widgets.push(this.extractWidget(widget));
+          }
+          // Handle multiple widgets in a parameter
+          if (param.widgets && param.widgets.length > 0) {
+            for (const w of param.widgets) {
+              widgets.push(this.extractWidget(w));
+            }
+          }
+        } catch {
+          // Skip problematic parameters
+        }
+      }
+
+      return widgets;
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Recursively extract widget information
+   */
+  private extractWidget(widget: any, depth: number = 0): any {
+    if (!widget || depth > 10) return null; // Prevent infinite recursion
+    
+    try {
+      const widgetType = widget.constructor?.name || 'Unknown';
+      const result: any = {
+        type: widgetType,
+        name: widget.name || undefined,
+      };
+
+      // Extract common properties based on widget type
+      if (widgetType.includes('DataView')) {
+        result.dataSource = widget.dataSource?.constructor?.name;
+        result.entity = (widget as any).entityRef?.entity?.name;
+      } else if (widgetType.includes('ListView') || widgetType.includes('TemplateGrid')) {
+        result.dataSource = widget.dataSource?.constructor?.name;
+        result.entity = (widget as any).entityRef?.entity?.name;
+      } else if (widgetType.includes('Button')) {
+        result.caption = this.extractTextValue(widget.caption);
+        result.action = widget.action?.constructor?.name;
+      } else if (widgetType.includes('TextBox') || widgetType.includes('Input')) {
+        result.attribute = (widget as any).attributeRef?.attribute?.name;
+        result.label = this.extractTextValue((widget as any).label);
+      } else if (widgetType.includes('Text') || widgetType.includes('Label')) {
+        result.content = this.extractTextValue(widget.content || widget.caption);
+      } else if (widgetType.includes('Container') || widgetType.includes('LayoutGrid')) {
+        result.class = widget.class || undefined;
+      }
+
+      // Extract child widgets recursively
+      const children: any[] = [];
+      const childWidgets = widget.widgets || widget.content?.widgets || [];
+      if (Array.isArray(childWidgets)) {
+        for (const child of childWidgets.slice(0, 50)) { // Limit children to prevent huge files
+          const childData = this.extractWidget(child, depth + 1);
+          if (childData) {
+            children.push(childData);
+          }
+        }
+      }
+      if (children.length > 0) {
+        result.children = children;
+      }
+
+      return result;
+    } catch {
+      return { type: 'Unknown', error: 'Failed to extract' };
+    }
+  }
+
+  /**
+   * Extract microflow actions for detailed diffs
+   */
+  private extractMicroflowActions(microflow: any): any[] {
+    try {
+      const actions: any[] = [];
+      const objects = microflow.objectCollection?.objects || [];
+      
+      for (const obj of objects) {
+        try {
+          const actionType = obj.constructor?.name || 'Unknown';
+          const action: any = {
+            type: actionType,
+          };
+
+          // Extract details based on action type
+          if (actionType.includes('ActionActivity')) {
+            action.actionType = obj.action?.constructor?.name;
+            // For microflow calls
+            if (obj.action?.microflowCall) {
+              action.microflowCalled = obj.action.microflowCall.microflow?.name;
+            }
+            // For change object
+            if (actionType.includes('ChangeObject') || obj.action?.constructor?.name?.includes('Change')) {
+              action.entity = (obj.action as any)?.changeVariableName;
+            }
+            // For create object
+            if (actionType.includes('CreateObject') || obj.action?.constructor?.name?.includes('Create')) {
+              action.entity = (obj.action as any)?.entity?.name;
+            }
+            // For retrieve
+            if (obj.action?.constructor?.name?.includes('Retrieve')) {
+              action.entity = (obj.action as any)?.entity?.name;
+              action.xpathConstraint = (obj.action as any)?.xpathConstraint;
+            }
+          } else if (actionType.includes('ExclusiveSplit') || actionType.includes('Decision')) {
+            action.expression = obj.splitCondition?.expression || obj.expression;
+          } else if (actionType.includes('LoopedActivity') || actionType.includes('Loop')) {
+            action.iteratedListVariableName = obj.iteratedListVariableName;
+          } else if (actionType.includes('EndEvent')) {
+            action.returnValue = obj.returnValue;
+          }
+
+          // Add caption/documentation if available
+          if (obj.caption) {
+            action.caption = this.extractTextValue(obj.caption) || obj.caption;
+          }
+          if (obj.documentation) {
+            action.documentation = obj.documentation;
+          }
+
+          actions.push(action);
+        } catch {
+          actions.push({ type: 'Unknown', error: 'Failed to extract' });
+        }
+      }
+
+      return actions;
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Extract microflow parameters
+   */
+  private extractMicroflowParameters(microflow: any): any[] {
+    try {
+      const parameters: any[] = [];
+      const params = microflow.parameters || microflow.objectCollection?.objects?.filter(
+        (o: any) => o.constructor?.name?.includes('Parameter')
+      ) || [];
+
+      for (const param of params) {
+        try {
+          parameters.push({
+            name: param.name,
+            type: param.variableType?.constructor?.name || param.type?.constructor?.name || 'Unknown',
+            entity: (param as any).entity?.name || (param as any).variableType?.entity?.name,
+          });
+        } catch {
+          // Skip problematic parameters
+        }
+      }
+
+      return parameters;
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Extract associations from domain model
+   */
+  private extractAssociations(domainModel: any, entityName: string): any[] {
+    try {
+      const associations: any[] = [];
+      const allAssociations = domainModel.associations || [];
+
+      for (const assoc of allAssociations) {
+        try {
+          // Check if this association involves the entity
+          const parentName = assoc.parent?.name;
+          const childName = assoc.child?.name;
+          
+          if (parentName === entityName || childName === entityName) {
+            associations.push({
+              name: assoc.name,
+              type: assoc.type?.name || String(assoc.type),
+              parent: parentName,
+              child: childName,
+              parentDeleteBehavior: assoc.parentDeleteBehavior?.name,
+              childDeleteBehavior: assoc.childDeleteBehavior?.name,
+            });
+          }
+        } catch {
+          // Skip problematic associations
+        }
+      }
+
+      return associations;
+    } catch {
+      return [];
     }
   }
 }
