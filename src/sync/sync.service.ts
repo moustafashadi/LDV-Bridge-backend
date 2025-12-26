@@ -5,6 +5,7 @@ import {
   UnauthorizedException,
   Logger,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { InjectQueue } from '@nestjs/bull';
 import type { Queue } from 'bull';
 import { Cron, CronExpression } from '@nestjs/schedule';
@@ -39,6 +40,7 @@ export class SyncService {
     private readonly componentsService: ComponentsService,
     private readonly changesService: ChangesService,
     @InjectQueue('app-sync') private readonly syncQueue: Queue,
+    private readonly configService: ConfigService,
   ) {}
 
   /**
@@ -454,6 +456,15 @@ export class SyncService {
    */
   @Cron(CronExpression.EVERY_HOUR)
   async scheduledSync() {
+    // If automatic sync is disabled via configuration, skip the cron job
+    const enabled = this.configService.get<string>('ENABLE_AUTOMATIC_SYNC');
+    if (enabled && enabled.toLowerCase() === 'false') {
+      this.logger.log(
+        'Automatic sync is disabled via ENABLE_AUTOMATIC_SYNC=false; skipping scheduled run',
+      );
+      return;
+    }
+
     this.logger.log('Running scheduled sync for all apps');
 
     try {
@@ -463,10 +474,7 @@ export class SyncService {
 
       const appsToSync = await this.prisma.app.findMany({
         where: {
-          OR: [
-            { lastSyncedAt: null },
-            { lastSyncedAt: { lt: oneHourAgo } },
-          ],
+          OR: [{ lastSyncedAt: null }, { lastSyncedAt: { lt: oneHourAgo } }],
         },
         include: {
           owner: {
@@ -532,10 +540,14 @@ export class SyncService {
           data: { jobId: job.id.toString() },
         });
 
-        this.logger.log(`Queued automatic sync for app ${app.name} (${app.id})`);
+        this.logger.log(
+          `Queued automatic sync for app ${app.name} (${app.id})`,
+        );
       }
 
-      this.logger.log(`Scheduled sync completed - queued ${appsToSync.length} apps`);
+      this.logger.log(
+        `Scheduled sync completed - queued ${appsToSync.length} apps`,
+      );
     } catch (error) {
       this.logger.error(`Scheduled sync failed: ${error.message}`, error.stack);
     }
