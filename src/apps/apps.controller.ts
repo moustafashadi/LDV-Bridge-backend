@@ -9,6 +9,8 @@ import {
   UseGuards,
   HttpCode,
   HttpStatus,
+  Sse,
+  MessageEvent,
 } from '@nestjs/common';
 import {
   ApiTags,
@@ -16,12 +18,26 @@ import {
   ApiResponse,
   ApiBearerAuth,
 } from '@nestjs/swagger';
+import {
+  Observable,
+  map,
+  interval,
+  takeWhile,
+  startWith,
+  mergeMap,
+  EMPTY,
+} from 'rxjs';
 import { AppsService } from './apps.service';
+import {
+  AppCreationProgressService,
+  AppCreationProgressEvent,
+} from './app-creation-progress.service';
 import { MendixService } from '../connectors/mendix/mendix.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
+import { Public } from '../auth/decorators/public.decorator';
 import type { AuthenticatedUser } from '../auth/interfaces/authenticated-user.interface';
 import {
   GrantAppAccessDto,
@@ -46,6 +62,7 @@ export class AppsController {
   constructor(
     private readonly appsService: AppsService,
     private readonly mendixService: MendixService,
+    private readonly appCreationProgressService: AppCreationProgressService,
   ) {}
 
   // ============================================
@@ -111,7 +128,50 @@ export class AppsController {
       name: dto.name,
       description: dto.description,
       connectorId: dto.connectorId,
+      tempId: dto.tempId,
     });
+  }
+
+  @Sse('creation/:tempId/progress')
+  @Public()
+  @ApiOperation({
+    summary: 'Stream app creation progress via Server-Sent Events',
+    description:
+      'Subscribe to real-time progress updates for app creation. Uses SSE for streaming.',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'SSE stream of app creation progress events',
+  })
+  appCreationProgress(
+    @Param('tempId') tempId: string,
+  ): Observable<MessageEvent> {
+    // Create a stream that:
+    // 1. Subscribes to progress events for this tempId
+    // 2. Keeps connection alive with heartbeats
+    // 3. Completes when app creation is done or errors
+
+    let completed = false;
+
+    return interval(1000).pipe(
+      startWith(0),
+      mergeMap(() => {
+        if (completed) {
+          return EMPTY;
+        }
+        return this.appCreationProgressService.getProgressStream(tempId);
+      }),
+      takeWhile((event) => {
+        if (event.status === 'completed' || event.status === 'error') {
+          completed = true;
+          return true; // Emit this final event then stop
+        }
+        return true;
+      }),
+      map((event: AppCreationProgressEvent) => ({
+        data: JSON.stringify(event),
+      })),
+    );
   }
 
   @Get()

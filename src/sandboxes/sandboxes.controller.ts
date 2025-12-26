@@ -44,6 +44,7 @@ import {
   AssignUsersDto,
   UnassignUsersDto,
 } from './dto/sandbox-response.dto';
+import { CreateFeatureSandboxDto } from './dto/create-feature-sandbox.dto';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
@@ -396,7 +397,7 @@ export class SandboxesController {
     description: 'Forbidden - Not authorized to create sandbox for this app',
   })
   async createFeatureSandbox(
-    @Body() dto: { appId: string; featureName: string; description?: string },
+    @Body() dto: CreateFeatureSandboxDto,
     @CurrentUser('id') userId: string,
     @CurrentUser('organizationId') organizationId: string,
   ): Promise<SandboxResponseDto> {

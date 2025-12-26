@@ -1,0 +1,50 @@
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import {
+  IsString,
+  IsNotEmpty,
+  IsOptional,
+  IsUUID,
+  MinLength,
+  MaxLength,
+  Matches,
+} from 'class-validator';
+
+/**
+ * DTO for creating a feature sandbox with Mendix and GitHub branches
+ */
+export class CreateFeatureSandboxDto {
+  @ApiProperty({
+    description: 'App ID to create the feature sandbox for',
+    example: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+  })
+  @IsNotEmpty({ message: 'App ID is required' })
+  @IsUUID('4', { message: 'App ID must be a valid UUID' })
+  appId: string;
+
+  @ApiProperty({
+    description:
+      'Name of the feature (used to generate branch names). Must be 3-50 characters, letters, numbers, spaces, hyphens, and underscores only.',
+    example: 'User Dashboard',
+    minLength: 3,
+    maxLength: 50,
+  })
+  @IsNotEmpty({ message: 'Feature name is required' })
+  @IsString()
+  @MinLength(3, { message: 'Feature name must be at least 3 characters' })
+  @MaxLength(50, { message: 'Feature name must be at most 50 characters' })
+  @Matches(/^[a-zA-Z0-9\s\-_]+$/, {
+    message:
+      'Feature name can only contain letters, numbers, spaces, hyphens, and underscores',
+  })
+  featureName: string;
+
+  @ApiPropertyOptional({
+    description: 'Optional description for the feature sandbox',
+    example: 'Implementing the new user dashboard with analytics',
+    maxLength: 500,
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(500, { message: 'Description must be at most 500 characters' })
+  description?: string;
+}

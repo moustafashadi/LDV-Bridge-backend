@@ -22,6 +22,10 @@ import { TokenManagerService } from '../services/token-manager.service';
 import { ConnectorsWebSocketGateway } from '../../websocket/websocket.gateway';
 import { AppStatus } from '@prisma/client';
 import { AppsService } from '../../apps/apps.service';
+import {
+  AppCreationProgressService,
+  APP_CREATION_STEPS,
+} from '../../apps/app-creation-progress.service';
 import { ChangesService } from '../../changes/changes.service';
 import { NotificationsService } from '../../notifications/notifications.service';
 import { GitHubService } from '../../github/github.service';
@@ -64,6 +68,8 @@ export class MendixService implements IBaseConnector {
     private tokenManager: TokenManagerService,
     private websocketGateway: ConnectorsWebSocketGateway,
     private appsService: AppsService,
+    @Inject(forwardRef(() => AppCreationProgressService))
+    private appCreationProgressService: AppCreationProgressService,
     @Inject(forwardRef(() => ChangesService))
     private changesService: ChangesService,
     @Inject(forwardRef(() => NotificationsService))
@@ -1223,6 +1229,7 @@ Mendix App Export
       name: string;
       description?: string;
       connectorId?: string;
+      tempId?: string; // Optional temp ID for progress tracking
     },
   ): Promise<{
     id: string;
@@ -1238,7 +1245,17 @@ Mendix App Export
     syncMessage?: string;
     createdAt: Date;
   }> {
-    this.logger.log(`[CREATE_APP] Creating Mendix app: ${config.name}`);
+    const tempId = config.tempId || `temp-${Date.now()}`;
+    this.logger.log(
+      `[CREATE_APP] Creating Mendix app: ${config.name} (tempId: ${tempId})`,
+    );
+
+    // Emit initializing step
+    this.appCreationProgressService.emitStep(
+      tempId,
+      APP_CREATION_STEPS.INITIALIZING,
+      'in-progress',
+    );
 
     try {
       // Get both API clients
@@ -1251,7 +1268,18 @@ Mendix App Export
         organizationId,
       );
 
+      this.appCreationProgressService.emitStep(
+        tempId,
+        APP_CREATION_STEPS.INITIALIZING,
+        'completed',
+      );
+
       // Step 1: Create Mendix project via Build API
+      this.appCreationProgressService.emitStep(
+        tempId,
+        APP_CREATION_STEPS.CREATING_PROJECT,
+        'in-progress',
+      );
       this.logger.log(
         `[CREATE_APP] Step 1: Creating Mendix project via Build API...`,
       );
@@ -1281,7 +1309,19 @@ Mendix App Export
         `[CREATE_APP] Mendix project created with ID: ${projectId}`,
       );
 
+      this.appCreationProgressService.emitStep(
+        tempId,
+        APP_CREATION_STEPS.CREATING_PROJECT,
+        'completed',
+        `Project ID: ${projectId}`,
+      );
+
       // Step 2: Deploy app via Deploy API to get AppId (subdomain)
+      this.appCreationProgressService.emitStep(
+        tempId,
+        APP_CREATION_STEPS.DEPLOYING_APP,
+        'in-progress',
+      );
       // This is REQUIRED for branch management APIs to work properly
       this.logger.log(`[CREATE_APP] Step 2: Deploying app via Deploy API...`);
 
@@ -1374,6 +1414,13 @@ Mendix App Export
         // Continue anyway - the app is created, user can deploy manually
       }
 
+      this.appCreationProgressService.emitStep(
+        tempId,
+        APP_CREATION_STEPS.DEPLOYING_APP,
+        'completed',
+        appId ? `AppId: ${appId}` : 'Manual deployment required',
+      );
+
       // Step 3: Get or find connector
       let connectorId = config.connectorId;
       if (!connectorId) {
@@ -1396,6 +1443,11 @@ Mendix App Export
       }
 
       // Step 4: Create app record in database
+      this.appCreationProgressService.emitStep(
+        tempId,
+        APP_CREATION_STEPS.CREATING_DATABASE,
+        'in-progress',
+      );
       this.logger.log(
         `[CREATE_APP] Step 3: Creating app record in database...`,
       );
@@ -1423,7 +1475,19 @@ Mendix App Export
 
       this.logger.log(`[CREATE_APP] App record created: ${app.id}`);
 
+      this.appCreationProgressService.emitStep(
+        tempId,
+        APP_CREATION_STEPS.CREATING_DATABASE,
+        'completed',
+        `App ID: ${app.id}`,
+      );
+
       // Step 5: Create GitHub repository (if org has GitHub integration)
+      this.appCreationProgressService.emitStep(
+        tempId,
+        APP_CREATION_STEPS.CREATING_GITHUB_REPO,
+        'in-progress',
+      );
       this.logger.log(`[CREATE_APP] Step 4: Checking GitHub integration...`);
 
       const organization = await this.appsService[
@@ -1464,9 +1528,22 @@ Mendix App Export
         );
       }
 
-      // Step 6: Perform initial sync using Model SDK (only if deployed)
+      this.appCreationProgressService.emitStep(
+        tempId,
+        APP_CREATION_STEPS.CREATING_GITHUB_REPO,
+        'completed',
+        githubRepoUrl ? `Repo: ${githubRepoUrl}` : 'No GitHub integration',
+      );
+
+      // Step 6: Perform initial sync using Git clone (only if deployed)
+      // Uses the same approach as syncSandbox - clones from Team Server and uploads to GitHub
+      this.appCreationProgressService.emitStep(
+        tempId,
+        APP_CREATION_STEPS.CLONING_PROJECT,
+        'in-progress',
+      );
       this.logger.log(
-        `[CREATE_APP] Step 5: Performing initial sync via Model SDK...`,
+        `[CREATE_APP] Step 5: Performing initial sync via Git clone...`,
       );
 
       let syncCompleted = false;
@@ -1482,19 +1559,34 @@ Mendix App Export
           const pat = token?.metadata?.pat;
 
           if (pat && githubRepoUrl) {
-            // Export model and commit to GitHub
+            // Export model via Git clone (full app) and commit to GitHub
             let exportPath: string | null = null;
             try {
               this.logger.log(
-                `[CREATE_APP] Exporting full model for appId: ${appId}, projectId: ${projectId}...`,
+                `[CREATE_APP] Cloning full app from Team Server for appId: ${appId}, projectId: ${projectId}...`,
               );
-              exportPath = await this.mendixModelSdkService.exportFullModel(
-                appId, // App ID (subdomain) for logging
+
+              // Use Git clone like syncSandbox does - this gets the full Mendix app
+              exportPath = await this.mendixModelSdkService.exportViaGitClone(
+                projectId, // projectId (UUID) for Git clone
                 pat,
-                'main',
-                projectId, // Project ID (UUID) for SDK
+                'main', // branch name
+                appId, // appId for logging
               );
-              this.logger.log(`[CREATE_APP] Model exported to: ${exportPath}`);
+              this.logger.log(`[CREATE_APP] App cloned to: ${exportPath}`);
+
+              this.appCreationProgressService.emitStep(
+                tempId,
+                APP_CREATION_STEPS.CLONING_PROJECT,
+                'completed',
+              );
+
+              // Upload to GitHub
+              this.appCreationProgressService.emitStep(
+                tempId,
+                APP_CREATION_STEPS.UPLOADING_GITHUB,
+                'in-progress',
+              );
 
               // Commit to main branch (initial commit)
               const refetchedApp = await this.appsService[
@@ -1510,9 +1602,10 @@ Mendix App Export
                   'Initial sync from Mendix',
                 );
                 syncCompleted = true;
-                syncMessage = 'Initial sync completed successfully';
+                syncMessage =
+                  'Initial sync completed successfully (full app uploaded)';
                 this.logger.log(
-                  `[CREATE_APP] Initial sync committed to GitHub`,
+                  `[CREATE_APP] Initial sync committed to GitHub (full app)`,
                 );
               }
             } finally {
@@ -1524,7 +1617,7 @@ Mendix App Export
               }
             }
           } else if (!pat) {
-            syncMessage = 'Sync skipped: No PAT available for Model SDK export';
+            syncMessage = 'Sync skipped: No PAT available for Git clone';
             this.logger.log(`[CREATE_APP] ${syncMessage}`);
           } else if (!githubRepoUrl) {
             syncMessage = 'Sync skipped: No GitHub repository connected';
@@ -1539,7 +1632,27 @@ Mendix App Export
         }
       }
 
+      // Mark sync steps as completed (even if skipped)
+      this.appCreationProgressService.emitStep(
+        tempId,
+        APP_CREATION_STEPS.CLONING_PROJECT,
+        'completed',
+        syncMessage || 'Completed',
+      );
+      this.appCreationProgressService.emitStep(
+        tempId,
+        APP_CREATION_STEPS.UPLOADING_GITHUB,
+        'completed',
+        syncCompleted ? 'Uploaded successfully' : syncMessage || 'Skipped',
+      );
+
       // Update app status based on results
+      this.appCreationProgressService.emitStep(
+        tempId,
+        APP_CREATION_STEPS.FINALIZING,
+        'in-progress',
+      );
+
       const finalStatus = syncCompleted
         ? AppStatus.LIVE
         : appId
@@ -1555,6 +1668,18 @@ Mendix App Export
       });
 
       const portalUrl = `https://sprintr.home.mendix.com/link/project/${projectId}`;
+
+      this.appCreationProgressService.emitStep(
+        tempId,
+        APP_CREATION_STEPS.FINALIZING,
+        'completed',
+      );
+
+      // Emit completion
+      this.appCreationProgressService.emitComplete(
+        tempId,
+        `App ${app.name} created successfully!`,
+      );
 
       this.logger.log(
         `[CREATE_APP] Mendix app creation complete: ${app.name} (${app.id})`,
@@ -1575,6 +1700,14 @@ Mendix App Export
         createdAt: app.createdAt,
       };
     } catch (error) {
+      // Emit error progress
+      this.appCreationProgressService.emitError(
+        tempId,
+        0,
+        'App creation failed',
+        error.message,
+      );
+
       this.logger.error(
         `[CREATE_APP] Failed to create Mendix app: ${error.message}`,
         error.stack,
