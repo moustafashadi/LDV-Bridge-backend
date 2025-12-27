@@ -782,6 +782,47 @@ These JSON files enable meaningful diffs when changes are made in Mendix Studio.
       fs.mkdirSync(scheduledEventsDir, { recursive: true });
 
       const allModules = model.allModules();
+
+      // Log all modules for debugging
+      const moduleNames = allModules.map((m) => m.name);
+      this.logger.log(
+        `[JSON] Found ${moduleNames.length} modules: ${moduleNames.slice(0, 10).join(', ')}${moduleNames.length > 10 ? '...' : ''}`,
+      );
+
+      // Define system/marketplace modules to skip (these are Mendix platform or marketplace modules)
+      // We only want to track changes to user-created modules
+      const systemModules = new Set([
+        // Core Mendix system modules
+        'System',
+        'MxModelReflection',
+        'Administration',
+        // Atlas UI framework
+        'Atlas_Core',
+        'Atlas_Web_Content',
+        // Common marketplace modules
+        'CommunityCommons',
+        'Encryption',
+        'ObjectHandling',
+        'Email_Connector',
+        'FeedbackModule',
+        'WebActions',
+        'NanoflowCommons',
+        'Nanoflow_Commons',
+        'DataGrid',
+        'DataWidgets',
+        'PopupMenu',
+        'ExcelImporter',
+        'MendixSSO',
+        'SAML20',
+        'DeepLink',
+        'REST',
+        // Add more marketplace modules as needed
+      ]);
+
+      // Count elements by module type for logging
+      let userModuleCount = 0;
+      let systemModuleCount = 0;
+
       let pagesExported = 0,
         microflowsExported = 0,
         nanoflowsExported = 0;
@@ -794,6 +835,16 @@ These JSON files enable meaningful diffs when changes are made in Mendix Studio.
 
       for (const module of allModules) {
         const moduleName = module.name;
+        const isSystemModule =
+          systemModules.has(moduleName) || moduleName.startsWith('Atlas_');
+
+        if (isSystemModule) {
+          systemModuleCount++;
+          // Skip system modules to focus on user content (reduces noise)
+          continue;
+        }
+
+        userModuleCount++;
         const safeModuleName = moduleName.replace(/[^a-zA-Z0-9_-]/g, '_');
 
         // Export domain model with detailed entity structure
@@ -801,6 +852,10 @@ These JSON files enable meaningful diffs when changes are made in Mendix Studio.
           const domainModel = module.domainModel;
           if (domainModel) {
             await domainModel.load();
+            this.logger.debug(
+              `[JSON] Module "${moduleName}" has ${domainModel.entities?.length || 0} entities`,
+            );
+
             const entities = domainModel.entities.map((entity) => ({
               name: entity.name,
               documentation: entity.documentation || undefined,
@@ -822,15 +877,17 @@ These JSON files enable meaningful diffs when changes are made in Mendix Studio.
                 })) || [],
             }));
 
-            if (entities.length > 0) {
-              fs.writeFileSync(
-                path.join(domainModelsDir, `${safeModuleName}.json`),
-                JSON.stringify({ module: moduleName, entities }, null, 2),
-              );
-              domainModelsExported++;
-            }
+            // Export even if empty - this helps track that the module exists
+            fs.writeFileSync(
+              path.join(domainModelsDir, `${safeModuleName}.json`),
+              JSON.stringify({ module: moduleName, entities }, null, 2),
+            );
+            domainModelsExported++;
           }
-        } catch {
+        } catch (err) {
+          this.logger.debug(
+            `[JSON] Failed to export domain model for "${moduleName}": ${err}`,
+          );
           skippedElements++;
         }
 
@@ -1050,6 +1107,23 @@ These JSON files enable meaningful diffs when changes are made in Mendix Studio.
         exportedAt: new Date().toISOString(),
         projectId,
         branch: branchName,
+        modules: {
+          total: allModules.length,
+          user: userModuleCount,
+          system: systemModuleCount,
+          userModuleNames: allModules
+            .filter((m) => {
+              const name = m.name;
+              return !systemModules.has(name) && !name.startsWith('Atlas_');
+            })
+            .map((m) => m.name),
+          systemModuleNames: allModules
+            .filter((m) => {
+              const name = m.name;
+              return systemModules.has(name) || name.startsWith('Atlas_');
+            })
+            .map((m) => m.name),
+        },
         counts: {
           pages: pagesExported,
           microflows: microflowsExported,
@@ -1068,6 +1142,9 @@ These JSON files enable meaningful diffs when changes are made in Mendix Studio.
         JSON.stringify(summary, null, 2),
       );
 
+      this.logger.log(
+        `[JSON] Processed ${userModuleCount} user modules (skipped ${systemModuleCount} system modules)`,
+      );
       this.logger.log(
         `[JSON] Exported: ${pagesExported} pages, ${microflowsExported} microflows, ` +
           `${nanoflowsExported} nanoflows, ${domainModelsExported} domain models, ` +
@@ -1113,103 +1190,366 @@ These JSON files enable meaningful diffs when changes are made in Mendix Studio.
 
   /**
    * Extract widget structure from a page for detailed diffs
+   * Uses the Mendix SDK traverse() method to walk all structures
    */
   private extractWidgetStructure(page: any): any[] {
     try {
       const widgets: any[] = [];
+      const widgetTypes = new Set<string>();
 
-      // Get the layout call content
-      const layoutCall = page.layoutCall;
-      if (!layoutCall) return widgets;
+      // Define actual visual widget types we want to capture
+      // These are the real UI components, not SDK metadata structures
+      const visualWidgetTypes = new Set([
+        // Layout widgets
+        'Pages$Container',
+        'Pages$LayoutGrid',
+        'Pages$LayoutGridRow',
+        'Pages$LayoutGridColumn',
+        'Pages$Table',
+        'Pages$TableRow',
+        'Pages$TableCell',
+        'Pages$TabContainer',
+        'Pages$TabPage',
+        'Pages$ScrollContainer',
+        'Pages$NavigationList',
+        'Pages$NavigationListItem',
+        'Pages$GroupBox',
+        'Pages$Placeholder',
+        // Data widgets
+        'Pages$DataView',
+        'Pages$ListView',
+        'Pages$TemplateGrid',
+        'Pages$DataGrid',
+        'Pages$DataGrid2',
+        'Pages$ReferenceSetSelector',
+        // Input widgets
+        'Pages$TextBox',
+        'Pages$TextArea',
+        'Pages$DropDown',
+        'Pages$RadioButtons',
+        'Pages$CheckBox',
+        'Pages$DatePicker',
+        'Pages$ReferenceSelector',
+        'Pages$InputReferenceSetSelector',
+        'Pages$FileManager',
+        'Pages$ImageUploader',
+        // Display widgets
+        'Pages$Text',
+        'Pages$Title',
+        'Pages$Label',
+        'Pages$DynamicText',
+        'Pages$StaticImageViewer',
+        'Pages$DynamicImage',
+        'Pages$ImageViewer',
+        // Action widgets
+        'Pages$Button',
+        'Pages$ActionButton',
+        'Pages$DropDownButton',
+        'Pages$LinkButton',
+        'Pages$SignOutButton',
+        // Other
+        'Pages$Snippet',
+        'Pages$SnippetCall',
+        'Pages$Header',
+        'Pages$SidebarToggleButton',
+        'Pages$MenuBar',
+        'Pages$SimpleMenuBar',
+        'Pages$NavigationTree',
+        'Pages$MenuWidget',
+        // Custom widgets (marketplace/custom)
+        'CustomWidgets$CustomWidget',
+        'CustomWidgets$CustomWidgetType',
+      ]);
 
-      // Extract widgets from layout parameters
-      const parameters = layoutCall.arguments || [];
-      for (const param of parameters) {
-        try {
-          const widget = param.widget || param.widgets?.[0];
-          if (widget) {
-            widgets.push(this.extractWidget(widget));
+      // Use the SDK's traverse method to walk all page structures
+      page.traverse((structure: any) => {
+        const typeName =
+          structure.structureTypeName || structure.constructor?.name;
+
+        if (!typeName) return;
+
+        // Track all types for debugging
+        widgetTypes.add(typeName);
+
+        // Only capture actual visual widget types
+        if (visualWidgetTypes.has(typeName)) {
+          const widgetData = this.extractWidgetFromStructure(
+            structure,
+            typeName,
+          );
+          if (widgetData) {
+            widgets.push(widgetData);
           }
-          // Handle multiple widgets in a parameter
-          if (param.widgets && param.widgets.length > 0) {
-            for (const w of param.widgets) {
-              widgets.push(this.extractWidget(w));
-            }
-          }
-        } catch {
-          // Skip problematic parameters
         }
-      }
+      });
+
+      this.logger.debug(
+        `[Widget] Page "${page.name}" - found ${widgets.length} widgets. All types seen: ${Array.from(widgetTypes).join(', ')}`,
+      );
 
       return widgets;
-    } catch {
+    } catch (err) {
+      this.logger.warn(`[Widget] Error extracting widgets from page: ${err}`);
       return [];
     }
   }
 
   /**
-   * Recursively extract widget information
+   * Extract data from a widget structure found via traverse
    */
-  private extractWidget(widget: any, depth: number = 0): any {
-    if (!widget || depth > 10) return null; // Prevent infinite recursion
+  private extractWidgetFromStructure(structure: any, typeName: string): any {
+    // Get display type name
+    let displayType = typeName
+      .replace('Pages$', '')
+      .replace('CustomWidgets$', '');
 
-    try {
-      const widgetType = widget.constructor?.name || 'Unknown';
-      const result: any = {
-        type: widgetType,
-        name: widget.name || undefined,
-      };
+    const result: any = {
+      type: displayType,
+    };
 
-      // Extract common properties based on widget type
-      if (widgetType.includes('DataView')) {
-        result.dataSource = widget.dataSource?.constructor?.name;
-        result.entity = (widget as any).entityRef?.entity?.name;
-      } else if (
-        widgetType.includes('ListView') ||
-        widgetType.includes('TemplateGrid')
-      ) {
-        result.dataSource = widget.dataSource?.constructor?.name;
-        result.entity = (widget as any).entityRef?.entity?.name;
-      } else if (widgetType.includes('Button')) {
-        result.caption = this.extractTextValue(widget.caption);
-        result.action = widget.action?.constructor?.name;
-      } else if (
-        widgetType.includes('TextBox') ||
-        widgetType.includes('Input')
-      ) {
-        result.attribute = (widget as any).attributeRef?.attribute?.name;
-        result.label = this.extractTextValue((widget as any).label);
-      } else if (widgetType.includes('Text') || widgetType.includes('Label')) {
-        result.content = this.extractTextValue(
-          widget.content || widget.caption,
-        );
-      } else if (
-        widgetType.includes('Container') ||
-        widgetType.includes('LayoutGrid')
-      ) {
-        result.class = widget.class || undefined;
+    // Helper to safely get a property value
+    const safeGet = (obj: any, prop: string): any => {
+      try {
+        return obj?.[prop];
+      } catch {
+        return undefined;
       }
+    };
 
-      // Extract child widgets recursively
-      const children: any[] = [];
-      const childWidgets = widget.widgets || widget.content?.widgets || [];
-      if (Array.isArray(childWidgets)) {
-        for (const child of childWidgets.slice(0, 50)) {
-          // Limit children to prevent huge files
-          const childData = this.extractWidget(child, depth + 1);
-          if (childData) {
-            children.push(childData);
-          }
+    // Helper to safely get nested property
+    const safeGetNested = (obj: any, ...props: string[]): any => {
+      try {
+        let value = obj;
+        for (const prop of props) {
+          value = value?.[prop];
+          if (value === undefined) return undefined;
         }
+        return value;
+      } catch {
+        return undefined;
       }
-      if (children.length > 0) {
-        result.children = children;
-      }
+    };
 
-      return result;
-    } catch {
-      return { type: 'Unknown', error: 'Failed to extract' };
+    // For custom widgets, try to get the actual widget type
+    if (typeName.includes('CustomWidget')) {
+      const widgetType =
+        safeGetNested(structure, 'type', 'widgetId') ||
+        safeGetNested(structure, 'type', 'name') ||
+        safeGet(structure, 'widgetId') ||
+        safeGetNested(structure, 'type', 'qualifiedName');
+
+      if (widgetType) {
+        const parts = String(widgetType).split('.');
+        displayType = parts[parts.length - 1] || displayType;
+        result.type = displayType;
+        result.widgetId = widgetType;
+      }
     }
+
+    // Add name if available - key for identification
+    const name = safeGet(structure, 'name');
+    if (name) result.name = name;
+
+    // Add internal ID if available
+    const id = safeGet(structure, 'id');
+    if (id) result.id = id;
+
+    // Add class/style info (common user changes)
+    const cssClass = safeGet(structure, 'class');
+    if (cssClass) result.class = cssClass;
+
+    const style = safeGet(structure, 'style');
+    if (style) result.style = style;
+
+    // Extract specific properties based on widget type
+    this.extractTypeSpecificProperties(
+      structure,
+      displayType,
+      result,
+      safeGet,
+      safeGetNested,
+    );
+
+    return result;
+  }
+
+  /**
+   * Extract type-specific properties from widgets
+   */
+  private extractTypeSpecificProperties(
+    structure: any,
+    displayType: string,
+    result: any,
+    safeGet: (obj: any, prop: string) => any,
+    safeGetNested: (obj: any, ...props: string[]) => any,
+  ): void {
+    // Text/Label widgets
+    if (
+      displayType.includes('Text') ||
+      displayType.includes('Title') ||
+      displayType.includes('Label')
+    ) {
+      const content =
+        safeGet(structure, 'content') ||
+        safeGet(structure, 'caption') ||
+        safeGet(structure, 'text');
+      const text = this.extractTextValueSafe(content);
+      if (text) result.content = text;
+    }
+
+    // Button widgets
+    if (displayType.includes('Button')) {
+      const caption = this.extractTextValueSafe(safeGet(structure, 'caption'));
+      if (caption) result.caption = caption;
+
+      const actionType = safeGetNested(
+        structure,
+        'action',
+        'constructor',
+        'name',
+      );
+      if (actionType) result.action = actionType;
+
+      const buttonStyle = safeGet(structure, 'buttonStyle');
+      if (buttonStyle) result.buttonStyle = String(buttonStyle);
+
+      const renderType = safeGet(structure, 'renderType');
+      if (renderType) result.renderType = String(renderType);
+    }
+
+    // Data widgets (DataView, ListView, etc.)
+    if (
+      displayType.includes('DataView') ||
+      displayType.includes('ListView') ||
+      displayType.includes('TemplateGrid')
+    ) {
+      const dataSourceType = safeGetNested(
+        structure,
+        'dataSource',
+        'constructor',
+        'name',
+      );
+      if (dataSourceType) result.dataSource = dataSourceType;
+
+      const entity = safeGetNested(structure, 'entityRef', 'entity', 'name');
+      if (entity) result.entity = entity;
+    }
+
+    // Input widgets (TextBox, TextArea, etc.)
+    if (
+      displayType.includes('TextBox') ||
+      displayType.includes('Input') ||
+      displayType.includes('TextArea')
+    ) {
+      const attribute = safeGetNested(
+        structure,
+        'attributeRef',
+        'attribute',
+        'name',
+      );
+      if (attribute) result.attribute = attribute;
+
+      const label = this.extractTextValueSafe(safeGet(structure, 'label'));
+      if (label) result.label = label;
+
+      const placeholder = this.extractTextValueSafe(
+        safeGet(structure, 'placeholder'),
+      );
+      if (placeholder) result.placeholder = placeholder;
+    }
+
+    // Image widgets
+    if (displayType.includes('Image')) {
+      const imageSourceType = safeGetNested(
+        structure,
+        'imageSource',
+        'constructor',
+        'name',
+      );
+      if (imageSourceType) result.imageSource = imageSourceType;
+
+      const defaultImage = safeGetNested(structure, 'defaultImage', 'name');
+      if (defaultImage) result.defaultImage = defaultImage;
+    }
+
+    // Selector widgets (DropDown, ReferenceSelector)
+    if (
+      displayType.includes('DropDown') ||
+      displayType.includes('ReferenceSelector')
+    ) {
+      const attribute = safeGetNested(
+        structure,
+        'attributeRef',
+        'attribute',
+        'name',
+      );
+      if (attribute) result.attribute = attribute;
+
+      const selectorSourceType = safeGetNested(
+        structure,
+        'selectorSource',
+        'constructor',
+        'name',
+      );
+      if (selectorSourceType) result.selectorSource = selectorSourceType;
+    }
+
+    // Layout widgets (Container, LayoutGrid, etc.)
+    if (
+      displayType.includes('Container') ||
+      displayType.includes('LayoutGrid')
+    ) {
+      const conditionalVisibility = safeGet(structure, 'conditionalVisibility');
+      if (conditionalVisibility) result.hasConditionalVisibility = true;
+    }
+
+    // Tab containers
+    if (
+      displayType.includes('TabContainer') ||
+      displayType.includes('TabPage')
+    ) {
+      const caption = safeGet(structure, 'caption');
+      if (caption) {
+        const captionText = this.extractTextValueSafe(caption);
+        result.caption = captionText || String(caption);
+      }
+    }
+
+    // GroupBox
+    if (displayType.includes('GroupBox')) {
+      const caption = this.extractTextValueSafe(safeGet(structure, 'caption'));
+      if (caption) result.caption = caption;
+
+      const collapsible = safeGet(structure, 'collapsible');
+      if (collapsible !== undefined) result.collapsible = collapsible;
+    }
+  }
+
+  /**
+   * Safe version of extractTextValue that doesn't throw
+   */
+  private extractTextValueSafe(template: any): string | null {
+    if (!template) return null;
+    try {
+      // Handle ClientTemplate, TextTemplate, etc.
+      if (template.template) {
+        return template.template;
+      }
+      if (template.text) {
+        return template.text;
+      }
+      // If it has translations, get the first one
+      if (template.translations?.length > 0) {
+        return template.translations[0].text;
+      }
+      // Direct string
+      if (typeof template === 'string') {
+        return template;
+      }
+    } catch {
+      // Ignore
+    }
+    return null;
   }
 
   /**

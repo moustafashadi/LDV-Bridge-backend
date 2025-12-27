@@ -107,8 +107,8 @@ export class GitHubService {
 
     const now = Math.floor(Date.now() / 1000);
     const payload = {
-      iat: now - 60, // 60 seconds in the past
-      exp: now + 600, // 10 minutes
+      iat: now - 30, // 30 seconds in the past (less aggressive)
+      exp: now + 300, // 5 minutes (safer, well within 10 min limit)
       iss: this.appId,
     };
 
@@ -474,8 +474,54 @@ export class GitHubService {
       );
     }
 
-    const token = await this.getInstallationToken(app.organizationId);
+    let token = await this.getInstallationToken(app.organizationId);
     const repoFullName = `${org.githubOrgName}/${app.githubRepoName}`;
+    
+    this.logger.log(`[COMMIT] Committing to repo: ${repoFullName}`);
+    this.logger.log(`[COMMIT] GitHub org: ${org.githubOrgName}, Installation ID: ${org.githubInstallationId}`);
+
+    // Check if repo exists first
+    try {
+      const repoCheck = await fetch(`https://api.github.com/repos/${repoFullName}`, {
+        headers: {
+          Accept: 'application/vnd.github+json',
+          Authorization: `Bearer ${token}`,
+          'X-GitHub-Api-Version': '2022-11-28',
+        },
+      });
+      if (!repoCheck.ok) {
+        const errorData = await repoCheck.json();
+        this.logger.warn(`[COMMIT] Repository ${repoFullName} not accessible: ${repoCheck.status} - ${errorData.message}`);
+        
+        // Try to create the repository if it doesn't exist
+        if (repoCheck.status === 404) {
+          this.logger.log(`[COMMIT] Repository not found, attempting to create it...`);
+          try {
+            await this.createAppRepository(app);
+            this.logger.log(`[COMMIT] Successfully created repository ${repoFullName}`);
+            // Get fresh token after repo creation
+            token = await this.getInstallationToken(app.organizationId);
+          } catch (createError) {
+            this.logger.error(`[COMMIT] Failed to create repository: ${createError.message}`);
+            throw new HttpException(
+              `Repository ${repoFullName} not found and could not be created: ${createError.message}`,
+              HttpStatus.NOT_FOUND,
+            );
+          }
+        } else {
+          throw new HttpException(
+            `Repository ${repoFullName} not accessible. Please ensure the GitHub App has access to this repository.`,
+            HttpStatus.FORBIDDEN,
+          );
+        }
+      } else {
+        this.logger.log(`[COMMIT] Repository ${repoFullName} is accessible`);
+      }
+    } catch (error) {
+      if (error instanceof HttpException) throw error;
+      this.logger.error(`[COMMIT] Failed to check repository: ${error.message}`);
+      throw error;
+    }
 
     // Get actual default branch from repo if not specified
     let targetBranch = branch;

@@ -182,12 +182,19 @@ export class GitHubController {
       try {
         // Try to get org name from GitHub API
         const appJwt = this.generateTempJwt();
+
+        // Decode JWT to verify contents (for debugging)
+        const jwt = require('jsonwebtoken');
+        const decoded = jwt.decode(appJwt);
+        this.logger.log(`[JWT] Decoded payload: ${JSON.stringify(decoded)}`);
+
         this.logger.log(
           `Fetching installation details for: ${dto.installationId}`,
         );
 
-        const response = await fetch(
-          `https://api.github.com/app/installations/${dto.installationId}`,
+        // First, let's list all installations to debug
+        const listResponse = await fetch(
+          `https://api.github.com/app/installations`,
           {
             headers: {
               Accept: 'application/vnd.github+json',
@@ -197,18 +204,65 @@ export class GitHubController {
           },
         );
 
-        if (response.ok) {
-          const data = await response.json();
-          orgName = data.account?.login || '';
-          accountType = data.account?.type || 'User'; // 'Organization' or 'User'
+        if (listResponse.ok) {
+          const installations = await listResponse.json();
           this.logger.log(
-            `GitHub account detected: ${orgName} (type: ${accountType})`,
+            `[GitHub] Found ${installations.length} installations for this app`,
           );
+          installations.forEach((inst: any) => {
+            this.logger.log(
+              `[GitHub] Installation: id=${inst.id}, account=${inst.account?.login}, type=${inst.account?.type}`,
+            );
+          });
+
+          // Try to find the installation in our list
+          const matchingInstallation = installations.find(
+            (inst: any) => inst.id.toString() === dto.installationId,
+          );
+
+          if (matchingInstallation) {
+            orgName = matchingInstallation.account?.login || '';
+            accountType = matchingInstallation.account?.type || 'User';
+            this.logger.log(
+              `[GitHub] Found matching installation: ${orgName} (${accountType})`,
+            );
+          } else {
+            this.logger.warn(
+              `[GitHub] Installation ${dto.installationId} not found in app's installations`,
+            );
+            // Maybe the installation ID is from a different app?
+          }
         } else {
-          const errorText = await response.text();
+          const errorText = await listResponse.text();
           this.logger.warn(
-            `GitHub API returned ${response.status}: ${errorText}`,
+            `[GitHub] Failed to list installations: ${listResponse.status} - ${errorText}`,
           );
+
+          // Fall back to direct fetch
+          const response = await fetch(
+            `https://api.github.com/app/installations/${dto.installationId}`,
+            {
+              headers: {
+                Accept: 'application/vnd.github+json',
+                Authorization: `Bearer ${appJwt}`,
+                'X-GitHub-Api-Version': '2022-11-28',
+              },
+            },
+          );
+
+          if (response.ok) {
+            const data = await response.json();
+            orgName = data.account?.login || '';
+            accountType = data.account?.type || 'User';
+            this.logger.log(
+              `GitHub account detected: ${orgName} (type: ${accountType})`,
+            );
+          } else {
+            const errorText = await response.text();
+            this.logger.warn(
+              `GitHub API returned ${response.status}: ${errorText}`,
+            );
+          }
         }
       } catch (error) {
         this.logger.warn(`Could not fetch org name: ${error}`);
@@ -326,8 +380,25 @@ export class GitHubController {
     let key = privateKey;
     if (!key && privateKeyPath) {
       const fs = require('fs');
-      if (fs.existsSync(privateKeyPath)) {
-        key = fs.readFileSync(privateKeyPath, 'utf8');
+      const path = require('path');
+
+      // Resolve relative paths from the project root (backend folder)
+      let resolvedPath = privateKeyPath;
+      if (!path.isAbsolute(privateKeyPath)) {
+        resolvedPath = path.resolve(process.cwd(), privateKeyPath);
+      }
+
+      this.logger.debug(`[JWT] Private key path: ${privateKeyPath}`);
+      this.logger.debug(`[JWT] Resolved path: ${resolvedPath}`);
+      this.logger.debug(`[JWT] Current working dir: ${process.cwd()}`);
+
+      if (fs.existsSync(resolvedPath)) {
+        key = fs.readFileSync(resolvedPath, 'utf8');
+        this.logger.debug(
+          `[JWT] Successfully loaded key from file (${key?.length || 0} chars)`,
+        );
+      } else {
+        this.logger.error(`[JWT] Private key file not found: ${resolvedPath}`);
       }
     }
 
@@ -338,10 +409,51 @@ export class GitHubController {
     const jwt = require('jsonwebtoken');
     const now = Math.floor(Date.now() / 1000);
 
-    return jwt.sign(
-      { iat: now - 60, exp: now + 600, iss: appId },
-      key.replace(/\\n/g, '\n'),
-      { algorithm: 'RS256' },
+    // GitHub JWTs must expire within 10 minutes, use 5 minutes to be safe
+    // iat should be no more than 60 seconds in the past
+    const payload = {
+      iat: now - 30, // 30 seconds in the past (less aggressive)
+      exp: now + 300, // 5 minutes (well within 10 min limit)
+      iss: appId,
+    };
+
+    this.logger.debug(
+      `[JWT] Generating JWT with iat=${payload.iat}, exp=${payload.exp}, now=${now}`,
     );
+    this.logger.debug(`[JWT] Current time: ${new Date().toISOString()}`);
+    this.logger.debug(
+      `[JWT] Token valid from: ${new Date(payload.iat * 1000).toISOString()}`,
+    );
+    this.logger.debug(
+      `[JWT] Token expires at: ${new Date(payload.exp * 1000).toISOString()}`,
+    );
+
+    // Process the key - handle both escaped newlines and base64 encoded keys
+    let processedKey = key;
+
+    // If key contains literal \n (escaped), replace with actual newlines
+    if (key.includes('\\n')) {
+      processedKey = key.replace(/\\n/g, '\n');
+    }
+
+    // Debug key format
+    this.logger.debug(`[JWT] Key length: ${processedKey.length} chars`);
+    this.logger.debug(
+      `[JWT] Key starts with: ${processedKey.substring(0, 40)}...`,
+    );
+    this.logger.debug(
+      `[JWT] Key ends with: ...${processedKey.substring(processedKey.length - 40)}`,
+    );
+
+    // Verify key format
+    if (
+      !processedKey.includes('-----BEGIN RSA PRIVATE KEY-----') &&
+      !processedKey.includes('-----BEGIN PRIVATE KEY-----')
+    ) {
+      this.logger.error(`[JWT] Private key does not have valid PEM header!`);
+      this.logger.error(`[JWT] Key preview: ${processedKey.substring(0, 100)}`);
+    }
+
+    return jwt.sign(payload, processedKey, { algorithm: 'RS256' });
   }
 }
