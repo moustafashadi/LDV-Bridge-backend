@@ -36,6 +36,7 @@ export enum SandboxStatus {
 
   // Workflow statuses (aligned with Prisma SandboxStatus)
   ACTIVE = 'ACTIVE', // Environment ready / Citizen dev actively working
+  SUBMITTING = 'SUBMITTING', // In process of submitting (prevents duplicate submissions)
   PENDING_REVIEW = 'PENDING_REVIEW', // Submitted for Pro Dev review
   CHANGES_REQUESTED = 'CHANGES_REQUESTED', // Pro Dev requested changes
   MERGED = 'MERGED', // Approved and merged to main
