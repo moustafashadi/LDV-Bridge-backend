@@ -1,7 +1,12 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
-import Anthropic from '@anthropic-ai/sdk';
+import {
+  AIProvider,
+  AnthropicProvider,
+  OpenAIProvider,
+  GeminiProvider,
+} from './providers';
 
 export interface BridgeAIAnalysis {
   id: string;
@@ -11,6 +16,8 @@ export interface BridgeAIAnalysis {
   overallAssessment: 'safe' | 'warning' | 'critical';
   summary: string;
   recommendations: string[];
+  provider?: string;
+  model?: string;
   rawResponse?: string;
 }
 
@@ -22,40 +29,108 @@ export interface SecurityConcern {
   remediation?: string;
 }
 
+export type AIProviderName = 'anthropic' | 'openai' | 'gemini';
+
+export interface AIProviderStatus {
+  name: AIProviderName;
+  available: boolean;
+  model: string;
+}
+
 @Injectable()
 export class BridgeAIService {
   private readonly logger = new Logger(BridgeAIService.name);
-  private anthropic: Anthropic | null = null;
+  private providers: Map<AIProviderName, AIProvider> = new Map();
+  private providerPriority: AIProviderName[] = ['anthropic', 'openai', 'gemini'];
 
   constructor(
     private readonly configService: ConfigService,
     private readonly prisma: PrismaService,
   ) {
-    const apiKey = this.configService.get<string>('ANTHROPIC_API_KEY');
-    if (apiKey) {
-      this.anthropic = new Anthropic({ apiKey });
-      this.logger.log('BridgeAI initialized with Anthropic Claude');
+    this.initializeProviders();
+  }
+
+  /**
+   * Initialize all configured AI providers
+   */
+  private initializeProviders(): void {
+    // Anthropic Claude
+    const anthropicKey = this.configService.get<string>('ANTHROPIC_API_KEY');
+    if (anthropicKey) {
+      this.providers.set('anthropic', new AnthropicProvider(anthropicKey));
+      this.logger.log('✅ Anthropic Claude provider configured');
+    }
+
+    // OpenAI GPT-4
+    const openaiKey = this.configService.get<string>('OPENAI_API_KEY');
+    if (openaiKey) {
+      this.providers.set('openai', new OpenAIProvider(openaiKey));
+      this.logger.log('✅ OpenAI GPT-4 provider configured');
+    }
+
+    // Google Gemini
+    const geminiKey = this.configService.get<string>('GOOGLE_GEMINI_API_KEY');
+    if (geminiKey) {
+      this.providers.set('gemini', new GeminiProvider(geminiKey));
+      this.logger.log('✅ Google Gemini provider configured');
+    }
+
+    // Set priority from config if specified
+    const priorityConfig = this.configService.get<string>('AI_PROVIDER_PRIORITY');
+    if (priorityConfig) {
+      const priority = priorityConfig.split(',').map(p => p.trim() as AIProviderName);
+      this.providerPriority = priority.filter(p => this.providers.has(p));
+    }
+
+    if (this.providers.size === 0) {
+      this.logger.warn('⚠️ No AI providers configured - BridgeAI features will be disabled');
     } else {
-      this.logger.warn('ANTHROPIC_API_KEY not configured - BridgeAI features will be disabled');
+      this.logger.log(`BridgeAI initialized with ${this.providers.size} provider(s): ${Array.from(this.providers.keys()).join(', ')}`);
+      this.logger.log(`Provider priority: ${this.providerPriority.join(' → ')}`);
     }
   }
 
   /**
-   * Check if BridgeAI is available
+   * Check if any AI provider is available
    */
   isAvailable(): boolean {
-    return this.anthropic !== null;
+    return this.providers.size > 0 && this.providerPriority.some(p => this.providers.get(p)?.isAvailable());
   }
 
   /**
-   * Analyze a change using Claude AI
+   * Get status of all providers
+   */
+  getProvidersStatus(): AIProviderStatus[] {
+    return Array.from(this.providers.entries()).map(([name, provider]) => ({
+      name,
+      available: provider.isAvailable(),
+      model: provider.getModel(),
+    }));
+  }
+
+  /**
+   * Get the currently active provider (highest priority available)
+   */
+  getActiveProvider(): AIProvider | null {
+    for (const name of this.providerPriority) {
+      const provider = this.providers.get(name);
+      if (provider?.isAvailable()) {
+        return provider;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Analyze a change using AI with automatic fallback
    */
   async analyzeChange(
     changeId: string,
     organizationId: string,
+    preferredProvider?: AIProviderName,
   ): Promise<BridgeAIAnalysis> {
-    if (!this.anthropic) {
-      throw new Error('BridgeAI is not configured. Please set ANTHROPIC_API_KEY.');
+    if (!this.isAvailable()) {
+      throw new Error('No AI providers configured. Please set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GOOGLE_GEMINI_API_KEY.');
     }
 
     this.logger.log(`Starting BridgeAI analysis for change ${changeId}`);
@@ -82,7 +157,7 @@ export class BridgeAIService {
     // Prepare the code diff context
     const diffContext = this.prepareDiffContext(diffSummary, beforeCode, afterCode);
 
-    // Create the prompt for Claude
+    // Create the prompt
     const prompt = this.createSecurityAnalysisPrompt(
       change.app?.name || 'Unknown App',
       change.app?.platform || 'MENDIX',
@@ -92,37 +167,58 @@ export class BridgeAIService {
       riskAssessment,
     );
 
-    try {
-      // Call Claude API
-      const response = await this.anthropic.messages.create({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 4096,
-        messages: [
-          {
-            role: 'user',
-            content: prompt,
-          },
-        ],
-      });
-
-      // Parse the response
-      const content = response.content[0];
-      if (content.type !== 'text') {
-        throw new Error('Unexpected response format from Claude');
-      }
-
-      const analysis = this.parseClaudeResponse(content.text, changeId);
-
-      // Store the analysis in the database
-      await this.storeAnalysis(changeId, analysis, content.text);
-
-      this.logger.log(`BridgeAI analysis completed for change ${changeId}: ${analysis.overallAssessment}`);
-
-      return analysis;
-    } catch (error) {
-      this.logger.error(`BridgeAI analysis failed: ${error.message}`, error.stack);
-      throw error;
+    // Build provider list (preferred first, then by priority)
+    const providersToTry: AIProviderName[] = [];
+    if (preferredProvider && this.providers.has(preferredProvider)) {
+      providersToTry.push(preferredProvider);
     }
+    for (const name of this.providerPriority) {
+      if (!providersToTry.includes(name) && this.providers.has(name)) {
+        providersToTry.push(name);
+      }
+    }
+
+    let lastError: Error | null = null;
+
+    // Try each provider until one succeeds
+    for (const providerName of providersToTry) {
+      const provider = this.providers.get(providerName);
+      if (!provider?.isAvailable()) continue;
+
+      try {
+        this.logger.log(`Trying ${providerName} provider...`);
+        
+        const response = await provider.analyze(prompt);
+        
+        // Parse the response
+        const analysis = this.parseAIResponse(response.content, changeId, providerName, provider.getModel());
+
+        // Store the analysis in the database
+        await this.storeAnalysis(changeId, analysis, response.content);
+
+        this.logger.log(`BridgeAI analysis completed using ${providerName} for change ${changeId}: ${analysis.overallAssessment}`);
+
+        return analysis;
+      } catch (error: any) {
+        this.logger.warn(`${providerName} provider failed: ${error.message}`);
+        lastError = error;
+
+        // Check if we should try next provider
+        if (error.message?.includes('CREDITS_EXHAUSTED') || 
+            error.message?.includes('RATE_LIMITED') ||
+            error.message?.includes('INVALID_API_KEY')) {
+          this.logger.log(`Falling back to next provider...`);
+          continue;
+        }
+
+        // For other errors, still try next provider
+        continue;
+      }
+    }
+
+    // All providers failed
+    this.logger.error('All AI providers failed');
+    throw new Error(lastError?.message || 'All AI providers failed. Please check your API keys and quotas.');
   }
 
   /**
@@ -159,6 +255,19 @@ export class BridgeAIService {
       parts.push(`- Modifications: ${diffSummary.modified || 0}`);
       parts.push(`- Deletions: ${diffSummary.deleted || 0}`);
       parts.push('');
+
+      // Include raw diff if available
+      if (diffSummary.rawDiff) {
+        parts.push(`## Raw Diff`);
+        parts.push('```diff');
+        // Truncate if too long
+        const rawDiff = diffSummary.rawDiff.length > 8000 
+          ? diffSummary.rawDiff.substring(0, 8000) + '\n...(truncated)'
+          : diffSummary.rawDiff;
+        parts.push(rawDiff);
+        parts.push('```');
+        parts.push('');
+      }
 
       // Include categorized changes
       if (diffSummary.categories) {
@@ -257,7 +366,7 @@ export class BridgeAIService {
   }
 
   /**
-   * Create the security analysis prompt for Claude
+   * Create the security analysis prompt
    */
   private createSecurityAnalysisPrompt(
     appName: string,
@@ -305,7 +414,7 @@ Analyze the code changes for security concerns. Focus on:
    - Is data validation sufficient?
 
 ## Response Format
-Respond in the following JSON format:
+Respond ONLY with the following JSON (no other text):
 \`\`\`json
 {
   "overallAssessment": "safe" | "warning" | "critical",
@@ -330,16 +439,21 @@ If no security concerns are found, return an empty array for securityConcerns an
   }
 
   /**
-   * Parse Claude's response into structured format
+   * Parse AI response into structured format
    */
-  private parseClaudeResponse(response: string, changeId: string): BridgeAIAnalysis {
+  private parseAIResponse(
+    response: string, 
+    changeId: string, 
+    provider: string,
+    model: string,
+  ): BridgeAIAnalysis {
     try {
       // Extract JSON from response (it might be wrapped in markdown code blocks)
       const jsonMatch = response.match(/```json\s*([\s\S]*?)\s*```/) || 
                        response.match(/\{[\s\S]*\}/);
       
       if (!jsonMatch) {
-        throw new Error('No JSON found in Claude response');
+        throw new Error('No JSON found in AI response');
       }
 
       const jsonStr = jsonMatch[1] || jsonMatch[0];
@@ -353,10 +467,12 @@ If no security concerns are found, return an empty array for securityConcerns an
         overallAssessment: parsed.overallAssessment || 'safe',
         summary: parsed.summary || 'No summary available',
         recommendations: parsed.recommendations || [],
+        provider,
+        model,
         rawResponse: response,
       };
-    } catch (error) {
-      this.logger.error(`Failed to parse Claude response: ${error.message}`);
+    } catch (error: any) {
+      this.logger.error(`Failed to parse AI response: ${error.message}`);
       
       // Return a fallback analysis
       return {
@@ -367,6 +483,8 @@ If no security concerns are found, return an empty array for securityConcerns an
         overallAssessment: 'warning',
         summary: 'AI analysis completed but response parsing failed. Manual review recommended.',
         recommendations: ['Review the change manually due to AI parsing issues'],
+        provider,
+        model,
         rawResponse: response,
       };
     }
