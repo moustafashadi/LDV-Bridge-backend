@@ -61,7 +61,7 @@ export class ReviewsController {
   ) {
     return this.reviewsService.submitForReview(
       changeId,
-      req.user.userId,
+      req.user.id,
       req.user.organizationId,
       submitForReviewDto,
     );
@@ -70,11 +70,34 @@ export class ReviewsController {
   @Get()
   @Roles(UserRole.PRO_DEVELOPER, UserRole.ADMIN)
   @ApiOperation({ summary: 'Get all reviews with filters' })
-  @ApiQuery({ name: 'changeId', required: false, description: 'Filter by change ID' })
-  @ApiQuery({ name: 'reviewerId', required: false, description: 'Filter by reviewer ID' })
-  @ApiQuery({ name: 'status', required: false, enum: ReviewStatus, description: 'Filter by status' })
-  @ApiQuery({ name: 'page', required: false, type: Number, description: 'Page number (default: 1)' })
-  @ApiQuery({ name: 'limit', required: false, type: Number, description: 'Items per page (default: 20)' })
+  @ApiQuery({
+    name: 'changeId',
+    required: false,
+    description: 'Filter by change ID',
+  })
+  @ApiQuery({
+    name: 'reviewerId',
+    required: false,
+    description: 'Filter by reviewer ID',
+  })
+  @ApiQuery({
+    name: 'status',
+    required: false,
+    enum: ReviewStatus,
+    description: 'Filter by status',
+  })
+  @ApiQuery({
+    name: 'page',
+    required: false,
+    type: Number,
+    description: 'Page number (default: 1)',
+  })
+  @ApiQuery({
+    name: 'limit',
+    required: false,
+    type: Number,
+    description: 'Items per page (default: 20)',
+  })
   @ApiResponse({
     status: 200,
     description: 'List of reviews',
@@ -100,8 +123,18 @@ export class ReviewsController {
   @Get('metrics')
   @Roles(UserRole.PRO_DEVELOPER, UserRole.ADMIN)
   @ApiOperation({ summary: 'Get review metrics for the organization' })
-  @ApiQuery({ name: 'from', required: false, type: Date, description: 'Start date for metrics' })
-  @ApiQuery({ name: 'to', required: false, type: Date, description: 'End date for metrics' })
+  @ApiQuery({
+    name: 'from',
+    required: false,
+    type: Date,
+    description: 'Start date for metrics',
+  })
+  @ApiQuery({
+    name: 'to',
+    required: false,
+    type: Date,
+    description: 'End date for metrics',
+  })
   @ApiResponse({
     status: 200,
     description: 'Review metrics',
@@ -116,7 +149,10 @@ export class ReviewsController {
     if (from) filters.from = new Date(from);
     if (to) filters.to = new Date(to);
 
-    return this.reviewsService.getReviewMetrics(req.user.organizationId, filters);
+    return this.reviewsService.getReviewMetrics(
+      req.user.organizationId,
+      filters,
+    );
   }
 
   @Get(':id')
@@ -129,7 +165,10 @@ export class ReviewsController {
     type: ReviewResponseDto,
   })
   @ApiResponse({ status: 404, description: 'Review not found' })
-  async findOne(@Param('id') id: string, @Request() req: any): Promise<ReviewResponseDto> {
+  async findOne(
+    @Param('id') id: string,
+    @Request() req: any,
+  ): Promise<ReviewResponseDto> {
     return this.reviewsService.findOne(id, req.user.organizationId);
   }
 
@@ -144,8 +183,15 @@ export class ReviewsController {
     type: ReviewResponseDto,
   })
   @ApiResponse({ status: 404, description: 'Review not found' })
-  async startReview(@Param('id') id: string, @Request() req: any): Promise<ReviewResponseDto> {
-    return this.reviewsService.startReview(id, req.user.userId, req.user.organizationId);
+  async startReview(
+    @Param('id') id: string,
+    @Request() req: any,
+  ): Promise<ReviewResponseDto> {
+    return this.reviewsService.startReview(
+      id,
+      req.user.id,
+      req.user.organizationId,
+    );
   }
 
   @Post(':id/approve')
@@ -165,7 +211,7 @@ export class ReviewsController {
   ) {
     return this.reviewsService.approve(
       id,
-      req.user.userId,
+      req.user.id,
       req.user.organizationId,
       reviewDecisionDto,
     );
@@ -189,7 +235,7 @@ export class ReviewsController {
   ): Promise<ReviewResponseDto> {
     return this.reviewsService.reject(
       id,
-      req.user.userId,
+      req.user.id,
       req.user.organizationId,
       reviewDecisionDto,
     );
@@ -213,7 +259,7 @@ export class ReviewsController {
   ): Promise<ReviewResponseDto> {
     return this.reviewsService.requestChanges(
       id,
-      req.user.userId,
+      req.user.id,
       req.user.organizationId,
       reviewDecisionDto,
     );
@@ -238,7 +284,7 @@ export class ReviewsController {
   ): Promise<CommentResponseDto> {
     return this.commentsService.create(
       changeId,
-      req.user.userId,
+      req.user.id,
       req.user.organizationId,
       createCommentDto,
     );
@@ -276,7 +322,7 @@ export class ReviewsController {
   ): Promise<CommentResponseDto> {
     return this.commentsService.update(
       commentId,
-      req.user.userId,
+      req.user.id,
       req.user.organizationId,
       updateCommentDto,
     );
@@ -288,11 +334,14 @@ export class ReviewsController {
   @ApiParam({ name: 'commentId', description: 'ID of the comment' })
   @ApiResponse({ status: 204, description: 'Comment deleted successfully' })
   @ApiResponse({ status: 404, description: 'Comment not found' })
-  async deleteComment(@Param('commentId') commentId: string, @Request() req: any): Promise<void> {
+  async deleteComment(
+    @Param('commentId') commentId: string,
+    @Request() req: any,
+  ): Promise<void> {
     const isAdmin = req.user.role === UserRole.ADMIN;
     return this.commentsService.delete(
       commentId,
-      req.user.userId,
+      req.user.id,
       req.user.organizationId,
       isAdmin,
     );
@@ -313,7 +362,7 @@ export class ReviewsController {
   ): Promise<CommentResponseDto> {
     return this.commentsService.resolve(
       commentId,
-      req.user.userId,
+      req.user.id,
       req.user.organizationId,
     );
   }
@@ -333,7 +382,7 @@ export class ReviewsController {
   ): Promise<CommentResponseDto> {
     return this.commentsService.unresolve(
       commentId,
-      req.user.userId,
+      req.user.id,
       req.user.organizationId,
     );
   }

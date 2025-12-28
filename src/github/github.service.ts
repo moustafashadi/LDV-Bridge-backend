@@ -476,33 +476,46 @@ export class GitHubService {
 
     let token = await this.getInstallationToken(app.organizationId);
     const repoFullName = `${org.githubOrgName}/${app.githubRepoName}`;
-    
+
     this.logger.log(`[COMMIT] Committing to repo: ${repoFullName}`);
-    this.logger.log(`[COMMIT] GitHub org: ${org.githubOrgName}, Installation ID: ${org.githubInstallationId}`);
+    this.logger.log(
+      `[COMMIT] GitHub org: ${org.githubOrgName}, Installation ID: ${org.githubInstallationId}`,
+    );
 
     // Check if repo exists first
     try {
-      const repoCheck = await fetch(`https://api.github.com/repos/${repoFullName}`, {
-        headers: {
-          Accept: 'application/vnd.github+json',
-          Authorization: `Bearer ${token}`,
-          'X-GitHub-Api-Version': '2022-11-28',
+      const repoCheck = await fetch(
+        `https://api.github.com/repos/${repoFullName}`,
+        {
+          headers: {
+            Accept: 'application/vnd.github+json',
+            Authorization: `Bearer ${token}`,
+            'X-GitHub-Api-Version': '2022-11-28',
+          },
         },
-      });
+      );
       if (!repoCheck.ok) {
         const errorData = await repoCheck.json();
-        this.logger.warn(`[COMMIT] Repository ${repoFullName} not accessible: ${repoCheck.status} - ${errorData.message}`);
-        
+        this.logger.warn(
+          `[COMMIT] Repository ${repoFullName} not accessible: ${repoCheck.status} - ${errorData.message}`,
+        );
+
         // Try to create the repository if it doesn't exist
         if (repoCheck.status === 404) {
-          this.logger.log(`[COMMIT] Repository not found, attempting to create it...`);
+          this.logger.log(
+            `[COMMIT] Repository not found, attempting to create it...`,
+          );
           try {
             await this.createAppRepository(app);
-            this.logger.log(`[COMMIT] Successfully created repository ${repoFullName}`);
+            this.logger.log(
+              `[COMMIT] Successfully created repository ${repoFullName}`,
+            );
             // Get fresh token after repo creation
             token = await this.getInstallationToken(app.organizationId);
           } catch (createError) {
-            this.logger.error(`[COMMIT] Failed to create repository: ${createError.message}`);
+            this.logger.error(
+              `[COMMIT] Failed to create repository: ${createError.message}`,
+            );
             throw new HttpException(
               `Repository ${repoFullName} not found and could not be created: ${createError.message}`,
               HttpStatus.NOT_FOUND,
@@ -519,7 +532,9 @@ export class GitHubService {
       }
     } catch (error) {
       if (error instanceof HttpException) throw error;
-      this.logger.error(`[COMMIT] Failed to check repository: ${error.message}`);
+      this.logger.error(
+        `[COMMIT] Failed to check repository: ${error.message}`,
+      );
       throw error;
     }
 
@@ -1226,6 +1241,78 @@ export class GitHubService {
       deletions: f.deletions,
       patch: f.patch,
     }));
+  }
+
+  /**
+   * Get file content at a specific commit SHA
+   */
+  async getFileContentAtCommit(
+    repoFullName: string,
+    filePath: string,
+    commitSha: string,
+    organizationId: string,
+  ): Promise<string | null> {
+    try {
+      const token = await this.getInstallationToken(organizationId);
+
+      const response = await fetch(
+        `https://api.github.com/repos/${repoFullName}/contents/${filePath}?ref=${commitSha}`,
+        {
+          headers: {
+            Accept: 'application/vnd.github.raw+json',
+            Authorization: `Bearer ${token}`,
+            'X-GitHub-Api-Version': '2022-11-28',
+          },
+        },
+      );
+
+      if (!response.ok) {
+        if (response.status === 404) {
+          return null; // File doesn't exist at this commit
+        }
+        throw new Error(`Failed to fetch file: ${response.statusText}`);
+      }
+
+      return await response.text();
+    } catch (error) {
+      this.logger.warn(
+        `Failed to get file content at ${commitSha}: ${error.message}`,
+      );
+      return null;
+    }
+  }
+
+  /**
+   * Get raw diff content between two commits (unified diff format)
+   */
+  async getRawDiff(
+    repoFullName: string,
+    base: string,
+    head: string,
+    organizationId: string,
+  ): Promise<string> {
+    const token = await this.getInstallationToken(organizationId);
+
+    const response = await fetch(
+      `https://api.github.com/repos/${repoFullName}/compare/${base}...${head}`,
+      {
+        headers: {
+          Accept: 'application/vnd.github.diff',
+          Authorization: `Bearer ${token}`,
+          'X-GitHub-Api-Version': '2022-11-28',
+        },
+      },
+    );
+
+    if (!response.ok) {
+      const error = await response.text();
+      throw new HttpException(
+        error || 'Failed to get raw diff',
+        HttpStatus.BAD_GATEWAY,
+      );
+    }
+
+    return await response.text();
   }
 
   // ========================================

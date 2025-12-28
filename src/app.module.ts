@@ -27,6 +27,7 @@ import { AppsModule } from './apps/apps.module';
 import { LinkedEnvironmentsModule } from './connectors/powerapps/linked-environments/linked-environments.module';
 import { GitHubModule } from './github/github.module';
 import { CicdModule } from './cicd/cicd.module';
+import { BridgeAIModule } from './ai/bridge-ai.module';
 
 @Module({
   imports: [
@@ -68,6 +69,7 @@ import { CicdModule } from './cicd/cicd.module';
     LinkedEnvironmentsModule, // Linked external environments (PowerApps)
     GitHubModule, // GitHub integration for version control
     CicdModule, // CI/CD pipeline integration with GitHub Actions
+    BridgeAIModule, // AI-powered security analysis with Anthropic Claude
   ],
   controllers: [AppController],
   providers: [

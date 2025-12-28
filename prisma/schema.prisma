@@ -405,6 +405,7 @@ model Change {
   diffSummary    Json? // Parsed diff summary
   riskScore      Int? // 0-100
   riskAssessment Json? // Risk analysis details
+  aiAnalysis     Json? // BridgeAI analysis results (stored for audit trail)
   submittedAt    DateTime?
   deletedAt      DateTime? // Soft delete timestamp
   deletedBy      String? // User who deleted/undid the change
@@ -512,6 +513,7 @@ enum SandboxStatus {
   
   // Workflow statuses (for feature sandbox development)
   ACTIVE              // Citizen dev is actively working
+  SUBMITTING          // In process of submitting for review (prevents duplicate submissions)
   PENDING_REVIEW      // Submitted, waiting for Pro Dev review
   CHANGES_REQUESTED   // Pro Dev requested changes
   MERGED              // Approved and merged to main

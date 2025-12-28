@@ -847,6 +847,10 @@ export class SandboxesService {
           orderBy: { createdAt: 'desc' },
           take: 1,
           include: {
+            gitCommits: {
+              orderBy: { createdAt: 'desc' },
+              take: 1,
+            },
             reviews: {
               include: {
                 reviewer: {
@@ -955,10 +959,23 @@ export class SandboxesService {
             diffSummary: latestChange.diffSummary,
             beforeMetadata: latestChange.beforeMetadata,
             afterMetadata: latestChange.afterMetadata,
+            beforeCode: latestChange.beforeCode,
+            afterCode: latestChange.afterCode,
             pipelineStatus: latestChange.pipelineStatus,
             pipelineUrl: latestChange.pipelineUrl,
             pipelineResults: latestChange.pipelineResults,
             createdAt: latestChange.createdAt,
+            // Git commit info for GitHub links
+            gitCommit: (latestChange as any).gitCommits?.[0]
+              ? {
+                  commitSha: (latestChange as any).gitCommits[0].commitSha,
+                  commitUrl: (latestChange as any).gitCommits[0].commitUrl,
+                  commitMessage: (latestChange as any).gitCommits[0]
+                    .commitMessage,
+                  branch: (latestChange as any).gitCommits[0].branch,
+                  repository: (latestChange as any).gitCommits[0].repository,
+                }
+              : null,
           }
         : null,
       review: review
@@ -1740,248 +1757,293 @@ export class SandboxesService {
   ): Promise<SandboxResponseDto> {
     this.logger.log(`Submitting sandbox ${sandboxId} for review`);
 
-    const sandbox = await this.getRawSandbox(sandboxId, organizationId);
-
-    // Validate status
-    if (
-      sandbox.status !== SandboxStatus.ACTIVE &&
-      sandbox.status !== SandboxStatus.CHANGES_REQUESTED
-    ) {
-      throw new BadRequestException(
-        `Cannot submit sandbox in status ${sandbox.status}. Sandbox must be ACTIVE or CHANGES_REQUESTED.`,
-      );
-    }
-
-    // Check for conflicts first
-    const conflictCheck = await this.checkConflicts(
-      sandboxId,
-      userId,
-      organizationId,
-    );
-    if (conflictCheck.hasConflicts) {
-      // Update status to NEEDS_RESOLUTION
-      await this.prisma.sandbox.update({
-        where: { id: sandboxId },
-        data: { conflictStatus: 'NEEDS_RESOLUTION' },
+    // Use a transaction with optimistic locking to prevent duplicate submissions
+    const sandbox = await this.prisma.$transaction(async (tx) => {
+      const sandbox = await tx.sandbox.findFirst({
+        where: {
+          id: sandboxId,
+          organizationId,
+        },
+        include: {
+          app: true,
+          createdBy: {
+            select: { id: true, email: true, name: true },
+          },
+        },
       });
 
-      throw new BadRequestException(
-        'Cannot submit: main branch has changed and conflicts were detected. A Pro Developer will help resolve this.',
-      );
-    }
+      if (!sandbox) {
+        throw new NotFoundException(`Sandbox ${sandboxId} not found`);
+      }
 
-    // Get app details for Mendix/GitHub operations
-    const app = sandbox.appId
-      ? await this.prisma.app.findFirst({
-          where: { id: sandbox.appId, organizationId },
-        })
-      : null;
-
-    if (!app) {
-      throw new BadRequestException(
-        'Sandbox is not linked to an app. Cannot submit for review.',
-      );
-    }
-
-    // Get user's Mendix PAT for API calls
-    const userConnection = await this.prisma.userConnection.findFirst({
-      where: {
-        userId,
-        platform: 'MENDIX',
-        isActive: true,
-      },
-    });
-
-    if (!userConnection) {
-      throw new BadRequestException(
-        'No Mendix connection found. Please connect your Mendix account.',
-      );
-    }
-
-    // Get PAT from metadata (Mendix stores PAT there) or fallback to accessToken
-    const metadata = userConnection.metadata as any;
-    const mendixPat = metadata?.pat || userConnection.accessToken;
-    const mendixAppId = app.externalId;
-
-    // Get projectId from app metadata - required for Platform SDK
-    const appMetadata = app.metadata as any;
-    const projectId =
-      appMetadata?.projectId || appMetadata?.metadata?.projectId;
-
-    if (!mendixAppId || !mendixPat) {
-      throw new BadRequestException(
-        'Missing Mendix app ID or PAT. Cannot export model.',
-      );
-    }
-
-    this.logger.log(
-      `Sync: mendixAppId=${mendixAppId}, projectId=${projectId}, PAT length=${mendixPat?.length}`,
-    );
-
-    // Verify the Mendix branch exists before proceeding
-    try {
-      const branches = await this.mendixService.listBranches(
-        userId,
-        organizationId,
-        mendixAppId,
-      );
-      const branchExists = branches.some(
-        (b) => b.name === sandbox.mendixBranch,
-      );
-      if (!branchExists) {
+      // Validate status - only allow ACTIVE or CHANGES_REQUESTED
+      if (
+        sandbox.status !== SandboxStatus.ACTIVE &&
+        sandbox.status !== SandboxStatus.CHANGES_REQUESTED
+      ) {
         throw new BadRequestException(
-          `Mendix branch "${sandbox.mendixBranch}" does not exist. The branch may have failed to create. Please abandon this sandbox and create a new one.`,
+          `Cannot submit sandbox in status ${sandbox.status}. Sandbox must be ACTIVE or CHANGES_REQUESTED.`,
         );
       }
-    } catch (branchCheckError) {
-      if (branchCheckError instanceof BadRequestException) {
-        throw branchCheckError;
-      }
-      this.logger.warn(
-        `Could not verify branch existence: ${branchCheckError.message}`,
-      );
-      // Continue anyway - the export will fail if branch doesn't exist
-    }
 
-    // Step 1: Export Mendix model via SDK
-    let exportPath: string;
-    try {
-      this.logger.log(
-        `Exporting Mendix model for app ${mendixAppId} branch ${sandbox.mendixBranch}`,
-      );
-      exportPath = await this.mendixModelSdkService.exportFullModel(
-        mendixAppId,
-        mendixPat,
-        sandbox.mendixBranch || 'main',
-        projectId, // Pass projectId for SDK (UUID required, not subdomain)
-      );
-      this.logger.log(`Model exported to ${exportPath}`);
-    } catch (error) {
-      this.logger.error(`Failed to export Mendix model: ${error.message}`);
-      throw new BadRequestException(
-        `Failed to export Mendix model: ${error.message}`,
-      );
-    }
+      // Immediately update status to SUBMITTING to prevent duplicate submissions
+      await tx.sandbox.update({
+        where: { id: sandboxId },
+        data: { status: SandboxStatus.SUBMITTING },
+      });
 
-    // Step 2: Commit to GitHub sandbox branch
-    let commitResult: {
-      commit: { sha: string; html_url: string };
-      branch: string;
-    };
-    try {
-      this.logger.log(
-        `Committing model to GitHub branch ${sandbox.githubBranch}`,
-      );
-      const commitInfo = await this.githubService.commitAppSnapshot(
-        app as any,
-        exportPath,
-        `[Sandbox] Submit for review: ${sandbox.name}`,
-        sandbox.githubBranch || undefined,
-      );
-      commitResult = {
-        commit: commitInfo,
-        branch: sandbox.githubBranch || 'main',
-      };
-      this.logger.log(`Committed to GitHub: ${commitInfo.sha}`);
-    } catch (error) {
-      this.logger.error(`Failed to commit to GitHub: ${error.message}`);
-      throw new BadRequestException(
-        `Failed to commit to GitHub: ${error.message}`,
-      );
-    }
-
-    // Save the previous SHA before updating (for incremental change detection)
-    const previousGithubSha = (sandbox as any).latestGithubSha;
-
-    // Update sandbox with latest GitHub SHA
-    await this.prisma.sandbox.update({
-      where: { id: sandboxId },
-      data: {
-        latestGithubSha: commitResult.commit.sha,
-      },
+      return sandbox;
     });
 
-    // Step 3: Trigger change detection (creates Change records with before/after diffs)
-    let changeDetectionResult: { success: boolean; changeCount: number };
     try {
-      this.logger.log(`Triggering change detection for sandbox ${sandboxId}`);
-      changeDetectionResult = await this.changesService.syncSandbox(
+      // Proceed with submission (now safe from duplicate calls)
+
+      // Check for conflicts first
+      const conflictCheck = await this.checkConflicts(
         sandboxId,
         userId,
         organizationId,
-        previousGithubSha, // Pass previous SHA for incremental diff
-        commitResult.commit.sha, // Pass new SHA
       );
-      this.logger.log(
-        `Change detection complete: ${changeDetectionResult.changeCount} changes`,
-      );
-    } catch (error) {
-      this.logger.warn(`Change detection failed: ${error.message}`);
-      // Don't fail the submission if change detection fails
-      changeDetectionResult = { success: false, changeCount: 0 };
-    }
+      if (conflictCheck.hasConflicts) {
+        // Update status back to ACTIVE since submission failed
+        await this.prisma.sandbox.update({
+          where: { id: sandboxId },
+          data: {
+            status: SandboxStatus.ACTIVE,
+            conflictStatus: 'NEEDS_RESOLUTION',
+          },
+        });
 
-    // Update status to PENDING_REVIEW
-    const updated = await this.prisma.sandbox.update({
-      where: { id: sandboxId },
-      data: {
-        status: SandboxStatus.PENDING_REVIEW,
-        submittedAt: new Date(),
-        environment: {
-          ...(sandbox.environment as any),
-          lastSubmission: {
-            commitSha: commitResult.commit.sha,
-            commitUrl: commitResult.commit.html_url,
-            changesDetected: changeDetectionResult.changeCount,
-            submittedAt: new Date().toISOString(),
+        throw new BadRequestException(
+          'Cannot submit: main branch has changed and conflicts were detected. A Pro Developer will help resolve this.',
+        );
+      }
+
+      // Get app details for Mendix/GitHub operations
+      const app = sandbox.appId
+        ? await this.prisma.app.findFirst({
+            where: { id: sandbox.appId, organizationId },
+          })
+        : null;
+
+      if (!app) {
+        throw new BadRequestException(
+          'Sandbox is not linked to an app. Cannot submit for review.',
+        );
+      }
+
+      // Get user's Mendix PAT for API calls
+      const userConnection = await this.prisma.userConnection.findFirst({
+        where: {
+          userId,
+          platform: 'MENDIX',
+          isActive: true,
+        },
+      });
+
+      if (!userConnection) {
+        throw new BadRequestException(
+          'No Mendix connection found. Please connect your Mendix account.',
+        );
+      }
+
+      // Get PAT from metadata (Mendix stores PAT there) or fallback to accessToken
+      const metadata = userConnection.metadata as any;
+      const mendixPat = metadata?.pat || userConnection.accessToken;
+      const mendixAppId = app.externalId;
+
+      // Get projectId from app metadata - required for Platform SDK
+      const appMetadata = app.metadata as any;
+      const projectId =
+        appMetadata?.projectId || appMetadata?.metadata?.projectId;
+
+      if (!mendixAppId || !mendixPat) {
+        throw new BadRequestException(
+          'Missing Mendix app ID or PAT. Cannot export model.',
+        );
+      }
+
+      this.logger.log(
+        `Sync: mendixAppId=${mendixAppId}, projectId=${projectId}, PAT length=${mendixPat?.length}`,
+      );
+
+      // Verify the Mendix branch exists before proceeding
+      try {
+        const branches = await this.mendixService.listBranches(
+          userId,
+          organizationId,
+          mendixAppId,
+        );
+        const branchExists = branches.some(
+          (b) => b.name === sandbox.mendixBranch,
+        );
+        if (!branchExists) {
+          throw new BadRequestException(
+            `Mendix branch "${sandbox.mendixBranch}" does not exist. The branch may have failed to create. Please abandon this sandbox and create a new one.`,
+          );
+        }
+      } catch (branchCheckError) {
+        if (branchCheckError instanceof BadRequestException) {
+          throw branchCheckError;
+        }
+        this.logger.warn(
+          `Could not verify branch existence: ${branchCheckError.message}`,
+        );
+        // Continue anyway - the export will fail if branch doesn't exist
+      }
+
+      // Step 1: Export Mendix model via SDK
+      let exportPath: string;
+      try {
+        this.logger.log(
+          `Exporting Mendix model for app ${mendixAppId} branch ${sandbox.mendixBranch}`,
+        );
+        exportPath = await this.mendixModelSdkService.exportFullModel(
+          mendixAppId,
+          mendixPat,
+          sandbox.mendixBranch || 'main',
+          projectId, // Pass projectId for SDK (UUID required, not subdomain)
+        );
+        this.logger.log(`Model exported to ${exportPath}`);
+      } catch (error) {
+        this.logger.error(`Failed to export Mendix model: ${error.message}`);
+        throw new BadRequestException(
+          `Failed to export Mendix model: ${error.message}`,
+        );
+      }
+
+      // Step 2: Commit to GitHub sandbox branch
+      let commitResult: {
+        commit: { sha: string; html_url: string };
+        branch: string;
+      };
+      try {
+        this.logger.log(
+          `Committing model to GitHub branch ${sandbox.githubBranch}`,
+        );
+        const commitInfo = await this.githubService.commitAppSnapshot(
+          app as any,
+          exportPath,
+          `[Sandbox] Submit for review: ${sandbox.name}`,
+          sandbox.githubBranch || undefined,
+        );
+        commitResult = {
+          commit: commitInfo,
+          branch: sandbox.githubBranch || 'main',
+        };
+        this.logger.log(`Committed to GitHub: ${commitInfo.sha}`);
+      } catch (error) {
+        this.logger.error(`Failed to commit to GitHub: ${error.message}`);
+        throw new BadRequestException(
+          `Failed to commit to GitHub: ${error.message}`,
+        );
+      }
+
+      // Save the previous SHA before updating (for incremental change detection)
+      const previousGithubSha = (sandbox as any).latestGithubSha;
+
+      // Update sandbox with latest GitHub SHA
+      await this.prisma.sandbox.update({
+        where: { id: sandboxId },
+        data: {
+          latestGithubSha: commitResult.commit.sha,
+        },
+      });
+
+      // Step 3: Trigger change detection (creates Change records with before/after diffs)
+      let changeDetectionResult: { success: boolean; changeCount: number };
+      try {
+        this.logger.log(`Triggering change detection for sandbox ${sandboxId}`);
+        changeDetectionResult = await this.changesService.syncSandbox(
+          sandboxId,
+          userId,
+          organizationId,
+          previousGithubSha, // Pass previous SHA for incremental diff
+          commitResult.commit.sha, // Pass new SHA
+        );
+        this.logger.log(
+          `Change detection complete: ${changeDetectionResult.changeCount} changes`,
+        );
+      } catch (error) {
+        this.logger.warn(`Change detection failed: ${error.message}`);
+        // Don't fail the submission if change detection fails
+        changeDetectionResult = { success: false, changeCount: 0 };
+      }
+
+      // Update status to PENDING_REVIEW
+      const updated = await this.prisma.sandbox.update({
+        where: { id: sandboxId },
+        data: {
+          status: SandboxStatus.PENDING_REVIEW,
+          submittedAt: new Date(),
+          environment: {
+            ...(sandbox.environment as any),
+            lastSubmission: {
+              commitSha: commitResult.commit.sha,
+              commitUrl: commitResult.commit.html_url,
+              changesDetected: changeDetectionResult.changeCount,
+              submittedAt: new Date().toISOString(),
+            },
           },
         },
-      },
-      include: {
-        createdBy: {
-          select: { id: true, email: true, name: true },
+        include: {
+          createdBy: {
+            select: { id: true, email: true, name: true },
+          },
         },
-      },
-    });
-
-    // CI/CD pipeline will be triggered automatically by GitHub Actions on push to sandbox/* branch
-
-    // Notify Pro Developers about new submission
-    const proDevelopers = await this.prisma.user.findMany({
-      where: {
-        organizationId,
-        role: { in: ['PRO_DEVELOPER', 'ADMIN'] },
-      },
-    });
-
-    for (const proDev of proDevelopers) {
-      await this.notificationsService.create({
-        userId: proDev.id,
-        type: 'REVIEW_ASSIGNED',
-        title: 'New Sandbox Submission',
-        message: `${updated.createdBy?.name || updated.createdBy?.email} has submitted sandbox "${sandbox.name}" for review. ${changeDetectionResult.changeCount} changes detected.`,
       });
+
+      // CI/CD pipeline will be triggered automatically by GitHub Actions on push to sandbox/* branch
+
+      // Notify Pro Developers about new submission
+      const proDevelopers = await this.prisma.user.findMany({
+        where: {
+          organizationId,
+          role: { in: ['PRO_DEVELOPER', 'ADMIN'] },
+        },
+      });
+
+      for (const proDev of proDevelopers) {
+        await this.notificationsService.create({
+          userId: proDev.id,
+          type: 'REVIEW_ASSIGNED',
+          title: 'New Sandbox Submission',
+          message: `${updated.createdBy?.name || updated.createdBy?.email} has submitted sandbox "${sandbox.name}" for review. ${changeDetectionResult.changeCount} changes detected.`,
+        });
+      }
+
+      this.logger.log(
+        `Sandbox ${sandboxId} submitted for review with ${changeDetectionResult.changeCount} changes`,
+      );
+
+      // Audit log with details
+      await this.auditService.createAuditLog({
+        userId,
+        organizationId,
+        action: 'UPDATE',
+        entityType: 'sandbox',
+        entityId: sandboxId,
+        details: {
+          action: 'submit_for_review',
+          commitSha: commitResult.commit.sha,
+          changesDetected: changeDetectionResult.changeCount,
+        },
+      });
+
+      return this.toResponseDto(updated);
+    } catch (error) {
+      // If submission fails, reset status back to ACTIVE
+      this.logger.error(`Submit for review failed: ${error.message}`);
+      await this.prisma.sandbox
+        .update({
+          where: { id: sandboxId },
+          data: { status: SandboxStatus.ACTIVE },
+        })
+        .catch(() => {
+          // Ignore error if sandbox doesn't exist anymore
+        });
+      throw error;
     }
-
-    this.logger.log(
-      `Sandbox ${sandboxId} submitted for review with ${changeDetectionResult.changeCount} changes`,
-    );
-
-    // Audit log with details
-    await this.auditService.createAuditLog({
-      userId,
-      organizationId,
-      action: 'UPDATE',
-      entityType: 'sandbox',
-      entityId: sandboxId,
-      details: {
-        action: 'submit_for_review',
-        commitSha: commitResult.commit.sha,
-        changesDetected: changeDetectionResult.changeCount,
-      },
-    });
-
-    return this.toResponseDto(updated);
   }
 
   /**

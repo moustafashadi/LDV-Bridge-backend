@@ -442,7 +442,90 @@ export class ChangesService {
         ? `Changed: ${descriptionParts.join(', ')}`
         : `${fileDiffs.length} files changed (+${totalAdditions}/-${totalDeletions})`;
 
-    // Create change record
+    // Fetch beforeCode and afterCode from GitHub
+    let beforeCode: string | null = null;
+    let afterCode: string | null = null;
+
+    const app = sandbox.app;
+    if (
+      app?.githubRepoName &&
+      app?.organization?.githubOrgName &&
+      sandbox.baseGithubSha &&
+      sandbox.latestGithubSha
+    ) {
+      const repoFullName = `${app.organization.githubOrgName}/${app.githubRepoName}`;
+
+      try {
+        // Fetch the raw diff between commits
+        const rawDiff = await this.githubService.getRawDiff(
+          repoFullName,
+          sandbox.baseGithubSha,
+          sandbox.latestGithubSha,
+          organizationId,
+        );
+
+        // Add raw diff to diffSummary for the raw view
+        (diffSummary as any).rawDiff = rawDiff;
+
+        // Build beforeCode and afterCode from the file patches
+        // Extract the actual content changes from each file's patch
+        const beforeParts: string[] = [];
+        const afterParts: string[] = [];
+
+        for (const file of fileDiffs) {
+          if (file.patch) {
+            // Parse the patch to extract before/after content
+            const lines = file.patch.split('\n');
+            const fileBefore: string[] = [];
+            const fileAfter: string[] = [];
+
+            for (const line of lines) {
+              if (line.startsWith('-') && !line.startsWith('---')) {
+                fileBefore.push(line.substring(1));
+              } else if (line.startsWith('+') && !line.startsWith('+++')) {
+                fileAfter.push(line.substring(1));
+              } else if (!line.startsWith('@@') && !line.startsWith('\\')) {
+                // Context line (unchanged)
+                fileBefore.push(
+                  line.startsWith(' ') ? line.substring(1) : line,
+                );
+                fileAfter.push(line.startsWith(' ') ? line.substring(1) : line);
+              }
+            }
+
+            if (fileBefore.length > 0 || file.status === 'removed') {
+              beforeParts.push(
+                `// File: ${file.filename}\n${fileBefore.join('\n')}`,
+              );
+            }
+            if (fileAfter.length > 0 || file.status === 'added') {
+              afterParts.push(
+                `// File: ${file.filename}\n${fileAfter.join('\n')}`,
+              );
+            }
+          }
+        }
+
+        // Store the extracted content
+        if (beforeParts.length > 0) {
+          beforeCode = beforeParts.join('\n\n');
+        }
+        if (afterParts.length > 0) {
+          afterCode = afterParts.join('\n\n');
+        }
+
+        this.logger.log(
+          `Fetched code content for change: before=${beforeCode ? beforeCode.length + ' chars' : 'no'}, after=${afterCode ? afterCode.length + ' chars' : 'no'}, rawDiff=${rawDiff ? rawDiff.length + ' chars' : 'no'}`,
+        );
+      } catch (error) {
+        this.logger.warn(
+          `Failed to fetch code content from GitHub: ${error.message}`,
+        );
+        // Continue without code content - the change will still be created
+      }
+    }
+
+    // Create change record with code content
     const changeCreateData: any = {
       organizationId,
       appId,
@@ -454,6 +537,8 @@ export class ChangesService {
       beforeMetadata: { githubSha: sandbox.baseGithubSha },
       afterMetadata: { githubSha: sandbox.latestGithubSha },
       diffSummary,
+      beforeCode,
+      afterCode,
     };
 
     if (userId && userId !== 'system') {
