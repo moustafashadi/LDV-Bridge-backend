@@ -6,6 +6,7 @@ import {
   AnthropicProvider,
   OpenAIProvider,
   GeminiProvider,
+  GroqProvider,
 } from './providers';
 
 export interface BridgeAIAnalysis {
@@ -29,7 +30,7 @@ export interface SecurityConcern {
   remediation?: string;
 }
 
-export type AIProviderName = 'anthropic' | 'openai' | 'gemini';
+export type AIProviderName = 'anthropic' | 'openai' | 'gemini' | 'groq';
 
 export interface AIProviderStatus {
   name: AIProviderName;
@@ -41,7 +42,12 @@ export interface AIProviderStatus {
 export class BridgeAIService {
   private readonly logger = new Logger(BridgeAIService.name);
   private providers: Map<AIProviderName, AIProvider> = new Map();
-  private providerPriority: AIProviderName[] = ['anthropic', 'openai', 'gemini'];
+  private providerPriority: AIProviderName[] = [
+    'anthropic',
+    'openai',
+    'gemini',
+    'groq',
+  ];
 
   constructor(
     private readonly configService: ConfigService,
@@ -75,18 +81,35 @@ export class BridgeAIService {
       this.logger.log('✅ Google Gemini provider configured');
     }
 
+    // Groq (Free tier)
+    const groqKey = this.configService.get<string>('GROQ_API_KEY');
+    if (groqKey) {
+      this.providers.set('groq', new GroqProvider(groqKey));
+      this.logger.log('✅ Groq provider configured (free tier)');
+    }
+
     // Set priority from config if specified
-    const priorityConfig = this.configService.get<string>('AI_PROVIDER_PRIORITY');
+    const priorityConfig = this.configService.get<string>(
+      'AI_PROVIDER_PRIORITY',
+    );
     if (priorityConfig) {
-      const priority = priorityConfig.split(',').map(p => p.trim() as AIProviderName);
-      this.providerPriority = priority.filter(p => this.providers.has(p));
+      const priority = priorityConfig
+        .split(',')
+        .map((p) => p.trim() as AIProviderName);
+      this.providerPriority = priority.filter((p) => this.providers.has(p));
     }
 
     if (this.providers.size === 0) {
-      this.logger.warn('⚠️ No AI providers configured - BridgeAI features will be disabled');
+      this.logger.warn(
+        '⚠️ No AI providers configured - BridgeAI features will be disabled',
+      );
     } else {
-      this.logger.log(`BridgeAI initialized with ${this.providers.size} provider(s): ${Array.from(this.providers.keys()).join(', ')}`);
-      this.logger.log(`Provider priority: ${this.providerPriority.join(' → ')}`);
+      this.logger.log(
+        `BridgeAI initialized with ${this.providers.size} provider(s): ${Array.from(this.providers.keys()).join(', ')}`,
+      );
+      this.logger.log(
+        `Provider priority: ${this.providerPriority.join(' → ')}`,
+      );
     }
   }
 
@@ -94,7 +117,10 @@ export class BridgeAIService {
    * Check if any AI provider is available
    */
   isAvailable(): boolean {
-    return this.providers.size > 0 && this.providerPriority.some(p => this.providers.get(p)?.isAvailable());
+    return (
+      this.providers.size > 0 &&
+      this.providerPriority.some((p) => this.providers.get(p)?.isAvailable())
+    );
   }
 
   /**
@@ -130,7 +156,9 @@ export class BridgeAIService {
     preferredProvider?: AIProviderName,
   ): Promise<BridgeAIAnalysis> {
     if (!this.isAvailable()) {
-      throw new Error('No AI providers configured. Please set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GOOGLE_GEMINI_API_KEY.');
+      throw new Error(
+        'No AI providers configured. Please set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GOOGLE_GEMINI_API_KEY.',
+      );
     }
 
     this.logger.log(`Starting BridgeAI analysis for change ${changeId}`);
@@ -155,7 +183,11 @@ export class BridgeAIService {
     const riskAssessment = change.riskAssessment as any;
 
     // Prepare the code diff context
-    const diffContext = this.prepareDiffContext(diffSummary, beforeCode, afterCode);
+    const diffContext = this.prepareDiffContext(
+      diffSummary,
+      beforeCode,
+      afterCode,
+    );
 
     // Create the prompt
     const prompt = this.createSecurityAnalysisPrompt(
@@ -187,16 +219,23 @@ export class BridgeAIService {
 
       try {
         this.logger.log(`Trying ${providerName} provider...`);
-        
+
         const response = await provider.analyze(prompt);
-        
+
         // Parse the response
-        const analysis = this.parseAIResponse(response.content, changeId, providerName, provider.getModel());
+        const analysis = this.parseAIResponse(
+          response.content,
+          changeId,
+          providerName,
+          provider.getModel(),
+        );
 
         // Store the analysis in the database
         await this.storeAnalysis(changeId, analysis, response.content);
 
-        this.logger.log(`BridgeAI analysis completed using ${providerName} for change ${changeId}: ${analysis.overallAssessment}`);
+        this.logger.log(
+          `BridgeAI analysis completed using ${providerName} for change ${changeId}: ${analysis.overallAssessment}`,
+        );
 
         return analysis;
       } catch (error: any) {
@@ -204,9 +243,11 @@ export class BridgeAIService {
         lastError = error;
 
         // Check if we should try next provider
-        if (error.message?.includes('CREDITS_EXHAUSTED') || 
-            error.message?.includes('RATE_LIMITED') ||
-            error.message?.includes('INVALID_API_KEY')) {
+        if (
+          error.message?.includes('CREDITS_EXHAUSTED') ||
+          error.message?.includes('RATE_LIMITED') ||
+          error.message?.includes('INVALID_API_KEY')
+        ) {
           this.logger.log(`Falling back to next provider...`);
           continue;
         }
@@ -218,7 +259,10 @@ export class BridgeAIService {
 
     // All providers failed
     this.logger.error('All AI providers failed');
-    throw new Error(lastError?.message || 'All AI providers failed. Please check your API keys and quotas.');
+    throw new Error(
+      lastError?.message ||
+        'All AI providers failed. Please check your API keys and quotas.',
+    );
   }
 
   /**
@@ -261,9 +305,10 @@ export class BridgeAIService {
         parts.push(`## Raw Diff`);
         parts.push('```diff');
         // Truncate if too long
-        const rawDiff = diffSummary.rawDiff.length > 8000 
-          ? diffSummary.rawDiff.substring(0, 8000) + '\n...(truncated)'
-          : diffSummary.rawDiff;
+        const rawDiff =
+          diffSummary.rawDiff.length > 8000
+            ? diffSummary.rawDiff.substring(0, 8000) + '\n...(truncated)'
+            : diffSummary.rawDiff;
         parts.push(rawDiff);
         parts.push('```');
         parts.push('');
@@ -272,7 +317,9 @@ export class BridgeAIService {
       // Include categorized changes
       if (diffSummary.categories) {
         parts.push(`## Changed Components by Category`);
-        for (const [category, files] of Object.entries(diffSummary.categories)) {
+        for (const [category, files] of Object.entries(
+          diffSummary.categories,
+        )) {
           if (Array.isArray(files) && files.length > 0) {
             parts.push(`### ${category}`);
             files.slice(0, 10).forEach((file: any) => {
@@ -292,15 +339,19 @@ export class BridgeAIService {
       parts.push(`## Code Changes (Sample)`);
       const operations = diffSummary.operations.slice(0, 20);
       for (const op of operations) {
-        parts.push(`### ${op.op?.toUpperCase() || 'CHANGE'}: ${op.path || 'unknown'}`);
+        parts.push(
+          `### ${op.op?.toUpperCase() || 'CHANGE'}: ${op.path || 'unknown'}`,
+        );
         if (op.value) {
-          const valueStr = typeof op.value === 'string' 
-            ? op.value 
-            : JSON.stringify(op.value, null, 2);
+          const valueStr =
+            typeof op.value === 'string'
+              ? op.value
+              : JSON.stringify(op.value, null, 2);
           // Truncate long values
-          const truncated = valueStr.length > 500 
-            ? valueStr.substring(0, 500) + '...(truncated)' 
-            : valueStr;
+          const truncated =
+            valueStr.length > 500
+              ? valueStr.substring(0, 500) + '...(truncated)'
+              : valueStr;
           parts.push('```json');
           parts.push(truncated);
           parts.push('```');
@@ -312,7 +363,7 @@ export class BridgeAIService {
     // Include model-json content for Mendix
     if (afterCode) {
       parts.push(`## Model JSON Content (After)`);
-      
+
       // Pages
       if (afterCode.pages) {
         parts.push(`### Pages (${Object.keys(afterCode.pages).length} total)`);
@@ -320,9 +371,10 @@ export class BridgeAIService {
         for (const [name, content] of pageEntries) {
           parts.push(`#### ${name}`);
           const contentStr = JSON.stringify(content, null, 2);
-          const truncated = contentStr.length > 1000 
-            ? contentStr.substring(0, 1000) + '...(truncated)' 
-            : contentStr;
+          const truncated =
+            contentStr.length > 1000
+              ? contentStr.substring(0, 1000) + '...(truncated)'
+              : contentStr;
           parts.push('```json');
           parts.push(truncated);
           parts.push('```');
@@ -331,14 +383,17 @@ export class BridgeAIService {
 
       // Microflows
       if (afterCode.microflows) {
-        parts.push(`### Microflows (${Object.keys(afterCode.microflows).length} total)`);
+        parts.push(
+          `### Microflows (${Object.keys(afterCode.microflows).length} total)`,
+        );
         const mfEntries = Object.entries(afterCode.microflows).slice(0, 5);
         for (const [name, content] of mfEntries) {
           parts.push(`#### ${name}`);
           const contentStr = JSON.stringify(content, null, 2);
-          const truncated = contentStr.length > 1000 
-            ? contentStr.substring(0, 1000) + '...(truncated)' 
-            : contentStr;
+          const truncated =
+            contentStr.length > 1000
+              ? contentStr.substring(0, 1000) + '...(truncated)'
+              : contentStr;
           parts.push('```json');
           parts.push(truncated);
           parts.push('```');
@@ -352,9 +407,10 @@ export class BridgeAIService {
         for (const [name, content] of dmEntries) {
           parts.push(`#### ${name}`);
           const contentStr = JSON.stringify(content, null, 2);
-          const truncated = contentStr.length > 1000 
-            ? contentStr.substring(0, 1000) + '...(truncated)' 
-            : contentStr;
+          const truncated =
+            contentStr.length > 1000
+              ? contentStr.substring(0, 1000) + '...(truncated)'
+              : contentStr;
           parts.push('```json');
           parts.push(truncated);
           parts.push('```');
@@ -442,16 +498,17 @@ If no security concerns are found, return an empty array for securityConcerns an
    * Parse AI response into structured format
    */
   private parseAIResponse(
-    response: string, 
-    changeId: string, 
+    response: string,
+    changeId: string,
     provider: string,
     model: string,
   ): BridgeAIAnalysis {
     try {
       // Extract JSON from response (it might be wrapped in markdown code blocks)
-      const jsonMatch = response.match(/```json\s*([\s\S]*?)\s*```/) || 
-                       response.match(/\{[\s\S]*\}/);
-      
+      const jsonMatch =
+        response.match(/```json\s*([\s\S]*?)\s*```/) ||
+        response.match(/\{[\s\S]*\}/);
+
       if (!jsonMatch) {
         throw new Error('No JSON found in AI response');
       }
@@ -473,7 +530,7 @@ If no security concerns are found, return an empty array for securityConcerns an
       };
     } catch (error: any) {
       this.logger.error(`Failed to parse AI response: ${error.message}`);
-      
+
       // Return a fallback analysis
       return {
         id: `ai-${changeId}-${Date.now()}`,
@@ -481,8 +538,11 @@ If no security concerns are found, return an empty array for securityConcerns an
         analyzedAt: new Date(),
         securityConcerns: [],
         overallAssessment: 'warning',
-        summary: 'AI analysis completed but response parsing failed. Manual review recommended.',
-        recommendations: ['Review the change manually due to AI parsing issues'],
+        summary:
+          'AI analysis completed but response parsing failed. Manual review recommended.',
+        recommendations: [
+          'Review the change manually due to AI parsing issues',
+        ],
         provider,
         model,
         rawResponse: response,

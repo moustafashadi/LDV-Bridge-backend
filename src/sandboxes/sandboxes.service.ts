@@ -976,6 +976,8 @@ export class SandboxesService {
                   repository: (latestChange as any).gitCommits[0].repository,
                 }
               : null,
+            // AI analysis (stored from BridgeAI)
+            aiAnalysis: latestChange.aiAnalysis || null,
           }
         : null,
       review: review

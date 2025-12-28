@@ -18,7 +18,11 @@ import {
   ApiParam,
   ApiQuery,
 } from '@nestjs/swagger';
-import { BridgeAIService, BridgeAIAnalysis, AIProviderName } from './bridge-ai.service';
+import {
+  BridgeAIService,
+  BridgeAIAnalysis,
+  AIProviderName,
+} from './bridge-ai.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
@@ -32,7 +36,9 @@ export class BridgeAIController {
   constructor(private readonly bridgeAIService: BridgeAIService) {}
 
   @Get('status')
-  @ApiOperation({ summary: 'Check BridgeAI availability and configured providers' })
+  @ApiOperation({
+    summary: 'Check BridgeAI availability and configured providers',
+  })
   @ApiResponse({
     status: 200,
     description: 'BridgeAI availability status with provider details',
@@ -44,25 +50,30 @@ export class BridgeAIController {
     return {
       enabled: this.bridgeAIService.isAvailable(),
       providers,
-      activeProvider: activeProvider ? {
-        name: activeProvider.getName(),
-        model: activeProvider.getModel(),
-      } : null,
+      activeProvider: activeProvider
+        ? {
+            name: activeProvider.getName(),
+            model: activeProvider.getModel(),
+          }
+        : null,
       features: ['security-analysis', 'code-review', 'risk-assessment'],
-      fallbackEnabled: providers.filter(p => p.available).length > 1,
+      fallbackEnabled: providers.filter((p) => p.available).length > 1,
     };
   }
 
   @Post('analyze/:changeId')
   @HttpCode(HttpStatus.OK)
   @Roles(UserRole.PRO_DEVELOPER, UserRole.ADMIN)
-  @ApiOperation({ summary: 'Analyze a change with BridgeAI (auto-selects best provider)' })
+  @ApiOperation({
+    summary: 'Analyze a change with BridgeAI (auto-selects best provider)',
+  })
   @ApiParam({ name: 'changeId', description: 'ID of the change to analyze' })
-  @ApiQuery({ 
-    name: 'provider', 
-    required: false, 
-    enum: ['anthropic', 'openai', 'gemini'],
-    description: 'Preferred AI provider (optional, will fallback if unavailable)' 
+  @ApiQuery({
+    name: 'provider',
+    required: false,
+    enum: ['anthropic', 'openai', 'gemini', 'groq'],
+    description:
+      'Preferred AI provider (optional, will fallback if unavailable)',
   })
   @ApiResponse({
     status: 200,

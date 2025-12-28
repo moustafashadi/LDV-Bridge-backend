@@ -8,7 +8,7 @@ import { AIProvider, AIProviderResponse } from './ai-provider.interface';
 export class GeminiProvider implements AIProvider {
   private readonly logger = new Logger(GeminiProvider.name);
   private client: GoogleGenerativeAI | null = null;
-  private readonly model = 'gemini-1.5-pro';
+  private readonly model = 'gemini-2.0-flash';
 
   constructor(apiKey?: string) {
     if (apiKey) {
