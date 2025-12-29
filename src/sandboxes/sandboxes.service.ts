@@ -33,6 +33,7 @@ import { MendixService } from '../connectors/mendix/mendix.service';
 import { MendixModelSdkService } from '../connectors/mendix/mendix-model-sdk.service';
 import { GitHubService } from '../github/github.service';
 import { ChangesService } from '../changes/changes.service';
+import { ReviewsService } from '../reviews/reviews.service';
 import { SyncProgressService, SYNC_STEPS } from './sync-progress.service';
 
 // Type helper for Sandbox with new schema fields
@@ -86,6 +87,8 @@ export class SandboxesService {
     private readonly mendixModelSdkService: MendixModelSdkService,
     @Inject(forwardRef(() => ChangesService))
     private readonly changesService: ChangesService,
+    @Inject(forwardRef(() => ReviewsService))
+    private readonly reviewsService: ReviewsService,
     private readonly syncProgressService: SyncProgressService,
   ) {
     // Initialize provisioners map
@@ -1970,6 +1973,48 @@ export class SandboxesService {
         this.logger.warn(`Change detection failed: ${error.message}`);
         // Don't fail the submission if change detection fails
         changeDetectionResult = { success: false, changeCount: 0 };
+      }
+
+      // Step 4: Create Review records for the latest Change
+      // Find the latest Change created for this sandbox
+      const latestChange = await this.prisma.change.findFirst({
+        where: {
+          sandboxId,
+          organizationId,
+        },
+        orderBy: { createdAt: 'desc' },
+      });
+
+      if (latestChange) {
+        // Find Pro Developers to assign as reviewers
+        const proDevelopers = await this.prisma.user.findMany({
+          where: {
+            organizationId,
+            role: { in: ['PRO_DEVELOPER'] },
+          },
+          take: 3, // Limit to first 3 reviewers
+        });
+
+        // Create Review records for each pro developer
+        for (const proDev of proDevelopers) {
+          try {
+            await this.reviewsService.create(
+              {
+                changeId: latestChange.id,
+                reviewerId: proDev.id,
+              },
+              organizationId,
+            );
+            this.logger.log(
+              `Created Review for change ${latestChange.id} assigned to ${proDev.email}`,
+            );
+          } catch (err) {
+            // Review might already exist, continue
+            this.logger.warn(
+              `Could not create review for ${proDev.email}: ${err.message}`,
+            );
+          }
+        }
       }
 
       // Update status to PENDING_REVIEW

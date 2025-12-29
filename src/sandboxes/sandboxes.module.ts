@@ -11,6 +11,7 @@ import { AuditModule } from '../common/audit/audit.module';
 import { ConnectorsModule } from '../connectors/connectors.module';
 import { GitHubModule } from '../github/github.module';
 import { ChangesModule } from '../changes/changes.module';
+import { ReviewsModule } from '../reviews/reviews.module';
 
 @Module({
   imports: [
@@ -20,6 +21,7 @@ import { ChangesModule } from '../changes/changes.module';
     forwardRef(() => ConnectorsModule), // Provides PowerAppsService, MendixService, MendixModelSdkService
     forwardRef(() => GitHubModule), // Provides GitHubService
     forwardRef(() => ChangesModule), // Provides ChangesService
+    forwardRef(() => ReviewsModule), // Provides ReviewsService for creating reviews on sandbox submit
     ScheduleModule.forRoot(), // Enable cron jobs
   ],
   controllers: [SandboxesController],
