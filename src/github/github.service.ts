@@ -914,7 +914,7 @@ export class GitHubService {
       repoFullName,
       extractedPath,
       baseTreeSha,
-      token,
+      app.organizationId, // Fix: pass organizationId, not token
     );
 
     // Create commit
