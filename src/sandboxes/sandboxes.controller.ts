@@ -396,12 +396,47 @@ export class SandboxesController {
     status: 403,
     description: 'Forbidden - Not authorized to create sandbox for this app',
   })
-  async createFeatureSandbox(
+  async createMendixFeatureSandbox(
     @Body() dto: CreateFeatureSandboxDto,
     @CurrentUser('id') userId: string,
     @CurrentUser('organizationId') organizationId: string,
   ): Promise<SandboxResponseDto> {
-    return this.sandboxesService.createFeatureSandbox(
+    return this.sandboxesService.createMendixFeatureSandbox(
+      dto.appId,
+      dto.featureName,
+      userId,
+      organizationId,
+      dto.description,
+    );
+  }
+
+  @Post('powerapps/feature')
+  @ApiOperation({
+    summary: 'Create PowerApps feature sandbox',
+    description:
+      'Creates a new feature sandbox for a PowerApps app. This creates a dev environment, ' +
+      'copies the app to it, and sets up a GitHub branch for version control.',
+  })
+  @ApiResponse({
+    status: 201,
+    description: 'PowerApps feature sandbox created successfully',
+    type: SandboxResponseDto,
+  })
+  @ApiResponse({ status: 404, description: 'App not found' })
+  @ApiResponse({
+    status: 403,
+    description: 'Forbidden - Not authorized to create sandbox for this app',
+  })
+  @ApiResponse({
+    status: 400,
+    description: 'Bad Request - Failed to create dev environment or copy app',
+  })
+  async createPowerAppsFeatureSandbox(
+    @Body() dto: CreateFeatureSandboxDto,
+    @CurrentUser('id') userId: string,
+    @CurrentUser('organizationId') organizationId: string,
+  ): Promise<SandboxResponseDto> {
+    return this.sandboxesService.createPowerAppsFeatureSandbox(
       dto.appId,
       dto.featureName,
       userId,
@@ -476,6 +511,92 @@ export class SandboxesController {
       userId,
       organizationId,
       dto.changeTitle,
+    );
+  }
+
+  @Post(':id/powerapps/sync')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary:
+      'Sync PowerApps sandbox - Export from dev environment and commit to GitHub',
+    description:
+      'Exports the current state of the copied app from the dev environment and commits it to the GitHub sandbox branch.',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Sync completed successfully',
+    schema: {
+      type: 'object',
+      properties: {
+        success: { type: 'boolean' },
+        message: { type: 'string' },
+        commitSha: { type: 'string' },
+        commitUrl: { type: 'string' },
+        changesDetected: { type: 'number' },
+        pipelineTriggered: { type: 'boolean' },
+      },
+    },
+  })
+  @ApiResponse({ status: 404, description: 'Sandbox not found' })
+  @ApiResponse({ status: 400, description: 'Not a PowerApps feature sandbox' })
+  async syncPowerAppsSandbox(
+    @Param('id') id: string,
+    @Body() dto: { changeTitle?: string },
+    @CurrentUser('id') userId: string,
+    @CurrentUser('organizationId') organizationId: string,
+  ): Promise<{
+    success: boolean;
+    message: string;
+    commitSha?: string;
+    commitUrl?: string;
+    changesDetected: number;
+    pipelineTriggered: boolean;
+  }> {
+    return this.sandboxesService.syncPowerAppsSandbox(
+      id,
+      userId,
+      organizationId,
+      dto.changeTitle,
+    );
+  }
+
+  @Post(':id/powerapps/merge')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Merge PowerApps sandbox to main',
+    description:
+      'Merges the approved sandbox branch to main and cleans up the dev environment and copied app.',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Sandbox merged successfully',
+    schema: {
+      type: 'object',
+      properties: {
+        success: { type: 'boolean' },
+        message: { type: 'string' },
+        mergeCommitSha: { type: 'string' },
+      },
+    },
+  })
+  @ApiResponse({ status: 404, description: 'Sandbox not found' })
+  @ApiResponse({
+    status: 400,
+    description: 'Sandbox not approved or not a PowerApps sandbox',
+  })
+  async mergePowerAppsSandbox(
+    @Param('id') id: string,
+    @CurrentUser('id') userId: string,
+    @CurrentUser('organizationId') organizationId: string,
+  ): Promise<{
+    success: boolean;
+    message: string;
+    mergeCommitSha?: string;
+  }> {
+    return this.sandboxesService.mergePowerAppsSandbox(
+      id,
+      userId,
+      organizationId,
     );
   }
 

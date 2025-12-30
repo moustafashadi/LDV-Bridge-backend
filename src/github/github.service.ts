@@ -1024,6 +1024,90 @@ export class GitHubService {
   }
 
   /**
+   * Merge a sandbox branch to main
+   * Similar to mergeStagingToMain but takes a branch name directly
+   */
+  async mergeSandboxBranch(
+    app: App,
+    sandboxBranch: string,
+    commitMessage: string,
+  ): Promise<{ merged: boolean; sha?: string }> {
+    const org = await this.prisma.organization.findUnique({
+      where: { id: app.organizationId },
+    });
+
+    if (!org?.githubOrgName || !app.githubRepoName) {
+      throw new HttpException(
+        'GitHub repository not configured for this app',
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+
+    const token = await this.getInstallationToken(app.organizationId);
+    const repoFullName = `${org.githubOrgName}/${app.githubRepoName}`;
+
+    // Get default branch
+    const repoInfo = await this.getRepoInfo(repoFullName, token);
+    const defaultBranch = repoInfo.default_branch || 'main';
+
+    // Merge sandbox into main
+    const response = await fetch(
+      `https://api.github.com/repos/${repoFullName}/merges`,
+      {
+        method: 'POST',
+        headers: {
+          Accept: 'application/vnd.github+json',
+          Authorization: `Bearer ${token}`,
+          'X-GitHub-Api-Version': '2022-11-28',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          base: defaultBranch,
+          head: sandboxBranch,
+          commit_message: commitMessage,
+        }),
+      },
+    );
+
+    if (!response.ok) {
+      const error = await response.json();
+
+      // 409 means nothing to merge (already up to date)
+      if (response.status === 409) {
+        this.logger.log(
+          `[SANDBOX] Branch ${sandboxBranch} already merged or up to date`,
+        );
+        return { merged: true };
+      }
+
+      this.logger.error(`[SANDBOX] Merge failed: ${JSON.stringify(error)}`);
+      throw new HttpException(
+        error.message || 'Failed to merge sandbox branch',
+        HttpStatus.BAD_GATEWAY,
+      );
+    }
+
+    const mergeResult = await response.json();
+    this.logger.log(
+      `[SANDBOX] Merged ${sandboxBranch} to ${defaultBranch}: ${mergeResult.sha}`,
+    );
+
+    return { merged: true, sha: mergeResult.sha };
+  }
+
+  /**
+   * Delete a branch by name (public version for sandbox cleanup)
+   */
+  async deleteBranchByName(
+    repoFullName: string,
+    branch: string,
+    organizationId: string,
+  ): Promise<void> {
+    const token = await this.getInstallationToken(organizationId);
+    await this.deleteBranch(repoFullName, branch, token);
+  }
+
+  /**
    * Delete a branch
    */
   private async deleteBranch(

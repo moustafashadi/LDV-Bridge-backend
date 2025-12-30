@@ -30,11 +30,14 @@ import { MendixProvisioner } from './provisioners/mendix.provisioner';
 import { NotificationsService } from '../notifications/notifications.service';
 import { AuditService } from '../common/audit/audit.service';
 import { MendixService } from '../connectors/mendix/mendix.service';
+import { PowerAppsService } from '../connectors/powerapps/powerapps.service';
 import { MendixModelSdkService } from '../connectors/mendix/mendix-model-sdk.service';
 import { GitHubService } from '../github/github.service';
 import { ChangesService } from '../changes/changes.service';
 import { ReviewsService } from '../reviews/reviews.service';
 import { SyncProgressService, SYNC_STEPS } from './sync-progress.service';
+import { App as MendixApp } from 'mendixplatformsdk';
+import { App } from '@prisma/client';
 
 // Type helper for Sandbox with new schema fields
 type SandboxWithRelations = {
@@ -90,6 +93,8 @@ export class SandboxesService {
     @Inject(forwardRef(() => ReviewsService))
     private readonly reviewsService: ReviewsService,
     private readonly syncProgressService: SyncProgressService,
+    @Inject(forwardRef(() => PowerAppsService))
+    private readonly powerAppsService: PowerAppsService,
   ) {
     // Initialize provisioners map
     this.provisioners = new Map<SandboxPlatform, IEnvironmentProvisioner>([
@@ -1539,7 +1544,7 @@ export class SandboxesService {
    * @param appId - LDV-Bridge app ID to create sandbox for
    * @param featureName - Name of the feature (used for branch names)
    */
-  async createFeatureSandbox(
+  async createMendixFeatureSandbox(
     appId: string,
     featureName: string,
     userId: string,
@@ -1752,6 +1757,642 @@ export class SandboxesService {
   }
 
   /**
+   * Create a PowerApps feature sandbox using environment-based isolation
+   * 1. Gets or creates a dev environment for the user
+   * 2. Copies the source app to the dev environment
+   * 3. Creates a GitHub sandbox branch
+   * 4. Creates sandbox record linking the copied app
+   *
+   * @param appId - Source app ID to create sandbox from
+   * @param featureName - Name of the feature (used for branch names and copied app name)
+   * @param userId - User creating the sandbox
+   * @param organizationId - Organization ID
+   * @param description - Optional description
+   */
+  async createPowerAppsFeatureSandbox(
+    appId: string,
+    featureName: string,
+    userId: string,
+    organizationId: string,
+    description?: string,
+  ): Promise<SandboxResponseDto> {
+    this.logger.log(
+      `Creating PowerApps feature sandbox "${featureName}" for app ${appId}`,
+    );
+
+    // Get the source app
+    const app = await this.prisma.app.findFirst({
+      where: { id: appId, organizationId, platform: 'POWERAPPS' },
+      include: { owner: true },
+    });
+
+    if (!app) {
+      throw new NotFoundException(`PowerApps app ${appId} not found`);
+    }
+
+    // Check if user has access (owner or has permission)
+    const hasAccess =
+      app.ownerId === userId ||
+      (await this.prisma.appPermission.findFirst({
+        where: { appId, userId, accessLevel: { in: ['EDITOR', 'OWNER'] } },
+      }));
+
+    if (!hasAccess) {
+      throw new ForbiddenException(
+        'You do not have access to create sandboxes for this app',
+      );
+    }
+
+    // Generate branch/sandbox name from feature name
+    const slug = featureName
+      .toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, '')
+      .replace(/\s+/g, '-')
+      .substring(0, 50);
+    const githubBranch = `sandbox/${slug}`;
+
+    // Check if sandbox already exists for this feature
+    const existingSandbox = await this.prisma.sandbox.findFirst({
+      where: {
+        appId,
+        organizationId,
+        githubBranch,
+        status: {
+          notIn: [
+            SandboxStatus.MERGED,
+            SandboxStatus.ABANDONED,
+            SandboxStatus.REJECTED,
+          ],
+        },
+      },
+    });
+
+    if (existingSandbox) {
+      throw new BadRequestException(
+        `A sandbox with name "${featureName}" already exists for this app`,
+      );
+    }
+
+    // Get source app's external ID (PowerApps app ID)
+    const sourceAppId = app.externalId;
+    if (!sourceAppId) {
+      throw new BadRequestException(
+        'App does not have a PowerApps external ID. Cannot create sandbox.',
+      );
+    }
+
+    // Get source app's environment ID from metadata
+    const appMetadata = app.metadata as any;
+    const sourceEnvironmentId =
+      appMetadata?.properties?.environment?.name || appMetadata?.environmentId;
+
+    if (!sourceEnvironmentId) {
+      throw new BadRequestException(
+        'Cannot determine source environment. Please sync the app first.',
+      );
+    }
+
+    // Step 1: Get or create a dev environment for the user
+    let devEnvironmentId: string;
+    let devEnvironmentUrl: string;
+    try {
+      this.logger.log(`Creating dev environment for user ${userId}`);
+      const envResult = await this.powerAppsService.createEnvironment(
+        userId,
+        organizationId,
+        {
+          name: `Dev-${featureName.substring(0, 30)}`,
+          region: 'unitedstates', // Default location
+          type: 'Developer',
+        },
+      );
+      devEnvironmentId = envResult.environmentId;
+      devEnvironmentUrl = envResult.environmentUrl;
+      this.logger.log(`Dev environment created: ${devEnvironmentId}`);
+    } catch (error) {
+      this.logger.error(`Failed to create dev environment: ${error.message}`);
+      throw new BadRequestException(
+        `Failed to create dev environment: ${error.message}`,
+      );
+    }
+
+    // Step 2: Copy the app to the dev environment
+    let copiedAppInfo: { appId: string; name: string; displayName: string };
+    try {
+      this.logger.log(
+        `Copying app ${sourceAppId} to dev environment ${devEnvironmentId}`,
+      );
+      copiedAppInfo = await this.powerAppsService.copyApp(
+        userId,
+        organizationId,
+        sourceAppId,
+        devEnvironmentId,
+        `${app.name}-${featureName}`.substring(0, 100),
+      );
+      this.logger.log(`App copied successfully: ${copiedAppInfo.appId}`);
+    } catch (error) {
+      this.logger.error(`Failed to copy app: ${error.message}`);
+      // Cleanup: delete the dev environment we just created
+      try {
+        await this.powerAppsService.deleteEnvironment(
+          userId,
+          organizationId,
+          devEnvironmentId,
+        );
+      } catch (cleanupError) {
+        this.logger.warn(
+          `Failed to cleanup dev environment: ${cleanupError.message}`,
+        );
+      }
+      throw new BadRequestException(`Failed to copy app: ${error.message}`);
+    }
+
+    // Build studio URL for the copied app
+    const studioUrl = `https://make.powerapps.com/environments/${devEnvironmentId}/apps/${copiedAppInfo.appId}/edit`;
+
+    // Step 3: Create sandbox record (before GitHub to get sandbox ID)
+    const sandbox = await this.prisma.sandbox.create({
+      data: {
+        organizationId,
+        createdById: userId,
+        appId,
+        name: featureName,
+        description: description || `Feature: ${featureName}`,
+        status: SandboxStatus.ACTIVE,
+        githubBranch,
+        environment: {
+          platform: 'POWERAPPS',
+          featureBased: true,
+          devEnvironmentId,
+          devEnvironmentUrl,
+          copiedAppId: copiedAppInfo.appId,
+          copiedAppName: copiedAppInfo.displayName,
+          sourceAppId,
+          sourceEnvironmentId,
+          studioUrl,
+        },
+      },
+      include: {
+        createdBy: {
+          select: { id: true, email: true, name: true },
+        },
+        app: true,
+      },
+    });
+
+    // Step 4: Create GitHub branch
+    let githubBranchInfo: { name: string; commit: { sha: string } } | null =
+      null;
+    try {
+      this.logger.log(
+        `Creating GitHub branch "${githubBranch}" for sandbox ${sandbox.id}`,
+      );
+      githubBranchInfo = await this.githubService.createSandboxBranch(sandbox);
+
+      // Update sandbox with GitHub SHA
+      await this.prisma.sandbox.update({
+        where: { id: sandbox.id },
+        data: {
+          baseGithubSha: githubBranchInfo.commit.sha,
+          latestGithubSha: githubBranchInfo.commit.sha,
+        },
+      });
+
+      this.logger.log(
+        `GitHub branch created with SHA ${githubBranchInfo.commit.sha}`,
+      );
+    } catch (error) {
+      this.logger.error(`Failed to create GitHub branch: ${error.message}`);
+      // Clean up: delete the sandbox record
+      await this.prisma.sandbox.delete({ where: { id: sandbox.id } });
+      // Clean up: delete the copied app and dev environment
+      try {
+        await this.powerAppsService.deleteApp(
+          userId,
+          organizationId,
+          copiedAppInfo.appId,
+        );
+        await this.powerAppsService.deleteEnvironment(
+          userId,
+          organizationId,
+          devEnvironmentId,
+        );
+      } catch (cleanupError) {
+        this.logger.warn(
+          `Failed to cleanup PowerApps resources: ${cleanupError.message}`,
+        );
+      }
+      throw new BadRequestException(
+        `Failed to create GitHub branch: ${error.message}`,
+      );
+    }
+
+    this.logger.log(
+      `Created PowerApps feature sandbox ${sandbox.id}: copied app ${copiedAppInfo.appId} in env ${devEnvironmentId}, GitHub branch ${githubBranch}`,
+    );
+
+    // Audit log
+    await this.auditService.createAuditLog({
+      userId,
+      organizationId,
+      action: 'CREATE',
+      entityType: 'sandbox',
+      entityId: sandbox.id,
+      details: {
+        platform: 'POWERAPPS',
+        featureName,
+        devEnvironmentId,
+        copiedAppId: copiedAppInfo.appId,
+        githubBranch,
+        githubSha: githubBranchInfo?.commit.sha,
+      },
+    });
+
+    // Refetch sandbox with updated GitHub info
+    const updatedSandbox = await this.prisma.sandbox.findUnique({
+      where: { id: sandbox.id },
+      include: {
+        createdBy: { select: { id: true, email: true, name: true } },
+      },
+    });
+
+    return this.toResponseDto(updatedSandbox);
+  }
+
+  /**
+   * Sync a PowerApps sandbox - Export copied app from dev environment and commit to GitHub
+   * Similar to Mendix syncSandbox but works with PowerApps environments
+   */
+  async syncPowerAppsSandbox(
+    sandboxId: string,
+    userId: string,
+    organizationId: string,
+    changeTitle?: string,
+  ): Promise<{
+    success: boolean;
+    message: string;
+    commitSha?: string;
+    commitUrl?: string;
+    changesDetected: number;
+    pipelineTriggered: boolean;
+  }> {
+    this.logger.log(`Syncing PowerApps sandbox ${sandboxId}`);
+
+    // Step 1: Validate sandbox
+    const sandbox = await this.prisma.sandbox.findFirst({
+      where: { id: sandboxId, organizationId },
+      include: { app: true },
+    });
+
+    if (!sandbox) {
+      throw new NotFoundException(`Sandbox ${sandboxId} not found`);
+    }
+
+    if (!['ACTIVE', 'CHANGES_REQUESTED'].includes(sandbox.status)) {
+      throw new BadRequestException(
+        `Cannot sync sandbox in ${sandbox.status} status`,
+      );
+    }
+
+    // Validate this is a PowerApps sandbox
+    const env = sandbox.environment as any;
+    if (env?.platform !== 'POWERAPPS' || !env?.copiedAppId) {
+      throw new BadRequestException(
+        'This is not a PowerApps feature sandbox. Use the Mendix sync endpoint instead.',
+      );
+    }
+
+    const copiedAppId = env.copiedAppId;
+    const app = sandbox.app;
+
+    if (!app) {
+      throw new BadRequestException('Sandbox is not linked to an app');
+    }
+
+    // Step 2: Export .msapp from the COPIED app in dev environment
+    let msappBuffer: Buffer;
+    try {
+      this.logger.log(`Exporting .msapp from copied app ${copiedAppId}`);
+      msappBuffer = await this.powerAppsService.exportApp(
+        userId,
+        organizationId,
+        copiedAppId,
+      );
+      this.logger.log(`Exported ${msappBuffer.length} bytes`);
+    } catch (error) {
+      this.logger.error(`Failed to export .msapp: ${error.message}`);
+      throw new BadRequestException(
+        `Failed to export app from PowerApps: ${error.message}`,
+      );
+    }
+
+    // Step 3: Extract and commit to GitHub sandbox branch
+    const os = require('os');
+    const path = require('path');
+    const fs = require('fs');
+
+    const tempDir = path.join(
+      os.tmpdir(),
+      'ldvbridge',
+      `sandbox_${sandboxId}_${Date.now()}`,
+    );
+    await fs.promises.mkdir(tempDir, { recursive: true });
+
+    let commitResult: { sha: string; html_url: string };
+    try {
+      // Write msapp and extract it
+      const msappPath = path.join(tempDir, 'app.msapp');
+      await fs.promises.writeFile(msappPath, msappBuffer);
+
+      // Use unzipper to extract
+      const unzipper = require('unzipper');
+      const extractPath = path.join(tempDir, 'extracted');
+      await fs.promises.mkdir(extractPath, { recursive: true });
+
+      await fs
+        .createReadStream(msappPath)
+        .pipe(unzipper.Extract({ path: extractPath }))
+        .promise();
+
+      // Commit to sandbox branch
+      this.logger.log(`Committing to GitHub branch ${sandbox.githubBranch}`);
+      const titleForCommit =
+        changeTitle || `Sync ${new Date().toISOString().slice(0, 16)}`;
+      commitResult = await this.githubService.commitAppSnapshot(
+        app,
+        extractPath,
+        `[Sandbox] ${titleForCommit}`,
+        sandbox.githubBranch || undefined,
+      );
+      this.logger.log(`Committed to GitHub: ${commitResult.sha}`);
+
+      // Cleanup temp directory
+      await fs.promises.rm(tempDir, { recursive: true, force: true });
+    } catch (error) {
+      // Cleanup on error
+      await fs.promises
+        .rm(tempDir, { recursive: true, force: true })
+        .catch(() => {});
+      this.logger.error(`Failed to commit to GitHub: ${error.message}`);
+      throw new BadRequestException(
+        `Failed to commit to GitHub: ${error.message}`,
+      );
+    }
+
+    // Step 4: Update sandbox with latest GitHub SHA
+    const previousSha = sandbox.latestGithubSha;
+    await this.prisma.sandbox.update({
+      where: { id: sandboxId },
+      data: {
+        latestGithubSha: commitResult.sha,
+      },
+    });
+
+    // Step 5: Change detection
+    let changeResult = { success: false, changeCount: 0 };
+    try {
+      this.logger.log(`Running change detection for sandbox ${sandboxId}`);
+      changeResult = await this.changesService.syncSandbox(
+        sandboxId,
+        userId,
+        organizationId,
+        previousSha || undefined,
+        commitResult.sha,
+      );
+      this.logger.log(`Detected ${changeResult.changeCount} changes`);
+    } catch (error) {
+      this.logger.warn(`Change detection failed: ${error.message}`);
+      // Don't fail sync if change detection fails
+    }
+
+    // Audit log
+    await this.auditService.createAuditLog({
+      userId,
+      organizationId,
+      action: 'UPDATE',
+      entityType: 'sandbox',
+      entityId: sandboxId,
+      details: {
+        action: 'sync_powerapps',
+        commitSha: commitResult.sha,
+        changesDetected: changeResult.changeCount,
+      },
+    });
+
+    return {
+      success: true,
+      message: `Successfully synced PowerApps sandbox. ${changeResult.changeCount} changes detected.`,
+      commitSha: commitResult.sha,
+      commitUrl: commitResult.html_url,
+      changesDetected: changeResult.changeCount,
+      pipelineTriggered: true, // GitHub Actions will trigger on push
+    };
+  }
+
+  /**
+   * Merge a PowerApps sandbox back to the main app
+   * 1. Validates sandbox is approved
+   * 2. Exports final .msapp from dev environment
+   * 3. Merges GitHub sandbox branch to main
+   * 4. Cleans up dev environment and copied app
+   * 5. Updates sandbox status to MERGED
+   *
+   * Note: Unlike Mendix, we can't programmatically update the main PowerApps app.
+   * The user will need to manually import the .msapp to the main app.
+   * We provide the final .msapp download link for this purpose.
+   */
+  async mergePowerAppsSandbox(
+    sandboxId: string,
+    userId: string,
+    organizationId: string,
+  ): Promise<{
+    success: boolean;
+    message: string;
+    mergeCommitSha?: string;
+    downloadUrl?: string;
+  }> {
+    this.logger.log(`Merging PowerApps sandbox ${sandboxId}`);
+
+    // Step 1: Validate sandbox
+    const sandbox = await this.prisma.sandbox.findFirst({
+      where: { id: sandboxId, organizationId },
+      include: { app: true },
+    });
+
+    if (!sandbox) {
+      throw new NotFoundException(`Sandbox ${sandboxId} not found`);
+    }
+
+    // Check status - must be PENDING_REVIEW (after Pro Dev approval)
+    if (sandbox.status !== SandboxStatus.PENDING_REVIEW) {
+      throw new BadRequestException(
+        `Cannot merge sandbox in ${sandbox.status} status. Sandbox must be PENDING_REVIEW (approved by Pro Dev).`,
+      );
+    }
+
+    // Validate this is a PowerApps sandbox
+    const env = sandbox.environment as any;
+    if (env?.platform !== 'POWERAPPS' || !env?.copiedAppId) {
+      throw new BadRequestException('This is not a PowerApps feature sandbox.');
+    }
+
+    const copiedAppId = env.copiedAppId;
+    const devEnvironmentId = env.devEnvironmentId;
+    const app = sandbox.app;
+
+    if (!app) {
+      throw new BadRequestException('Sandbox is not linked to an app');
+    }
+
+    // Step 2: Merge GitHub branch to main
+    let mergeResult: { sha: string } | null = null;
+    try {
+      this.logger.log(`Merging GitHub branch ${sandbox.githubBranch} to main`);
+
+      // Get organization for GitHub info
+      const org = await this.prisma.organization.findUnique({
+        where: { id: organizationId },
+      });
+
+      if (org?.githubOrgName && app.githubRepoName) {
+        const repoFullName = `${org.githubOrgName}/${app.githubRepoName}`;
+
+        // Create a merge commit using the GitHub API
+        const result = await this.githubService.mergeSandboxBranch(
+          app,
+          sandbox.githubBranch || 'main',
+          `Merge sandbox: ${sandbox.name}`,
+        );
+        mergeResult = result.sha ? { sha: result.sha } : null;
+
+        if (result.sha) {
+          this.logger.log(`Merged to main with SHA: ${result.sha}`);
+        }
+      }
+    } catch (error) {
+      this.logger.error(`Failed to merge GitHub branch: ${error.message}`);
+      throw new BadRequestException(
+        `Failed to merge GitHub branch: ${error.message}`,
+      );
+    }
+
+    // Step 3: Update sandbox status to MERGED
+    await this.prisma.sandbox.update({
+      where: { id: sandboxId },
+      data: {
+        status: SandboxStatus.MERGED,
+        mergedAt: new Date(),
+        environment: {
+          ...env,
+          mergeCommitSha: mergeResult?.sha,
+          mergedAt: new Date().toISOString(),
+        },
+      },
+    });
+
+    // Step 4: Cleanup - Delete copied app and dev environment
+    // Do this in background to not block the response
+    this.cleanupPowerAppsSandbox(
+      userId,
+      organizationId,
+      copiedAppId,
+      devEnvironmentId,
+      sandbox.githubBranch,
+      app,
+    ).catch((err) => {
+      this.logger.warn(`Background cleanup failed: ${err.message}`);
+    });
+
+    // Audit log
+    await this.auditService.createAuditLog({
+      userId,
+      organizationId,
+      action: 'UPDATE',
+      entityType: 'sandbox',
+      entityId: sandboxId,
+      details: {
+        action: 'merge_powerapps',
+        mergeCommitSha: mergeResult?.sha,
+      },
+    });
+
+    // Notify the sandbox creator
+    if (sandbox.createdById) {
+      await this.notificationsService.create({
+        userId: sandbox.createdById,
+        type: 'REVIEW_APPROVED',
+        title: 'Sandbox Merged',
+        message: `Your sandbox "${sandbox.name}" has been merged to main.`,
+      });
+    }
+
+    return {
+      success: true,
+      message: `Sandbox merged successfully. Changes are now in the main branch.`,
+      mergeCommitSha: mergeResult?.sha,
+    };
+  }
+
+  /**
+   * Background cleanup for merged PowerApps sandbox
+   * Deletes copied app, dev environment, and GitHub branch
+   */
+  private async cleanupPowerAppsSandbox(
+    userId: string,
+    organizationId: string,
+    copiedAppId: string,
+    devEnvironmentId: string,
+    githubBranch: string | null,
+    app: App,
+  ): Promise<void> {
+    this.logger.log(`Cleaning up PowerApps sandbox resources...`);
+
+    // Delete copied app
+    try {
+      this.logger.log(`Deleting copied app ${copiedAppId}`);
+      await this.powerAppsService.deleteApp(
+        userId,
+        organizationId,
+        copiedAppId,
+      );
+    } catch (error) {
+      this.logger.warn(`Failed to delete copied app: ${error.message}`);
+    }
+
+    // Delete dev environment
+    try {
+      this.logger.log(`Deleting dev environment ${devEnvironmentId}`);
+      await this.powerAppsService.deleteEnvironment(
+        userId,
+        organizationId,
+        devEnvironmentId,
+      );
+    } catch (error) {
+      this.logger.warn(`Failed to delete dev environment: ${error.message}`);
+    }
+
+    // Delete GitHub sandbox branch
+    if (githubBranch && app?.githubRepoName) {
+      try {
+        this.logger.log(`Deleting GitHub branch ${githubBranch}`);
+        const org = await this.prisma.organization.findUnique({
+          where: { id: organizationId },
+        });
+        if (org?.githubOrgName) {
+          await this.githubService.deleteBranchByName(
+            `${org.githubOrgName}/${app.githubRepoName}`,
+            githubBranch,
+            organizationId,
+          );
+        }
+      } catch (error) {
+        this.logger.warn(`Failed to delete GitHub branch: ${error.message}`);
+      }
+    }
+
+    this.logger.log(`Cleanup complete`);
+  }
+  /**
    * Submit sandbox for review
    * Exports model, commits to GitHub, runs change detection + policy + CI
    */
@@ -1927,7 +2568,7 @@ export class SandboxesService {
           `Committing model to GitHub branch ${sandbox.githubBranch}`,
         );
         const commitInfo = await this.githubService.commitAppSnapshot(
-          app as any,
+          app,
           exportPath,
           `[Sandbox] Submit for review: ${sandbox.name}`,
           sandbox.githubBranch || undefined,
@@ -1945,7 +2586,7 @@ export class SandboxesService {
       }
 
       // Save the previous SHA before updating (for incremental change detection)
-      const previousGithubSha = (sandbox as any).latestGithubSha;
+      const previousGithubSha = sandbox.latestGithubSha;
 
       // Update sandbox with latest GitHub SHA
       await this.prisma.sandbox.update({
@@ -2323,7 +2964,7 @@ export class SandboxesService {
     try {
       this.logger.log(`Committing to GitHub branch ${sandbox.githubBranch}`);
       commitInfo = await this.githubService.commitAppSnapshot(
-        app as any,
+        app,
         exportPath,
         changeTitle || `[Sync] ${sandbox.name}`,
         sandbox.githubBranch || undefined,
