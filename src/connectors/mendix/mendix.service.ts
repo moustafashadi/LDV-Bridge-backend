@@ -32,6 +32,17 @@ import { GitHubService } from '../../github/github.service';
 import { MendixModelSdkService } from './mendix-model-sdk.service';
 
 /**
+ * Interface to track resources created during app creation for rollback
+ */
+interface CreatedResources {
+  projectId?: string; // Mendix project (CANNOT be rolled back via API)
+  appId?: string; // Mendix deployment (CANNOT be rolled back via API)
+  dbAppId?: string; // Database record (CAN be rolled back)
+  githubRepoUrl?: string; // GitHub repository (CAN be rolled back)
+  organizationId?: string; // Organization ID for rollback context
+}
+
+/**
  * Mendix Connector Service
  * Integrates with Mendix Platform API using Personal Access Token (PAT) authentication
  *
@@ -1250,6 +1261,11 @@ Mendix App Export
       `[CREATE_APP] Creating Mendix app: ${config.name} (tempId: ${tempId})`,
     );
 
+    // Track created resources for rollback on failure
+    const createdResources: CreatedResources = {
+      organizationId,
+    };
+
     // Emit initializing step
     this.appCreationProgressService.emitStep(
       tempId,
@@ -1308,6 +1324,9 @@ Mendix App Export
       this.logger.log(
         `[CREATE_APP] Mendix project created with ID: ${projectId}`,
       );
+
+      // Track projectId for logging (cannot be rolled back via API)
+      createdResources.projectId = projectId;
 
       this.appCreationProgressService.emitStep(
         tempId,
@@ -1475,6 +1494,9 @@ Mendix App Export
 
       this.logger.log(`[CREATE_APP] App record created: ${app.id}`);
 
+      // Track database record for rollback
+      createdResources.dbAppId = app.id;
+
       this.appCreationProgressService.emitStep(
         tempId,
         APP_CREATION_STEPS.CREATING_DATABASE,
@@ -1516,6 +1538,9 @@ Mendix App Export
           if (updatedApp?.githubRepoUrl) {
             githubRepoUrl = updatedApp.githubRepoUrl;
           }
+
+          // Track GitHub repo for rollback
+          createdResources.githubRepoUrl = githubRepoUrl;
         } catch (repoError) {
           this.logger.warn(
             `[CREATE_APP] Failed to create GitHub repo: ${repoError.message}`,
@@ -1624,11 +1649,14 @@ Mendix App Export
             this.logger.log(`[CREATE_APP] ${syncMessage}`);
           }
         } catch (syncError) {
-          syncMessage = `Sync failed: ${syncError.message}`;
-          this.logger.warn(
+          // Re-throw sync error to trigger rollback
+          // The outer catch block will clean up created resources
+          this.logger.error(
             `[CREATE_APP] Initial sync failed: ${syncError.message}`,
           );
-          // Continue - app is created even if sync fails
+          throw new BadRequestException(
+            `Initial sync failed: ${syncError.message}. App creation rolled back.`,
+          );
         }
       }
 
@@ -1700,17 +1728,28 @@ Mendix App Export
         createdAt: app.createdAt,
       };
     } catch (error) {
-      // Emit error progress
+      // ROLLBACK: Clean up any resources that were created
+      this.logger.error(
+        `[CREATE_APP] Failed to create Mendix app: ${error.message}. Starting rollback...`,
+        error.stack,
+      );
+
+      const rolledBack = await this.rollbackAppCreation(
+        createdResources,
+        tempId,
+      );
+
+      // Emit error progress with rollback info
+      const rollbackInfo =
+        rolledBack.length > 0
+          ? `Rolled back: ${rolledBack.join(', ')}`
+          : 'No resources to rollback';
+
       this.appCreationProgressService.emitError(
         tempId,
         0,
-        'App creation failed',
-        error.message,
-      );
-
-      this.logger.error(
-        `[CREATE_APP] Failed to create Mendix app: ${error.message}`,
-        error.stack,
+        'App creation failed - changes rolled back',
+        `${error.message}. ${rollbackInfo}`,
       );
 
       if (error instanceof BadRequestException) {
@@ -1718,10 +1757,73 @@ Mendix App Export
       }
 
       throw new BadRequestException(
-        `Failed to create Mendix app: ${error.message}. ` +
+        `Failed to create Mendix app: ${error.message}. ${rollbackInfo}. ` +
           `Please ensure your PAT has 'mx:projects:write' permission.`,
       );
     }
+  }
+
+  /**
+   * Rollback created resources when app creation fails
+   * This provides transaction-like behavior for the multi-step creation process
+   */
+  private async rollbackAppCreation(
+    resources: CreatedResources,
+    tempId: string,
+  ): Promise<string[]> {
+    const rolledBack: string[] = [];
+
+    this.logger.log('[ROLLBACK] Starting rollback of created resources...');
+
+    // 1. Delete GitHub repository if created
+    if (resources.dbAppId && resources.githubRepoUrl) {
+      try {
+        const app = await this.appsService['prisma'].app.findUnique({
+          where: { id: resources.dbAppId },
+        });
+        if (app) {
+          this.logger.log('[ROLLBACK] Deleting GitHub repository...');
+          await this.githubService.deleteAppRepository(app);
+          rolledBack.push('GitHub repository');
+          this.logger.log('[ROLLBACK] GitHub repository deleted');
+        }
+      } catch (err) {
+        this.logger.warn(
+          `[ROLLBACK] Failed to delete GitHub repo: ${err.message}`,
+        );
+      }
+    }
+
+    // 2. Delete database record if created
+    if (resources.dbAppId && resources.organizationId) {
+      try {
+        this.logger.log('[ROLLBACK] Deleting database record...');
+        await this.appsService.deleteApp(
+          resources.dbAppId,
+          resources.organizationId,
+        );
+        rolledBack.push('Database record');
+        this.logger.log('[ROLLBACK] Database record deleted');
+      } catch (err) {
+        this.logger.warn(
+          `[ROLLBACK] Failed to delete app record: ${err.message}`,
+        );
+      }
+    }
+
+    // Note: Mendix project and deployment cannot be rolled back via API
+    if (resources.projectId) {
+      this.logger.warn(
+        `[ROLLBACK] Mendix project ${resources.projectId} was created but cannot be deleted via API. ` +
+          'Manual cleanup may be required in Mendix Portal.',
+      );
+    }
+
+    this.logger.log(
+      `[ROLLBACK] Rollback complete. Resources cleaned up: ${rolledBack.join(', ') || 'none'}`,
+    );
+
+    return rolledBack;
   }
 
   /**

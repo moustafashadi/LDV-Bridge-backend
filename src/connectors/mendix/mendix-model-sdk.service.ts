@@ -525,8 +525,47 @@ ${summary.modules.length > 0 ? summary.modules.map((m: string) => `- ${m}`).join
       this.logger.log(
         `[GIT] Fetching branch '${branchName}' with sparse checkout...`,
       );
-      await repoGit.fetch('origin', branchName, ['--depth', '1']);
-      await repoGit.checkout([`origin/${branchName}`, '--']);
+
+      // Add timeout to prevent hanging on slow/large repos (2 minutes)
+      const GIT_TIMEOUT_MS = 120_000;
+
+      // Create new git instance WITH timeout configuration
+      const gitWithTimeout = simpleGit(exportDir, {
+        timeout: {
+          block: GIT_TIMEOUT_MS, // Max time for any single git operation
+        },
+      });
+
+      // Re-apply config on the new instance
+      await gitWithTimeout.raw(['config', 'core.longpaths', 'true']);
+      await gitWithTimeout.raw(['config', 'core.sparseCheckout', 'true']);
+
+      try {
+        await gitWithTimeout.fetch('origin', branchName, ['--depth', '1']);
+        await gitWithTimeout.checkout([`origin/${branchName}`, '--']);
+      } catch (gitError) {
+        const errorMessage = (gitError as Error).message || String(gitError);
+        const isTimeout =
+          errorMessage.includes('timed out') ||
+          errorMessage.includes('ETIMEDOUT') ||
+          errorMessage.includes('timeout');
+
+        this.logger.error(
+          `[GIT] Git operation failed: ${errorMessage}${isTimeout ? ' (TIMEOUT)' : ''}`,
+        );
+
+        // Clean up temp directory on failure
+        try {
+          fs.rmSync(exportDir, { recursive: true, force: true });
+        } catch {}
+
+        if (isTimeout) {
+          throw new Error(
+            `Git clone timed out after ${GIT_TIMEOUT_MS / 1000} seconds. The repository may be too large or the network is slow. Please try again.`,
+          );
+        }
+        throw gitError;
+      }
 
       this.logger.log(`[GIT] Clone complete. Processing files...`);
 
@@ -757,10 +796,37 @@ These JSON files enable meaningful diffs when changes are made in Mendix Studio.
       this.logger.log(
         `[JSON] Creating working copy for JSON export (branch: ${branchName})...`,
       );
-      const workingCopy = await app.createTemporaryWorkingCopy(branchName);
+
+      // Add timeout to SDK calls (60 seconds) - these can hang indefinitely
+      const SDK_TIMEOUT_MS = 60_000;
+
+      const withTimeout = <T>(
+        promise: Promise<T>,
+        operation: string,
+      ): Promise<T> => {
+        return Promise.race([
+          promise,
+          new Promise<T>((_, reject) =>
+            setTimeout(
+              () =>
+                reject(
+                  new Error(
+                    `Mendix SDK ${operation} timed out after ${SDK_TIMEOUT_MS / 1000} seconds`,
+                  ),
+                ),
+              SDK_TIMEOUT_MS,
+            ),
+          ),
+        ]);
+      };
+
+      const workingCopy = await withTimeout(
+        app.createTemporaryWorkingCopy(branchName),
+        'createTemporaryWorkingCopy',
+      );
 
       this.logger.log(`[JSON] Opening model...`);
-      const model = await workingCopy.openModel();
+      const model = await withTimeout(workingCopy.openModel(), 'openModel');
 
       // Create subdirectories
       const pagesDir = path.join(jsonDir, 'pages');

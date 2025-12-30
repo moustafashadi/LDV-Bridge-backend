@@ -710,7 +710,7 @@ export class GitHubService {
 
     const token = await this.getInstallationToken(sandbox.organizationId);
     const repoFullName = `${org.githubOrgName}/${app.githubRepoName}`;
-    const branchName = `sandbox/${sandbox.id.slice(0, 8)}`;
+    const branchName = `sandbox/${sandbox.name.replace(' ', '-')}`; //replace spaces with -
 
     // Get main branch SHA
     const mainSha = await this.getBranchRef(repoFullName, 'main', token);

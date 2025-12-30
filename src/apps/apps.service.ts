@@ -94,6 +94,48 @@ export class AppsService {
   }
 
   /**
+   * Delete an app and all its related records
+   * Used for rollback when app creation fails
+   */
+  async deleteApp(appId: string, organizationId: string): Promise<void> {
+    const app = await this.prisma.app.findFirst({
+      where: { id: appId, organizationId },
+    });
+
+    if (!app) {
+      throw new NotFoundException('App not found');
+    }
+
+    this.logger.log(
+      `[DELETE_APP] Deleting app ${appId} and related records...`,
+    );
+
+    // Delete in order of dependencies
+    // 1. Delete reviews related to changes
+    await this.prisma.review.deleteMany({
+      where: {
+        change: {
+          appId,
+        },
+      },
+    });
+
+    // 2. Delete changes
+    await this.prisma.change.deleteMany({ where: { appId } });
+
+    // 3. Delete sandboxes
+    await this.prisma.sandbox.deleteMany({ where: { appId } });
+
+    // 4. Delete permissions
+    await this.prisma.appPermission.deleteMany({ where: { appId } });
+
+    // 5. Delete the app itself
+    await this.prisma.app.delete({ where: { id: appId } });
+
+    this.logger.log(`[DELETE_APP] Successfully deleted app ${appId}`);
+  }
+
+  /**
    * Get all apps in the organization
    */
   async getAllApps(organizationId: string) {
