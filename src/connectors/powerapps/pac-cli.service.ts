@@ -540,34 +540,48 @@ export class PacCliService {
 
   /**
    * Select/connect to a Power Platform environment
+   * @param environmentIdOrUrl Environment ID (GUID) or Dataverse URL (https://...crm.dynamics.com)
    */
-  async selectEnvironment(environmentId: string): Promise<void> {
-    try {
-      // PAC CLI uses environment URL or ID
-      const envUrl = `https://${environmentId}.crm.dynamics.com`;
+  async selectEnvironment(environmentIdOrUrl: string): Promise<void> {
+    // Check if it's already a URL format
+    const isUrl = environmentIdOrUrl.startsWith('https://');
+    
+    const attempts = [
+      // First try with the provided value as-is
+      { command: `org select --environment '${environmentIdOrUrl}'`, desc: 'org select' },
+      { command: `env select --environment '${environmentIdOrUrl}'`, desc: 'env select' },
+    ];
 
-      const { stdout, stderr } = await this.execPac(
-        `org select --environment '${environmentId}'`,
-        { timeout: 30000 },
-      );
-
-      this.logger.log(`Selected environment: ${environmentId}`);
-    } catch (error) {
-      // Try with full environment URL format
-      try {
-        await this.execPac(`env select --environment '${environmentId}'`, {
-          timeout: 30000,
-        });
-        this.logger.log(
-          `Selected environment via env select: ${environmentId}`,
-        );
-      } catch (e2) {
-        this.logger.error(`Failed to select environment: ${error.message}`);
-        throw new BadRequestException(
-          `Failed to select environment: ${error.message}`,
-        );
+    // If provided value is an ID (not URL), also try URL format as fallback
+    if (!isUrl && environmentIdOrUrl.match(/^[0-9a-f-]{36}$/i)) {
+      // Try common Dataverse URL patterns for newly created environments
+      // Note: New environments may use different regional URLs
+      const urlPatterns = [
+        `https://${environmentIdOrUrl}.crm.dynamics.com`,
+        `https://${environmentIdOrUrl}.crm4.dynamics.com`,
+      ];
+      for (const url of urlPatterns) {
+        attempts.push({ command: `org select --environment '${url}'`, desc: `org select with URL ${url}` });
       }
     }
+
+    let lastError: Error | null = null;
+    for (const { command, desc } of attempts) {
+      try {
+        this.logger.debug(`Trying ${desc}...`);
+        await this.execPac(command, { timeout: 30000 });
+        this.logger.log(`Selected environment via ${desc}: ${environmentIdOrUrl}`);
+        return;
+      } catch (error) {
+        this.logger.debug(`${desc} failed: ${error.message}`);
+        lastError = error;
+      }
+    }
+
+    this.logger.error(`Failed to select environment after all attempts: ${lastError?.message}`);
+    throw new BadRequestException(
+      `Failed to select environment: ${lastError?.message}`,
+    );
   }
 
   /**

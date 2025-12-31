@@ -1306,19 +1306,76 @@ export class PowerAppsService implements IBaseConnector {
               sourceAppId,
             );
 
-            // Step 2d: Use PAC CLI to export the solution and import to target
+            // Step 2d: Get target environment Dataverse URL
             this.logger.log(
-              'Step 2d: Using PAC CLI to export and import solution...',
+              'Step 2d: Getting target environment Dataverse URL...',
             );
-            const result = await this.pacCliService.exportAndImportSolution(
-              solutionName,
-              sourceEnvironmentId,
+            const targetDataverseUrl = await this.getEnvironmentDataverseUrl(
+              userId,
+              organizationId,
               targetEnvironmentId,
-              newDisplayName,
             );
 
-            // Step 2e: Cleanup - delete temporary solution from source
-            this.logger.log('Step 2e: Cleaning up temporary solution...');
+            if (!targetDataverseUrl) {
+              throw new Error(
+                'Target environment does not have Dataverse provisioned',
+              );
+            }
+
+            // Step 2e: Use Dataverse Web API to export and import solution
+            this.logger.log(
+              'Step 2e: Exporting and importing solution via Dataverse API...',
+            );
+            await this.exportAndImportSolutionViaDataverse(
+              userId,
+              organizationId,
+              sourceDataverseUrl,
+              targetDataverseUrl,
+              solutionName,
+            );
+
+            // Step 2f: Find the imported canvas app in the target environment
+            this.logger.log('Step 2f: Looking up imported app in target...');
+            const targetClient = await this.getDataverseClient(
+              userId,
+              organizationId,
+              targetDataverseUrl,
+            );
+
+            // Query for the solution component (canvas app) that was imported
+            const solutionQuery = await targetClient.get(
+              `/solutions?$filter=uniquename eq '${solutionName}'&$select=solutionid`,
+            );
+
+            let importedAppId = '';
+            if (
+              solutionQuery.data.value &&
+              solutionQuery.data.value.length > 0
+            ) {
+              const importedSolutionId = solutionQuery.data.value[0].solutionid;
+              // Query solution components to find the canvas app
+              const componentsQuery = await targetClient.get(
+                `/solutioncomponents?$filter=_solutionid_value eq ${importedSolutionId} and componenttype eq 300&$select=objectid`,
+              );
+
+              if (
+                componentsQuery.data.value &&
+                componentsQuery.data.value.length > 0
+              ) {
+                // Component type 300 = canvas app, objectid is the canvasapp entity ID
+                const canvasAppEntityId =
+                  componentsQuery.data.value[0].objectid;
+                // Now get the actual PowerApps app ID from the canvasapp entity
+                const canvasAppQuery = await targetClient.get(
+                  `/canvasapps(${canvasAppEntityId})?$select=canvasappid`,
+                );
+                importedAppId =
+                  canvasAppQuery.data.canvasappid || canvasAppEntityId;
+              }
+            }
+
+            // Step 2g: Cleanup - delete temporary solution from source
+            this.logger.log('Step 2g: Cleaning up temporary solution...');
             await this.deleteSolutionFromDataverse(
               userId,
               organizationId,
@@ -1326,7 +1383,17 @@ export class PowerAppsService implements IBaseConnector {
               solutionName,
             );
 
-            return result;
+            // Build studio URL
+            const studioUrl = importedAppId
+              ? `https://make.powerapps.com/e/${targetEnvironmentId}/canvas?action=edit&app-id=/providers/Microsoft.PowerApps/apps/${importedAppId}`
+              : undefined;
+
+            return {
+              appId: importedAppId || `imported-${solutionName}`,
+              name: importedAppId || solutionName,
+              displayName: newDisplayName,
+              studioUrl,
+            };
           } catch (solutionError) {
             this.logger.warn(
               `Solution-based copy failed: ${solutionError.message}, falling back to REST API`,
@@ -2200,6 +2267,150 @@ export class PowerAppsService implements IBaseConnector {
         `Failed to delete solution: ${error.response?.data?.error?.message || error.message}`,
       );
       // Don't throw - cleanup errors are non-fatal
+    }
+  }
+
+  /**
+   * Export a solution from Dataverse using Web API
+   * Uses the ExportSolution action which returns base64-encoded solution zip
+   * @returns Buffer containing the solution zip file
+   */
+  async exportSolutionViaDataverse(
+    userId: string,
+    organizationId: string,
+    dataverseUrl: string,
+    solutionName: string,
+    managed = false,
+  ): Promise<Buffer> {
+    const client = await this.getDataverseClient(
+      userId,
+      organizationId,
+      dataverseUrl,
+    );
+
+    try {
+      this.logger.log(
+        `Exporting solution ${solutionName} from ${dataverseUrl} (managed=${managed})`,
+      );
+
+      // Call the ExportSolution action
+      const response = await client.post('/ExportSolution', {
+        SolutionName: solutionName,
+        Managed: managed,
+      });
+
+      // Response contains ExportSolutionFile as base64-encoded string
+      const base64Content = response.data.ExportSolutionFile;
+      if (!base64Content) {
+        throw new Error('ExportSolutionFile not returned in response');
+      }
+
+      const buffer = Buffer.from(base64Content, 'base64');
+      this.logger.log(
+        `Exported solution ${solutionName}: ${buffer.length} bytes`,
+      );
+      return buffer;
+    } catch (error) {
+      this.logger.error(
+        `Failed to export solution: ${error.response?.data?.error?.message || error.message}`,
+      );
+      throw new BadRequestException(
+        `Failed to export solution from Dataverse: ${error.response?.data?.error?.message || error.message}`,
+      );
+    }
+  }
+
+  /**
+   * Import a solution to Dataverse using Web API
+   * Uses the ImportSolution action which accepts base64-encoded solution zip
+   * @param solutionZip Buffer containing the solution zip file
+   * @param overwriteUnmanagedCustomizations Whether to overwrite existing customizations
+   */
+  async importSolutionViaDataverse(
+    userId: string,
+    organizationId: string,
+    dataverseUrl: string,
+    solutionZip: Buffer,
+    overwriteUnmanagedCustomizations = true,
+    publishWorkflows = true,
+  ): Promise<void> {
+    const client = await this.getDataverseClient(
+      userId,
+      organizationId,
+      dataverseUrl,
+    );
+
+    try {
+      const base64Content = solutionZip.toString('base64');
+      // Generate a unique import job ID (GUID format required)
+      const importJobId = require('crypto').randomUUID();
+
+      this.logger.log(
+        `Importing solution to ${dataverseUrl} (${solutionZip.length} bytes, jobId=${importJobId})`,
+      );
+
+      // Call the ImportSolution action
+      await client.post('/ImportSolution', {
+        CustomizationFile: base64Content,
+        OverwriteUnmanagedCustomizations: overwriteUnmanagedCustomizations,
+        PublishWorkflows: publishWorkflows,
+        ImportJobId: importJobId,
+      });
+
+      this.logger.log('Solution imported successfully');
+    } catch (error) {
+      this.logger.error(
+        `Failed to import solution: ${error.response?.data?.error?.message || error.message}`,
+      );
+      throw new BadRequestException(
+        `Failed to import solution to Dataverse: ${error.response?.data?.error?.message || error.message}`,
+      );
+    }
+  }
+
+  /**
+   * Export solution from source environment and import to target environment
+   * Uses Dataverse Web API instead of PAC CLI to avoid auth limitations
+   */
+  async exportAndImportSolutionViaDataverse(
+    userId: string,
+    organizationId: string,
+    sourceDataverseUrl: string,
+    targetDataverseUrl: string,
+    solutionName: string,
+  ): Promise<void> {
+    try {
+      this.logger.log(`Cross-environment solution transfer: ${solutionName}`);
+      this.logger.log(`  Source: ${sourceDataverseUrl}`);
+      this.logger.log(`  Target: ${targetDataverseUrl}`);
+
+      // Step 1: Export solution from source
+      this.logger.log('Step 1: Exporting solution from source environment...');
+      const solutionZip = await this.exportSolutionViaDataverse(
+        userId,
+        organizationId,
+        sourceDataverseUrl,
+        solutionName,
+        false, // Unmanaged for dev workflow
+      );
+
+      // Step 2: Import solution to target
+      this.logger.log('Step 2: Importing solution to target environment...');
+      await this.importSolutionViaDataverse(
+        userId,
+        organizationId,
+        targetDataverseUrl,
+        solutionZip,
+        true, // Overwrite existing customizations
+        true, // Publish workflows
+      );
+
+      this.logger.log(
+        `Successfully transferred solution ${solutionName} to target environment`,
+      );
+    } catch (error) {
+      this.logger.error(`Failed to transfer solution: ${error.message}`);
+      throw error;
     }
   }
 
