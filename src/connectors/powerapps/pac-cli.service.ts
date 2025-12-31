@@ -81,6 +81,7 @@ export class PacCliService {
   /**
    * Execute a PAC CLI command
    * Uses PowerShell on Windows to properly handle paths with spaces
+   * Note: PAC CLI writes output to stderr, so we redirect stderr to stdout (2>&1)
    */
   private async execPac(
     args: string,
@@ -89,9 +90,10 @@ export class PacCliService {
     const pacPath = await this.getPacPath();
     const isWindows = os.platform() === 'win32';
     // On Windows, use PowerShell with & operator and escaped double quotes to handle paths with spaces
+    // PAC CLI writes output to stderr, so we need 2>&1 to redirect it to stdout for capture
     const command = isWindows
-      ? `powershell -Command "& \`"${pacPath}\`" ${args}"`
-      : `"${pacPath}" ${args}`;
+      ? `powershell -Command "& '${pacPath}' ${args} 2>&1"`
+      : `"${pacPath}" ${args} 2>&1`;
     this.logger.debug(`Executing: ${command}`);
     return execAsync(command, { timeout: options?.timeout || 60000 });
   }
@@ -137,7 +139,7 @@ export class PacCliService {
 
       // Clear existing profile if exists
       try {
-        await this.execPac(`auth delete --name "${profileName}"`);
+        await this.execPac(`auth delete --name '${profileName}'`);
       } catch {
         // Profile might not exist, ignore error
       }
@@ -145,7 +147,7 @@ export class PacCliService {
       // Create new profile with access token
       // Note: PAC CLI supports --cloud and various auth methods
       const { stdout, stderr } = await this.execPac(
-        `auth create --name "${profileName}" --environment "${environmentUrl}" --kind Admin`,
+        `auth create --name '${profileName}' --environment '${environmentUrl}' --kind Admin`,
         { timeout: 60000 },
       );
 
@@ -167,7 +169,7 @@ export class PacCliService {
    */
   async selectAuthProfile(profileName: string): Promise<void> {
     try {
-      await this.execPac(`auth select --name "${profileName}"`);
+      await this.execPac(`auth select --name '${profileName}'`);
       this.logger.log(`Selected PAC auth profile: ${profileName}`);
     } catch (error) {
       throw new BadRequestException(
@@ -545,7 +547,7 @@ export class PacCliService {
       const envUrl = `https://${environmentId}.crm.dynamics.com`;
 
       const { stdout, stderr } = await this.execPac(
-        `org select --environment "${environmentId}"`,
+        `org select --environment '${environmentId}'`,
         { timeout: 30000 },
       );
 
@@ -553,7 +555,7 @@ export class PacCliService {
     } catch (error) {
       // Try with full environment URL format
       try {
-        await this.execPac(`env select --environment "${environmentId}"`, {
+        await this.execPac(`env select --environment '${environmentId}'`, {
           timeout: 30000,
         });
         this.logger.log(
@@ -768,8 +770,9 @@ export class PacCliService {
       }
 
       // Run the export command
+      // Note: Use single quotes for arguments since execPac uses double quotes for PowerShell command
       const { stdout, stderr } = await this.execPac(
-        `solution export --name "${solutionName}" --path "${outputPath}" --managed false --overwrite`,
+        `solution export --name '${solutionName}' --path '${outputPath}' --managed false --overwrite`,
         { timeout: 300000 }, // 5 minute timeout
       );
 
@@ -837,7 +840,7 @@ export class PacCliService {
       await fs.access(solutionPath);
 
       const { stdout, stderr } = await this.execPac(
-        `solution import --path "${solutionPath}" --async false`,
+        `solution import --path '${solutionPath}' --async false`,
         { timeout: 600000 }, // 10 minute timeout for large solutions
       );
 
@@ -860,7 +863,7 @@ export class PacCliService {
   async deleteSolution(solutionName: string): Promise<void> {
     try {
       const { stdout, stderr } = await this.execPac(
-        `solution delete --solution-unique-name "${solutionName}"`,
+        `solution delete --solution-unique-name '${solutionName}'`,
         { timeout: 120000 },
       );
 
