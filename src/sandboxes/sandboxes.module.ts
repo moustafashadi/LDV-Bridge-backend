@@ -3,6 +3,7 @@ import { ScheduleModule } from '@nestjs/schedule';
 import { SandboxesController } from './sandboxes.controller';
 import { SandboxesService } from './sandboxes.service';
 import { SyncProgressService } from './sync-progress.service';
+import { SandboxCreationProgressService } from './sandbox-creation-progress.service';
 import { PowerAppsProvisioner } from './provisioners/powerapps.provisioner';
 import { MendixProvisioner } from './provisioners/mendix.provisioner';
 import { PrismaModule } from '../prisma/prisma.module';
@@ -28,9 +29,14 @@ import { ReviewsModule } from '../reviews/reviews.module';
   providers: [
     SandboxesService,
     SyncProgressService,
+    SandboxCreationProgressService,
     PowerAppsProvisioner,
     MendixProvisioner,
   ],
-  exports: [SandboxesService, SyncProgressService],
+  exports: [
+    SandboxesService,
+    SyncProgressService,
+    SandboxCreationProgressService,
+  ],
 })
 export class SandboxesModule {}

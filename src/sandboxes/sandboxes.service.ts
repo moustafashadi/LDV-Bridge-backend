@@ -36,6 +36,10 @@ import { GitHubService } from '../github/github.service';
 import { ChangesService } from '../changes/changes.service';
 import { ReviewsService } from '../reviews/reviews.service';
 import { SyncProgressService, SYNC_STEPS } from './sync-progress.service';
+import {
+  SandboxCreationProgressService,
+  POWERAPPS_CREATION_STEPS,
+} from './sandbox-creation-progress.service';
 import { App as MendixApp } from 'mendixplatformsdk';
 import { App } from '@prisma/client';
 
@@ -93,6 +97,7 @@ export class SandboxesService {
     @Inject(forwardRef(() => ReviewsService))
     private readonly reviewsService: ReviewsService,
     private readonly syncProgressService: SyncProgressService,
+    private readonly sandboxCreationProgressService: SandboxCreationProgressService,
     @Inject(forwardRef(() => PowerAppsService))
     private readonly powerAppsService: PowerAppsService,
   ) {
@@ -1775,179 +1780,280 @@ export class SandboxesService {
     userId: string,
     organizationId: string,
     description?: string,
+    tempId?: string,
   ): Promise<SandboxResponseDto> {
     this.logger.log(
       `Creating PowerApps feature sandbox "${featureName}" for app ${appId}`,
     );
 
-    // Get the source app
-    const app = await this.prisma.app.findFirst({
-      where: { id: appId, organizationId, platform: 'POWERAPPS' },
-      include: { owner: true },
-    });
-
-    if (!app) {
-      throw new NotFoundException(`PowerApps app ${appId} not found`);
-    }
-
-    // Check if user has access (owner or has permission)
-    const hasAccess =
-      app.ownerId === userId ||
-      (await this.prisma.appPermission.findFirst({
-        where: { appId, userId, accessLevel: { in: ['EDITOR', 'OWNER'] } },
-      }));
-
-    if (!hasAccess) {
-      throw new ForbiddenException(
-        'You do not have access to create sandboxes for this app',
+    // Emit initial progress if tempId provided
+    const trackingId = tempId || appId;
+    if (tempId) {
+      this.sandboxCreationProgressService.emitStep(
+        trackingId,
+        POWERAPPS_CREATION_STEPS.VALIDATING,
+        'in-progress',
       );
     }
 
-    // Generate branch/sandbox name from feature name
-    const slug = featureName
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, '')
-      .replace(/\s+/g, '-')
-      .substring(0, 50);
-    const githubBranch = `sandbox/${slug}`;
+    // Track created resources for rollback
+    const createdResources = {
+      devEnvironmentId: null as string | null,
+      copiedAppId: null as string | null,
+      sandboxId: null as string | null,
+      githubBranch: null as string | null,
+    };
 
-    // Check if sandbox already exists for this feature
-    const existingSandbox = await this.prisma.sandbox.findFirst({
-      where: {
-        appId,
-        organizationId,
-        githubBranch,
-        status: {
-          notIn: [
-            SandboxStatus.MERGED,
-            SandboxStatus.ABANDONED,
-            SandboxStatus.REJECTED,
-          ],
-        },
-      },
-    });
+    // Rollback helper function
+    const rollback = async (reason: string) => {
+      this.logger.warn(`Rolling back PowerApps feature sandbox: ${reason}`);
+      const errors: string[] = [];
 
-    if (existingSandbox) {
-      throw new BadRequestException(
-        `A sandbox with name "${featureName}" already exists for this app`,
-      );
-    }
+      // Delete GitHub branch if created
+      if (createdResources.githubBranch && createdResources.sandboxId) {
+        try {
+          const sandbox = await this.prisma.sandbox.findUnique({
+            where: { id: createdResources.sandboxId },
+            include: { app: true },
+          });
+          if (sandbox?.app?.githubRepoId) {
+            await this.githubService.deleteBranchByName(
+              organizationId,
+              sandbox.app.githubRepoId.toString(),
+              createdResources.githubBranch,
+            );
+            this.logger.log(
+              `Rolled back: GitHub branch ${createdResources.githubBranch}`,
+            );
+          }
+        } catch (e) {
+          errors.push(`GitHub branch: ${e.message}`);
+        }
+      }
 
-    // Get source app's external ID (PowerApps app ID)
-    const sourceAppId = app.externalId;
-    if (!sourceAppId) {
-      throw new BadRequestException(
-        'App does not have a PowerApps external ID. Cannot create sandbox.',
-      );
-    }
+      // Delete sandbox record if created
+      if (createdResources.sandboxId) {
+        try {
+          await this.prisma.sandbox.delete({
+            where: { id: createdResources.sandboxId },
+          });
+          this.logger.log(
+            `Rolled back: Sandbox record ${createdResources.sandboxId}`,
+          );
+        } catch (e) {
+          errors.push(`Sandbox record: ${e.message}`);
+        }
+      }
 
-    // Get source app's environment ID from metadata
-    const appMetadata = app.metadata as any;
-    const sourceEnvironmentId =
-      appMetadata?.properties?.environment?.name || appMetadata?.environmentId;
+      // Delete copied app if created
+      if (createdResources.copiedAppId) {
+        try {
+          await this.powerAppsService.deleteApp(
+            userId,
+            organizationId,
+            createdResources.copiedAppId,
+          );
+          this.logger.log(
+            `Rolled back: Copied app ${createdResources.copiedAppId}`,
+          );
+        } catch (e) {
+          errors.push(`Copied app: ${e.message}`);
+        }
+      }
 
-    if (!sourceEnvironmentId) {
-      throw new BadRequestException(
-        'Cannot determine source environment. Please sync the app first.',
-      );
-    }
+      // Delete dev environment if created
+      if (createdResources.devEnvironmentId) {
+        try {
+          await this.powerAppsService.deleteEnvironment(
+            userId,
+            organizationId,
+            createdResources.devEnvironmentId,
+          );
+          this.logger.log(
+            `Rolled back: Dev environment ${createdResources.devEnvironmentId}`,
+          );
+        } catch (e) {
+          errors.push(`Dev environment: ${e.message}`);
+        }
+      }
 
-    // Step 1: Get or create a dev environment for the user
-    let devEnvironmentId: string;
-    let devEnvironmentUrl: string;
+      if (errors.length > 0) {
+        this.logger.error(`Rollback errors: ${errors.join('; ')}`);
+      }
+    };
+
     try {
-      this.logger.log(`Creating dev environment for user ${userId}`);
+      // Get the source app
+      const app = await this.prisma.app.findFirst({
+        where: { id: appId, organizationId, platform: 'POWERAPPS' },
+        include: { owner: true },
+      });
+
+      if (!app) {
+        throw new NotFoundException(`PowerApps app ${appId} not found`);
+      }
+
+      // Check if user has access (owner or has permission)
+      const hasAccess =
+        app.ownerId === userId ||
+        (await this.prisma.appPermission.findFirst({
+          where: { appId, userId, accessLevel: { in: ['EDITOR', 'OWNER'] } },
+        }));
+
+      if (!hasAccess) {
+        throw new ForbiddenException(
+          'You do not have access to create sandboxes for this app',
+        );
+      }
+
+      // Generate branch/sandbox name from feature name
+      const slug = featureName
+        .toLowerCase()
+        .replace(/[^a-z0-9\s-]/g, '')
+        .replace(/\s+/g, '-')
+        .substring(0, 50);
+      const githubBranch = `sandbox/${slug}`;
+
+      // Check if sandbox already exists for this feature
+      const existingSandbox = await this.prisma.sandbox.findFirst({
+        where: {
+          appId,
+          organizationId,
+          githubBranch,
+          status: {
+            notIn: [
+              SandboxStatus.MERGED,
+              SandboxStatus.ABANDONED,
+              SandboxStatus.REJECTED,
+            ],
+          },
+        },
+      });
+
+      if (existingSandbox) {
+        throw new BadRequestException(
+          `A sandbox with name "${featureName}" already exists for this app`,
+        );
+      }
+
+      // Get source app's external ID (PowerApps app ID)
+      const sourceAppId = app.externalId;
+      if (!sourceAppId) {
+        throw new BadRequestException(
+          'App does not have a PowerApps external ID. Cannot create sandbox.',
+        );
+      }
+
+      // Get source app's environment ID from metadata
+      const appMetadata = app.metadata as any;
+      const sourceEnvironmentId =
+        appMetadata?.properties?.environment?.name ||
+        appMetadata?.environmentId;
+
+      if (!sourceEnvironmentId) {
+        throw new BadRequestException(
+          'Cannot determine source environment. Please sync the app first.',
+        );
+      }
+
+      // Step 1: Create a dev environment for the user
+      this.logger.log(`Step 1: Creating dev environment for user ${userId}`);
+      if (tempId) {
+        this.sandboxCreationProgressService.emitStep(
+          trackingId,
+          POWERAPPS_CREATION_STEPS.CREATING_ENVIRONMENT,
+          'in-progress',
+        );
+      }
       const envResult = await this.powerAppsService.createEnvironment(
         userId,
         organizationId,
         {
           name: `Dev-${featureName.substring(0, 30)}`,
-          region: 'unitedstates', // Default location
+          region: 'unitedstates',
           type: 'Developer',
         },
       );
-      devEnvironmentId = envResult.environmentId;
-      devEnvironmentUrl = envResult.environmentUrl;
-      this.logger.log(`Dev environment created: ${devEnvironmentId}`);
-    } catch (error) {
-      this.logger.error(`Failed to create dev environment: ${error.message}`);
-      throw new BadRequestException(
-        `Failed to create dev environment: ${error.message}`,
-      );
-    }
+      createdResources.devEnvironmentId = envResult.environmentId;
+      this.logger.log(`Dev environment created: ${envResult.environmentId}`);
 
-    // Step 2: Copy the app to the dev environment
-    let copiedAppInfo: { appId: string; name: string; displayName: string };
-    try {
-      this.logger.log(
-        `Copying app ${sourceAppId} to dev environment ${devEnvironmentId}`,
-      );
-      copiedAppInfo = await this.powerAppsService.copyApp(
+      // Note: Dataverse provisioning happens inside createEnvironment
+      // and emits its own progress (PROVISIONING_DATAVERSE step)
+
+      // Step 2: Copy the app to the dev environment
+      this.logger.log(`Step 2: Copying app ${sourceAppId} to dev environment`);
+      if (tempId) {
+        this.sandboxCreationProgressService.emitStep(
+          trackingId,
+          POWERAPPS_CREATION_STEPS.COPYING_APP,
+          'in-progress',
+        );
+      }
+      const copiedAppInfo = await this.powerAppsService.copyApp(
         userId,
         organizationId,
         sourceAppId,
-        devEnvironmentId,
+        envResult.environmentId,
         `${app.name}-${featureName}`.substring(0, 100),
       );
+      createdResources.copiedAppId = copiedAppInfo.appId;
       this.logger.log(`App copied successfully: ${copiedAppInfo.appId}`);
-    } catch (error) {
-      this.logger.error(`Failed to copy app: ${error.message}`);
-      // Cleanup: delete the dev environment we just created
-      try {
-        await this.powerAppsService.deleteEnvironment(
-          userId,
-          organizationId,
-          devEnvironmentId,
-        );
-      } catch (cleanupError) {
-        this.logger.warn(
-          `Failed to cleanup dev environment: ${cleanupError.message}`,
+
+      // Build studio URL for the copied app
+      const studioUrl = `https://make.powerapps.com/environments/${envResult.environmentId}/apps/${copiedAppInfo.appId}/edit`;
+
+      // Step 3: Create sandbox record
+      this.logger.log(`Step 3: Creating sandbox record`);
+      if (tempId) {
+        this.sandboxCreationProgressService.emitStep(
+          trackingId,
+          POWERAPPS_CREATION_STEPS.CREATING_SANDBOX_RECORD,
+          'in-progress',
         );
       }
-      throw new BadRequestException(`Failed to copy app: ${error.message}`);
-    }
-
-    // Build studio URL for the copied app
-    const studioUrl = `https://make.powerapps.com/environments/${devEnvironmentId}/apps/${copiedAppInfo.appId}/edit`;
-
-    // Step 3: Create sandbox record (before GitHub to get sandbox ID)
-    const sandbox = await this.prisma.sandbox.create({
-      data: {
-        organizationId,
-        createdById: userId,
-        appId,
-        name: featureName,
-        description: description || `Feature: ${featureName}`,
-        status: SandboxStatus.ACTIVE,
-        githubBranch,
-        environment: {
-          platform: 'POWERAPPS',
-          featureBased: true,
-          devEnvironmentId,
-          devEnvironmentUrl,
-          copiedAppId: copiedAppInfo.appId,
-          copiedAppName: copiedAppInfo.displayName,
-          sourceAppId,
-          sourceEnvironmentId,
-          studioUrl,
+      const sandbox = await this.prisma.sandbox.create({
+        data: {
+          organizationId,
+          createdById: userId,
+          appId,
+          name: featureName,
+          description: description || `Feature: ${featureName}`,
+          status: SandboxStatus.ACTIVE,
+          githubBranch,
+          environment: {
+            platform: 'POWERAPPS',
+            featureBased: true,
+            devEnvironmentId: envResult.environmentId,
+            devEnvironmentUrl: envResult.environmentUrl,
+            copiedAppId: copiedAppInfo.appId,
+            copiedAppName: copiedAppInfo.displayName,
+            sourceAppId,
+            sourceEnvironmentId,
+            studioUrl,
+          },
         },
-      },
-      include: {
-        createdBy: {
-          select: { id: true, email: true, name: true },
+        include: {
+          createdBy: {
+            select: { id: true, email: true, name: true },
+          },
+          app: true,
         },
-        app: true,
-      },
-    });
+      });
+      createdResources.sandboxId = sandbox.id;
+      this.logger.log(`Sandbox record created: ${sandbox.id}`);
 
-    // Step 4: Create GitHub branch
-    let githubBranchInfo: { name: string; commit: { sha: string } } | null =
-      null;
-    try {
-      this.logger.log(
-        `Creating GitHub branch "${githubBranch}" for sandbox ${sandbox.id}`,
-      );
-      githubBranchInfo = await this.githubService.createSandboxBranch(sandbox);
+      // Step 4: Create GitHub branch
+      this.logger.log(`Step 4: Creating GitHub branch "${githubBranch}"`);
+      if (tempId) {
+        this.sandboxCreationProgressService.emitStep(
+          trackingId,
+          POWERAPPS_CREATION_STEPS.CREATING_GITHUB_BRANCH,
+          'in-progress',
+        );
+      }
+      const githubBranchInfo =
+        await this.githubService.createSandboxBranch(sandbox);
+      createdResources.githubBranch = githubBranch;
 
       // Update sandbox with GitHub SHA
       await this.prisma.sandbox.update({
@@ -1957,66 +2063,70 @@ export class SandboxesService {
           latestGithubSha: githubBranchInfo.commit.sha,
         },
       });
-
       this.logger.log(
         `GitHub branch created with SHA ${githubBranchInfo.commit.sha}`,
       );
-    } catch (error) {
-      this.logger.error(`Failed to create GitHub branch: ${error.message}`);
-      // Clean up: delete the sandbox record
-      await this.prisma.sandbox.delete({ where: { id: sandbox.id } });
-      // Clean up: delete the copied app and dev environment
-      try {
-        await this.powerAppsService.deleteApp(
-          userId,
-          organizationId,
-          copiedAppInfo.appId,
-        );
-        await this.powerAppsService.deleteEnvironment(
-          userId,
-          organizationId,
-          devEnvironmentId,
-        );
-      } catch (cleanupError) {
-        this.logger.warn(
-          `Failed to cleanup PowerApps resources: ${cleanupError.message}`,
+
+      // Emit completion
+      if (tempId) {
+        this.sandboxCreationProgressService.emitComplete(
+          trackingId,
+          `Sandbox created: ${sandbox.id}`,
         );
       }
+
+      // Note: The sandbox branch is created from main, which should already have
+      // the app content from the initial sync. Users will sync their changes
+      // after making modifications in the sandbox.
+
+      this.logger.log(
+        `Created PowerApps feature sandbox ${sandbox.id}: ` +
+          `copied app ${copiedAppInfo.appId} in env ${envResult.environmentId}, ` +
+          `GitHub branch ${githubBranch}`,
+      );
+
+      // Audit log
+      await this.auditService.createAuditLog({
+        userId,
+        organizationId,
+        action: 'CREATE',
+        entityType: 'sandbox',
+        entityId: sandbox.id,
+        details: {
+          platform: 'POWERAPPS',
+          featureName,
+          devEnvironmentId: envResult.environmentId,
+          copiedAppId: copiedAppInfo.appId,
+          githubBranch,
+          githubSha: githubBranchInfo?.commit.sha,
+        },
+      });
+
+      // Refetch sandbox with updated GitHub info
+      const updatedSandbox = await this.prisma.sandbox.findUnique({
+        where: { id: sandbox.id },
+        include: {
+          createdBy: { select: { id: true, email: true, name: true } },
+        },
+      });
+
+      return this.toResponseDto(updatedSandbox);
+    } catch (error) {
+      // Rollback all created resources on any failure
+      await rollback(error.message);
+
+      // Re-throw the error with context
+      if (
+        error instanceof NotFoundException ||
+        error instanceof ForbiddenException ||
+        error instanceof BadRequestException
+      ) {
+        throw error;
+      }
       throw new BadRequestException(
-        `Failed to create GitHub branch: ${error.message}`,
+        `Failed to create PowerApps feature sandbox: ${error.message}`,
       );
     }
-
-    this.logger.log(
-      `Created PowerApps feature sandbox ${sandbox.id}: copied app ${copiedAppInfo.appId} in env ${devEnvironmentId}, GitHub branch ${githubBranch}`,
-    );
-
-    // Audit log
-    await this.auditService.createAuditLog({
-      userId,
-      organizationId,
-      action: 'CREATE',
-      entityType: 'sandbox',
-      entityId: sandbox.id,
-      details: {
-        platform: 'POWERAPPS',
-        featureName,
-        devEnvironmentId,
-        copiedAppId: copiedAppInfo.appId,
-        githubBranch,
-        githubSha: githubBranchInfo?.commit.sha,
-      },
-    });
-
-    // Refetch sandbox with updated GitHub info
-    const updatedSandbox = await this.prisma.sandbox.findUnique({
-      where: { id: sandbox.id },
-      include: {
-        createdBy: { select: { id: true, email: true, name: true } },
-      },
-    });
-
-    return this.toResponseDto(updatedSandbox);
   }
 
   /**

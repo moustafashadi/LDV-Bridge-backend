@@ -34,6 +34,10 @@ import {
   SyncProgressService,
   SyncProgressEvent,
 } from './sync-progress.service';
+import {
+  SandboxCreationProgressService,
+  SandboxCreationProgressEvent,
+} from './sandbox-creation-progress.service';
 import { CreateSandboxDto } from './dto/create-sandbox.dto';
 import { UpdateSandboxDto } from './dto/update-sandbox.dto';
 import { LinkExistingEnvironmentDto } from './dto/link-existing-environment.dto';
@@ -65,6 +69,7 @@ export class SandboxesController {
   constructor(
     private readonly sandboxesService: SandboxesService,
     private readonly syncProgressService: SyncProgressService,
+    private readonly sandboxCreationProgressService: SandboxCreationProgressService,
   ) {}
 
   @Post()
@@ -442,6 +447,7 @@ export class SandboxesController {
       userId,
       organizationId,
       dto.description,
+      dto.tempId,
     );
   }
 
@@ -639,6 +645,48 @@ export class SandboxesController {
     return progressStream.pipe(
       map(
         (event: SyncProgressEvent) =>
+          ({
+            data: event,
+          }) as MessageEvent,
+      ),
+    );
+  }
+
+  @Sse('powerapps/creation/:tempId/progress')
+  @Public() // SSE/EventSource doesn't support custom headers, so we make this public
+  @ApiOperation({
+    summary: 'Stream PowerApps sandbox creation progress via SSE',
+    description:
+      'Subscribe to real-time progress updates for PowerApps sandbox creation. ' +
+      'Uses a temporary ID to track progress before the sandbox is created. ' +
+      'Note: This endpoint is public as SSE does not support custom auth headers.',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'SSE stream of creation progress events',
+    schema: {
+      type: 'object',
+      properties: {
+        sandboxId: { type: 'string' },
+        step: { type: 'number' },
+        totalSteps: { type: 'number' },
+        status: {
+          type: 'string',
+          enum: ['pending', 'in-progress', 'completed', 'error'],
+        },
+        message: { type: 'string' },
+        details: { type: 'string' },
+        timestamp: { type: 'string', format: 'date-time' },
+      },
+    },
+  })
+  creationProgress(@Param('tempId') tempId: string): Observable<MessageEvent> {
+    const progressStream =
+      this.sandboxCreationProgressService.getProgressStream(tempId);
+
+    return progressStream.pipe(
+      map(
+        (event: SandboxCreationProgressEvent) =>
           ({
             data: event,
           }) as MessageEvent,

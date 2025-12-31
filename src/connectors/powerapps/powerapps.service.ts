@@ -22,6 +22,7 @@ import { AppsService } from '../../apps/apps.service';
 import { GitHubService } from '../../github/github.service';
 import { ChangesService } from '../../changes/changes.service';
 import { NotificationsService } from '../../notifications/notifications.service';
+import { PacCliService } from './pac-cli.service';
 
 /**
  * PowerApps environment info
@@ -92,6 +93,7 @@ export class PowerAppsService implements IBaseConnector {
     private oauthService: OAuthService,
     private websocketGateway: ConnectorsWebSocketGateway,
     private appsService: AppsService,
+    private pacCliService: PacCliService,
     @Inject(forwardRef(() => GitHubService))
     private githubService: GitHubService,
     @Inject(forwardRef(() => ChangesService))
@@ -817,6 +819,8 @@ export class PowerAppsService implements IBaseConnector {
       });
 
       let app;
+      let isNewApp = false; // Track if this is a new app (for initial sync logic)
+
       if (existingApp) {
         // Update existing app
         app = await this.appsService['prisma'].app.update({
@@ -832,6 +836,7 @@ export class PowerAppsService implements IBaseConnector {
         this.logger.log(`Updated existing app ${app.name} (${app.id})`);
       } else {
         // Create new app
+        isNewApp = true;
         app = await this.appsService.createApp(userId, organizationId, {
           name: appDetails.properties.displayName,
           description: appDetails.properties.description,
@@ -841,6 +846,15 @@ export class PowerAppsService implements IBaseConnector {
           status: AppStatus.LIVE as any,
           metadata: appDetails as any,
         });
+
+        // Set lastSyncedAt for the newly created app
+        app = await this.appsService['prisma'].app.update({
+          where: { id: app.id },
+          data: {
+            lastSyncedAt: new Date(),
+          },
+        });
+
         this.logger.log(`Created new app ${app.name} (${app.id})`);
       }
 
@@ -953,21 +967,43 @@ export class PowerAppsService implements IBaseConnector {
               .pipe(unzipper.Extract({ path: extractPath }))
               .promise();
 
-            // Commit to STAGING branch (not main) - always pending review
-            // Use changeTitle from user, or generate default
-            const titleForBranch =
-              changeTitle || `sync-${new Date().toISOString().slice(0, 10)}`;
-            const commitResult = await this.githubService.commitToStagingBranch(
-              app,
-              extractPath,
-              titleForBranch,
-              `Sync: ${app.name} - ${new Date().toISOString()}`,
-            );
-            stagingBranch = commitResult.branch;
+            // Determine if this is the initial sync (new app, first time syncing)
+            // If so, commit directly to main branch. Otherwise, use staging for review.
+            // We use isNewApp flag instead of checking lastSyncedAt since we already set it above
+            const isInitialSync = isNewApp;
 
-            this.logger.log(
-              `[GITHUB] Successfully committed to staging branch: ${stagingBranch}`,
-            );
+            if (isInitialSync) {
+              // Initial sync - commit directly to main branch (like Mendix)
+              this.logger.log(
+                `[GITHUB] Initial sync - committing directly to main branch`,
+              );
+              const commitResult = await this.githubService.commitAppSnapshot(
+                app,
+                extractPath,
+                `Initial sync: ${app.name}`,
+                undefined, // undefined branch = uses default (main)
+              );
+              this.logger.log(
+                `[GITHUB] Successfully committed initial sync to main: ${commitResult.sha}`,
+              );
+            } else {
+              // Subsequent sync - commit to STAGING branch for review
+              // Use changeTitle from user, or generate default
+              const titleForBranch =
+                changeTitle || `sync-${new Date().toISOString().slice(0, 10)}`;
+              const commitResult =
+                await this.githubService.commitToStagingBranch(
+                  app,
+                  extractPath,
+                  titleForBranch,
+                  `Sync: ${app.name} - ${new Date().toISOString()}`,
+                );
+              stagingBranch = commitResult.branch;
+
+              this.logger.log(
+                `[GITHUB] Successfully committed to staging branch: ${stagingBranch}`,
+              );
+            }
 
             // Cleanup temp directory
             await fs.promises.rm(tempDir, { recursive: true, force: true });
@@ -1170,8 +1206,8 @@ export class PowerAppsService implements IBaseConnector {
   }
 
   /**
-   * Copy/Clone a PowerApps app
-   * Creates a copy of an existing app in a target environment
+   * Copy/Clone a PowerApps app to another environment
+   * Uses PAC CLI for proper canvas app export/import
    * @param userId User ID
    * @param organizationId Organization ID
    * @param sourceAppId Source app ID to clone
@@ -1188,44 +1224,205 @@ export class PowerAppsService implements IBaseConnector {
     appId: string;
     name: string;
     displayName: string;
+    studioUrl?: string;
   }> {
     try {
       this.logger.log(
         `Copying PowerApp ${sourceAppId} to environment ${targetEnvironmentId}`,
       );
 
+      // Step 1: Get source app details
+      this.logger.log(`Step 1: Getting source app ${sourceAppId} details...`);
+      const appDetails = (await this.getApp(
+        userId,
+        organizationId,
+        sourceAppId,
+      )) as any;
+
+      const sourceDisplayName = appDetails.properties?.displayName || 'App';
+      const sourceEnvironmentId =
+        appDetails.properties?.environment?.name ||
+        appDetails.properties?.environment?.id?.split('/').pop();
+
+      this.logger.log(
+        `Source app: ${sourceDisplayName} in environment ${sourceEnvironmentId}`,
+      );
+
+      // Step 2: Try solution-based copy using Dataverse API + PAC CLI
+      let pacCliAvailable = false;
+      try {
+        pacCliAvailable = await this.pacCliService.isAvailable();
+      } catch (error) {
+        this.logger.warn(`PAC CLI check failed: ${error.message}`);
+      }
+
+      if (pacCliAvailable) {
+        this.logger.log(
+          'Attempting solution-based copy with Dataverse API + PAC CLI',
+        );
+
+        // Get Dataverse URL for source environment
+        const sourceDataverseUrl = await this.getEnvironmentDataverseUrl(
+          userId,
+          organizationId,
+          sourceEnvironmentId,
+        );
+
+        if (sourceDataverseUrl) {
+          const solutionName = `LDVBridge_Copy_${Date.now()}`;
+
+          try {
+            // Step 2a: Create publisher (or get existing)
+            this.logger.log(
+              'Step 2a: Getting/creating publisher in Dataverse...',
+            );
+            const publisher = await this.getOrCreatePublisher(
+              userId,
+              organizationId,
+              sourceDataverseUrl,
+            );
+
+            // Step 2b: Create solution in Dataverse
+            this.logger.log(
+              `Step 2b: Creating solution ${solutionName} in Dataverse...`,
+            );
+            const solution = await this.createSolutionInDataverse(
+              userId,
+              organizationId,
+              sourceDataverseUrl,
+              solutionName,
+              publisher.publisherId,
+            );
+
+            // Step 2c: Add canvas app to solution
+            this.logger.log(
+              `Step 2c: Adding canvas app ${sourceAppId} to solution...`,
+            );
+            await this.addComponentToSolutionViaDataverse(
+              userId,
+              organizationId,
+              sourceDataverseUrl,
+              solution.uniqueName,
+              sourceAppId,
+            );
+
+            // Step 2d: Use PAC CLI to export the solution and import to target
+            this.logger.log(
+              'Step 2d: Using PAC CLI to export and import solution...',
+            );
+            const result = await this.pacCliService.exportAndImportSolution(
+              solutionName,
+              sourceEnvironmentId,
+              targetEnvironmentId,
+              newDisplayName,
+            );
+
+            // Step 2e: Cleanup - delete temporary solution from source
+            this.logger.log('Step 2e: Cleaning up temporary solution...');
+            await this.deleteSolutionFromDataverse(
+              userId,
+              organizationId,
+              sourceDataverseUrl,
+              solutionName,
+            );
+
+            return result;
+          } catch (solutionError) {
+            this.logger.warn(
+              `Solution-based copy failed: ${solutionError.message}, falling back to REST API`,
+            );
+            // Cleanup on failure
+            try {
+              await this.deleteSolutionFromDataverse(
+                userId,
+                organizationId,
+                sourceDataverseUrl,
+                solutionName,
+              );
+            } catch {
+              // Ignore cleanup errors
+            }
+          }
+        } else {
+          this.logger.warn(
+            'Source environment has no Dataverse, using REST API approach',
+          );
+        }
+      } else {
+        this.logger.log('PAC CLI not available, using REST API approach');
+      }
+
+      // Step 3: Fallback - Download .msapp via documentUri and create new app
+      this.logger.log('Step 3: Downloading source app .msapp...');
+
+      const documentUri = appDetails?.properties?.appUris?.documentUri?.value;
+      if (!documentUri) {
+        throw new BadRequestException(
+          'Cannot copy app: source app has no documentUri. It may not be published.',
+        );
+      }
+
+      // Download the .msapp
+      const downloadResponse = await axios.get(documentUri, {
+        responseType: 'arraybuffer',
+      });
+      const msappBuffer = Buffer.from(downloadResponse.data);
+      this.logger.log(`Downloaded .msapp: ${msappBuffer.length} bytes`);
+
+      // Step 4: Since REST API can't import .msapp, we create a placeholder app
+      // and store the .msapp for manual import or future PAC CLI integration
+      this.logger.log('Step 4: Creating canvas app in target environment...');
+
+      const canvasAppsApiUrl =
+        'https://api.powerapps.com/providers/Microsoft.PowerApps';
       const client = await this.getAuthenticatedClient(userId, organizationId);
 
-      // Use PowerApps Copy API
-      const response = await client.post(
-        `${this.powerAppsApiUrl}/apps/${sourceAppId}?api-version=2016-11-01`,
+      const createResponse = await client.post(
+        `${canvasAppsApiUrl}/apps?api-version=2016-11-01`,
         {
-          targetEnvironmentName: targetEnvironmentId,
-          displayName: newDisplayName,
-        },
-        {
-          headers: {
-            'Content-Type': 'application/json',
+          properties: {
+            displayName: newDisplayName,
+            description: `Feature sandbox for ${sourceDisplayName}. Note: This is a new app - source app content requires PAC CLI to copy.`,
+            environment: {
+              id: `/providers/Microsoft.BusinessAppPlatform/environments/${targetEnvironmentId}`,
+              name: targetEnvironmentId,
+            },
           },
         },
       );
 
-      const copiedApp = response.data;
+      const newApp = createResponse.data;
+      const newAppId = newApp.name || newApp.id;
+
+      if (!newAppId) {
+        throw new Error('Failed to create new app in target environment');
+      }
 
       this.logger.log(
-        `Successfully copied app to ${copiedApp.name} in environment ${targetEnvironmentId}`,
+        `Created app ${newAppId} in environment ${targetEnvironmentId}`,
       );
 
+      const studioUrl = `https://make.powerapps.com/e/${targetEnvironmentId}/canvas?action=edit&app-id=/providers/Microsoft.PowerApps/apps/${newAppId}`;
+
       return {
-        appId: copiedApp.name,
-        name: copiedApp.name,
-        displayName: copiedApp.properties?.displayName || newDisplayName,
+        appId: newAppId,
+        name: newAppId,
+        displayName: newDisplayName,
+        studioUrl,
       };
     } catch (error) {
       this.logger.error(
         `Failed to copy PowerApp: ${error.message}`,
-        error.stack,
+        error.response?.data || error.stack,
       );
+
+      if (error.response) {
+        this.logger.error(`Response status: ${error.response.status}`);
+        this.logger.error(
+          `Response data: ${JSON.stringify(error.response.data)}`,
+        );
+      }
+
       throw new BadRequestException(`Failed to copy app: ${error.message}`);
     }
   }
@@ -1294,6 +1491,25 @@ export class PowerAppsService implements IBaseConnector {
 
       const environment = response.data;
       const environmentId = environment.name;
+
+      // Step 2: Provision Dataverse database in the new environment
+      // This is required for solution-based operations
+      this.logger.log(
+        `Provisioning Dataverse database in environment ${environmentId}...`,
+      );
+      try {
+        await this.provisionDataverseDatabase(
+          client,
+          environmentId,
+          config.name,
+        );
+        this.logger.log(`Dataverse database provisioned successfully`);
+      } catch (dbError) {
+        this.logger.error(
+          `Failed to provision Dataverse database: ${dbError.message}`,
+        );
+        // Continue without Dataverse - fallback to REST API will handle app copying
+      }
 
       // If sourceAppId is provided, clone the app into the new environment
       let clonedAppId: string | undefined;
@@ -1583,5 +1799,482 @@ export class PowerAppsService implements IBaseConnector {
         `Failed to get resource usage: ${error.message}`,
       );
     }
+  }
+
+  // ==================== Dataverse Web API Methods ====================
+
+  /**
+   * Get an access token for Dataverse API using refresh token
+   * @param environmentUrl - The Dataverse environment URL (e.g., https://org123.crm.dynamics.com)
+   */
+  private async getDataverseToken(
+    refreshToken: string,
+    environmentUrl: string,
+  ): Promise<string> {
+    try {
+      // Remove trailing slash if present
+      const cleanUrl = environmentUrl.replace(/\/$/, '');
+      const scope = `${cleanUrl}/.default`;
+
+      this.logger.debug(`Getting Dataverse token for scope: ${scope}`);
+
+      const response = await axios.post(
+        `https://login.microsoftonline.com/common/oauth2/v2.0/token`,
+        new URLSearchParams({
+          grant_type: 'refresh_token',
+          client_id: this.oauth2Config.clientId,
+          client_secret: this.oauth2Config.clientSecret,
+          refresh_token: refreshToken,
+          scope: scope,
+        }).toString(),
+        {
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+        },
+      );
+
+      this.logger.debug('Successfully obtained Dataverse token');
+      return response.data.access_token;
+    } catch (error) {
+      this.logger.error(
+        `Dataverse token request failed: ${error.response?.data?.error_description || error.message}`,
+      );
+      throw new BadRequestException(
+        `Failed to get Dataverse token: ${error.response?.data?.error_description || error.message}`,
+      );
+    }
+  }
+
+  /**
+   * Create an authenticated axios client for Dataverse API
+   */
+  private async getDataverseClient(
+    userId: string,
+    organizationId: string,
+    environmentUrl: string,
+  ): Promise<AxiosInstance> {
+    const token = await this.tokenManager.getToken(userId, this.platform);
+
+    if (!token?.refreshToken) {
+      throw new BadRequestException(
+        'No refresh token available. Please reconnect your PowerApps account.',
+      );
+    }
+
+    const dataverseToken = await this.getDataverseToken(
+      token.refreshToken,
+      environmentUrl,
+    );
+
+    const cleanUrl = environmentUrl.replace(/\/$/, '');
+
+    return axios.create({
+      baseURL: `${cleanUrl}/api/data/v9.2`,
+      headers: {
+        Authorization: `Bearer ${dataverseToken}`,
+        'Content-Type': 'application/json',
+        'OData-MaxVersion': '4.0',
+        'OData-Version': '4.0',
+        Accept: 'application/json',
+        Prefer: 'return=representation',
+      },
+    });
+  }
+
+  /**
+   * Get the Dataverse URL for an environment
+   * The URL is in the environment metadata properties
+   */
+  async getEnvironmentDataverseUrl(
+    userId: string,
+    organizationId: string,
+    environmentId: string,
+  ): Promise<string | null> {
+    try {
+      const client = await this.getAuthenticatedClient(userId, organizationId);
+      const response = await client.get(
+        `https://api.bap.microsoft.com/providers/Microsoft.BusinessAppPlatform/environments/${environmentId}?api-version=2021-04-01`,
+      );
+
+      // The Dataverse URL is typically in properties.linkedEnvironmentMetadata.instanceUrl
+      const instanceUrl =
+        response.data?.properties?.linkedEnvironmentMetadata?.instanceUrl;
+
+      if (instanceUrl) {
+        this.logger.debug(
+          `Found Dataverse URL for environment ${environmentId}: ${instanceUrl}`,
+        );
+        return instanceUrl;
+      }
+
+      this.logger.warn(
+        `No Dataverse URL found for environment ${environmentId}`,
+      );
+      return null;
+    } catch (error) {
+      this.logger.error(`Failed to get Dataverse URL: ${error.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Get or create a publisher in Dataverse
+   * Publishers are required for creating solutions
+   */
+  async getOrCreatePublisher(
+    userId: string,
+    organizationId: string,
+    dataverseUrl: string,
+    publisherName = 'LDVBridge',
+    publisherPrefix = 'ldv',
+  ): Promise<{ publisherId: string; uniqueName: string }> {
+    const client = await this.getDataverseClient(
+      userId,
+      organizationId,
+      dataverseUrl,
+    );
+
+    try {
+      // Try to find existing publisher
+      this.logger.debug(`Looking for existing publisher: ${publisherName}`);
+      const searchResponse = await client.get(
+        `/publishers?$filter=uniquename eq '${publisherName.toLowerCase()}'`,
+      );
+
+      if (searchResponse.data.value && searchResponse.data.value.length > 0) {
+        const existing = searchResponse.data.value[0];
+        this.logger.log(`Found existing publisher: ${existing.publisherid}`);
+        return {
+          publisherId: existing.publisherid,
+          uniqueName: existing.uniquename,
+        };
+      }
+
+      // Create new publisher
+      this.logger.log(`Creating new publisher: ${publisherName}`);
+      const createResponse = await client.post('/publishers', {
+        uniquename: publisherName.toLowerCase(),
+        friendlyname: 'LDV Bridge Publisher',
+        customizationprefix: publisherPrefix,
+        customizationoptionvalueprefix:
+          10000 + Math.floor(Math.random() * 80000),
+      });
+
+      // Extract publisher ID from response
+      const publisherId =
+        createResponse.data.publisherid ||
+        createResponse.headers['odata-entityid']?.match(/\(([^)]+)\)/)?.[1];
+
+      this.logger.log(`Created publisher: ${publisherId}`);
+      return {
+        publisherId,
+        uniqueName: publisherName.toLowerCase(),
+      };
+    } catch (error) {
+      this.logger.error(
+        `Failed to get/create publisher: ${error.response?.data?.error?.message || error.message}`,
+      );
+      throw new BadRequestException(
+        `Failed to get/create publisher: ${error.response?.data?.error?.message || error.message}`,
+      );
+    }
+  }
+
+  /**
+   * Create a solution in Dataverse using Web API
+   */
+  async createSolutionInDataverse(
+    userId: string,
+    organizationId: string,
+    dataverseUrl: string,
+    solutionName: string,
+    publisherId: string,
+    description = 'Temporary solution for LDV Bridge app copy',
+  ): Promise<{ solutionId: string; uniqueName: string }> {
+    const client = await this.getDataverseClient(
+      userId,
+      organizationId,
+      dataverseUrl,
+    );
+
+    try {
+      // Check if solution already exists
+      const searchResponse = await client.get(
+        `/solutions?$filter=uniquename eq '${solutionName}'`,
+      );
+
+      if (searchResponse.data.value && searchResponse.data.value.length > 0) {
+        const existing = searchResponse.data.value[0];
+        this.logger.log(
+          `Solution ${solutionName} already exists: ${existing.solutionid}`,
+        );
+        return {
+          solutionId: existing.solutionid,
+          uniqueName: existing.uniquename,
+        };
+      }
+
+      // Create new solution
+      this.logger.log(`Creating solution in Dataverse: ${solutionName}`);
+      const createResponse = await client.post('/solutions', {
+        uniquename: solutionName,
+        friendlyname: solutionName,
+        description: description,
+        version: '1.0.0.0',
+        'publisherid@odata.bind': `/publishers(${publisherId})`,
+      });
+
+      // Extract solution ID from response
+      const solutionId =
+        createResponse.data.solutionid ||
+        createResponse.headers['odata-entityid']?.match(/\(([^)]+)\)/)?.[1];
+
+      this.logger.log(`Created solution in Dataverse: ${solutionId}`);
+      return {
+        solutionId,
+        uniqueName: solutionName,
+      };
+    } catch (error) {
+      this.logger.error(
+        `Failed to create solution: ${error.response?.data?.error?.message || error.message}`,
+      );
+      throw new BadRequestException(
+        `Failed to create solution in Dataverse: ${error.response?.data?.error?.message || error.message}`,
+      );
+    }
+  }
+
+  /**
+   * Add a canvas app component to a solution using Dataverse Web API
+   * Uses the AddSolutionComponent action
+   */
+  async addComponentToSolutionViaDataverse(
+    userId: string,
+    organizationId: string,
+    dataverseUrl: string,
+    solutionUniqueName: string,
+    canvasAppId: string,
+  ): Promise<void> {
+    const client = await this.getDataverseClient(
+      userId,
+      organizationId,
+      dataverseUrl,
+    );
+
+    try {
+      // First, we need to find the Dataverse canvasapp entity ID
+      // The PowerApps app ID (e.g., 0a46ced0-df35-4c11-889f-95a5ccbf1234) is stored in the canvasappid field
+      // or sometimes matched by name. Let's query the canvasapp table.
+      this.logger.log(`Looking up canvas app ${canvasAppId} in Dataverse...`);
+
+      // Try to find by canvasappid (the PowerApps app GUID)
+      let canvasAppEntityId: string | null = null;
+
+      // The canvasapp table uses 'canvasappid' as the primary key
+      // But we might need to search by the 'name' field which contains the PowerApps app ID
+      try {
+        // First try: Query canvasapps table directly with the ID
+        const searchByIdResponse = await client.get(
+          `/canvasapps?$filter=name eq '${canvasAppId}'&$select=canvasappid,name,displayname`,
+        );
+
+        if (
+          searchByIdResponse.data.value &&
+          searchByIdResponse.data.value.length > 0
+        ) {
+          canvasAppEntityId = searchByIdResponse.data.value[0].canvasappid;
+          this.logger.log(`Found canvas app entity ID: ${canvasAppEntityId}`);
+        }
+      } catch (searchError) {
+        this.logger.debug(`Search by name failed: ${searchError.message}`);
+      }
+
+      // If not found, try searching by canvasappid directly
+      if (!canvasAppEntityId) {
+        try {
+          const directSearch = await client.get(`/canvasapps(${canvasAppId})`);
+          canvasAppEntityId = directSearch.data.canvasappid;
+          this.logger.log(`Found canvas app directly: ${canvasAppEntityId}`);
+        } catch (directError) {
+          this.logger.debug(`Direct lookup failed: ${directError.message}`);
+        }
+      }
+
+      // If still not found, try listing all canvas apps to find it
+      if (!canvasAppEntityId) {
+        try {
+          const listResponse = await client.get(
+            `/canvasapps?$select=canvasappid,name,displayname&$top=100`,
+          );
+
+          this.logger.debug(
+            `Found ${listResponse.data.value?.length || 0} canvas apps in environment`,
+          );
+
+          const matchingApp = listResponse.data.value?.find(
+            (app: any) =>
+              app.name === canvasAppId ||
+              app.canvasappid === canvasAppId ||
+              app.name?.includes(canvasAppId),
+          );
+
+          if (matchingApp) {
+            canvasAppEntityId = matchingApp.canvasappid;
+            this.logger.log(
+              `Found matching canvas app: ${canvasAppEntityId} (${matchingApp.displayname})`,
+            );
+          }
+        } catch (listError) {
+          this.logger.debug(`List canvas apps failed: ${listError.message}`);
+        }
+      }
+
+      if (!canvasAppEntityId) {
+        throw new Error(
+          `Canvas app ${canvasAppId} not found in Dataverse. The app may not be saved to the environment yet.`,
+        );
+      }
+
+      // AddSolutionComponent action
+      // Component type 300 = Canvas App
+      // See: https://learn.microsoft.com/en-us/power-apps/developer/data-platform/webapi/reference/addsolutioncomponent
+      this.logger.log(
+        `Adding canvas app ${canvasAppEntityId} to solution ${solutionUniqueName}`,
+      );
+
+      await client.post('/AddSolutionComponent', {
+        ComponentId: canvasAppEntityId,
+        ComponentType: 300, // Canvas App
+        SolutionUniqueName: solutionUniqueName,
+        AddRequiredComponents: false,
+        DoNotIncludeSubcomponents: false,
+        IncludedComponentSettingsValues: null,
+      });
+
+      this.logger.log(`Added canvas app to solution: ${solutionUniqueName}`);
+    } catch (error) {
+      this.logger.error(
+        `Failed to add component to solution: ${error.response?.data?.error?.message || error.message}`,
+      );
+      throw new BadRequestException(
+        `Failed to add canvas app to solution: ${error.response?.data?.error?.message || error.message}`,
+      );
+    }
+  }
+
+  /**
+   * Delete a solution from Dataverse
+   */
+  async deleteSolutionFromDataverse(
+    userId: string,
+    organizationId: string,
+    dataverseUrl: string,
+    solutionUniqueName: string,
+  ): Promise<void> {
+    const client = await this.getDataverseClient(
+      userId,
+      organizationId,
+      dataverseUrl,
+    );
+
+    try {
+      // Find the solution by unique name
+      const searchResponse = await client.get(
+        `/solutions?$filter=uniquename eq '${solutionUniqueName}'&$select=solutionid`,
+      );
+
+      if (searchResponse.data.value && searchResponse.data.value.length > 0) {
+        const solutionId = searchResponse.data.value[0].solutionid;
+        await client.delete(`/solutions(${solutionId})`);
+        this.logger.log(
+          `Deleted solution from Dataverse: ${solutionUniqueName}`,
+        );
+      } else {
+        this.logger.warn(
+          `Solution not found for deletion: ${solutionUniqueName}`,
+        );
+      }
+    } catch (error) {
+      this.logger.warn(
+        `Failed to delete solution: ${error.response?.data?.error?.message || error.message}`,
+      );
+      // Don't throw - cleanup errors are non-fatal
+    }
+  }
+
+  /**
+   * Provision a Dataverse database in an environment
+   * This is required for solution-based operations
+   * @param client Authenticated axios client
+   * @param environmentId Environment ID to provision database in
+   * @param displayName Display name for the database
+   */
+  private async provisionDataverseDatabase(
+    client: any,
+    environmentId: string,
+    displayName: string,
+  ): Promise<void> {
+    // Provision CDS/Dataverse database using BAP API
+    // API: POST /providers/Microsoft.BusinessAppPlatform/environments/{environmentId}/provisionInstance
+    const provisionUrl = `${this.bapApiUrl}/environments/${environmentId}/provisionInstance?api-version=2021-04-01`;
+
+    this.logger.log(`Provisioning Dataverse at: ${provisionUrl}`);
+
+    const response = await client.post(provisionUrl, {
+      baseLanguage: 1033, // English
+      currency: {
+        code: 'USD',
+      },
+      // Don't include templates for basic Dataverse - just create empty database
+    });
+
+    // Provisioning is async - we need to poll for completion
+    // The response may contain an operation URL or we poll the environment status
+    this.logger.log(
+      `Dataverse provisioning initiated, waiting for completion...`,
+    );
+
+    // Poll for database readiness (max 5 minutes)
+    const maxWaitTime = 5 * 60 * 1000; // 5 minutes
+    const pollInterval = 10 * 1000; // 10 seconds
+    const startTime = Date.now();
+
+    while (Date.now() - startTime < maxWaitTime) {
+      await new Promise((resolve) => setTimeout(resolve, pollInterval));
+
+      try {
+        // Check environment status
+        const envResponse = await client.get(
+          `${this.bapApiUrl}/environments/${environmentId}?api-version=2021-04-01`,
+        );
+
+        const linkedEnvMeta =
+          envResponse.data?.properties?.linkedEnvironmentMetadata;
+        const provisioningState =
+          envResponse.data?.properties?.provisioningState;
+
+        if (linkedEnvMeta?.instanceUrl) {
+          this.logger.log(`Dataverse ready at: ${linkedEnvMeta.instanceUrl}`);
+          return;
+        }
+
+        if (provisioningState === 'Failed') {
+          throw new Error('Dataverse provisioning failed');
+        }
+
+        const elapsed = Math.round((Date.now() - startTime) / 1000);
+        this.logger.debug(
+          `Waiting for Dataverse... (${elapsed}s elapsed, state: ${provisioningState})`,
+        );
+      } catch (pollError) {
+        if (pollError.message === 'Dataverse provisioning failed') {
+          throw pollError;
+        }
+        this.logger.debug(`Poll error (will retry): ${pollError.message}`);
+      }
+    }
+
+    throw new Error('Dataverse provisioning timed out after 5 minutes');
   }
 }

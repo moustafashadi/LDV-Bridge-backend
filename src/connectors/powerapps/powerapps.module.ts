@@ -2,6 +2,7 @@ import { Module, forwardRef } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { PowerAppsController } from './powerapps.controller';
 import { PowerAppsService } from './powerapps.service';
+import { PacCliService } from './pac-cli.service';
 import { OAuthService } from '../services/oauth.service';
 import { TokenManagerService } from '../services/token-manager.service';
 import { PrismaModule } from '../../prisma/prisma.module';
@@ -22,7 +23,12 @@ import { NotificationsModule } from '../../notifications/notifications.module';
     forwardRef(() => NotificationsModule),
   ],
   controllers: [PowerAppsController],
-  providers: [PowerAppsService, OAuthService, TokenManagerService],
-  exports: [PowerAppsService],
+  providers: [
+    PowerAppsService,
+    PacCliService,
+    OAuthService,
+    TokenManagerService,
+  ],
+  exports: [PowerAppsService, PacCliService],
 })
 export class PowerAppsModule {}
