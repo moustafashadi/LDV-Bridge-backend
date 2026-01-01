@@ -1225,6 +1225,7 @@ export class PowerAppsService implements IBaseConnector {
     name: string;
     displayName: string;
     studioUrl?: string;
+    solutionName?: string;
   }> {
     try {
       this.logger.log(
@@ -1393,6 +1394,7 @@ export class PowerAppsService implements IBaseConnector {
               name: importedAppId || solutionName,
               displayName: newDisplayName,
               studioUrl,
+              solutionName, // For later use during merge/deploy
             };
           } catch (solutionError) {
             this.logger.warn(

@@ -2029,6 +2029,7 @@ export class SandboxesService {
             copiedAppName: copiedAppInfo.displayName,
             sourceAppId,
             sourceEnvironmentId,
+            solutionName: copiedAppInfo.solutionName, // For deploy back to production
             studioUrl,
           },
         },
@@ -2158,7 +2159,9 @@ export class SandboxesService {
       throw new NotFoundException(`Sandbox ${sandboxId} not found`);
     }
 
-    if (!['ACTIVE', 'CHANGES_REQUESTED'].includes(sandbox.status)) {
+    if (
+      !['ACTIVE', 'CHANGES_REQUESTED', 'SUBMITTING'].includes(sandbox.status)
+    ) {
       throw new BadRequestException(
         `Cannot sync sandbox in ${sandbox.status} status`,
       );
@@ -2348,13 +2351,80 @@ export class SandboxesService {
 
     const copiedAppId = env.copiedAppId;
     const devEnvironmentId = env.devEnvironmentId;
+    const sourceEnvironmentId = env.sourceEnvironmentId; // Production environment
+    const solutionName = env.solutionName;
     const app = sandbox.app;
 
     if (!app) {
       throw new BadRequestException('Sandbox is not linked to an app');
     }
 
-    // Step 2: Merge GitHub branch to main
+    // Step 2: Deploy solution from dev to production using Dataverse API
+    if (solutionName && sourceEnvironmentId && devEnvironmentId) {
+      try {
+        this.logger.log(
+          `Step 2: Deploying solution ${solutionName} from dev to production`,
+        );
+
+        // Get Dataverse URLs for both environments
+        const devDataverseUrl =
+          await this.powerAppsService.getEnvironmentDataverseUrl(
+            userId,
+            organizationId,
+            devEnvironmentId,
+          );
+        const prodDataverseUrl =
+          await this.powerAppsService.getEnvironmentDataverseUrl(
+            userId,
+            organizationId,
+            sourceEnvironmentId,
+          );
+
+        if (devDataverseUrl && prodDataverseUrl) {
+          // Export solution from dev environment
+          this.logger.log(`Exporting solution ${solutionName} from dev...`);
+          const solutionZip =
+            await this.powerAppsService.exportSolutionViaDataverse(
+              userId,
+              organizationId,
+              devDataverseUrl,
+              solutionName,
+              false, // Unmanaged for modification
+            );
+
+          // Import solution to production environment
+          this.logger.log(`Importing solution to production...`);
+          await this.powerAppsService.importSolutionViaDataverse(
+            userId,
+            organizationId,
+            prodDataverseUrl,
+            solutionZip,
+            true, // overwriteUnmanagedCustomizations
+            true, // publishWorkflows
+          );
+
+          this.logger.log('Solution deployed to production successfully');
+        } else {
+          this.logger.warn(
+            'Could not get Dataverse URLs for solution transfer, skipping deploy',
+          );
+        }
+      } catch (deployError) {
+        this.logger.error(
+          `Failed to deploy solution to production: ${deployError.message}`,
+        );
+        // Don't fail the merge, but log the error - manual deployment may be needed
+        this.logger.warn(
+          'Merge will continue but changes may need manual deployment to production',
+        );
+      }
+    } else {
+      this.logger.warn(
+        'Missing solution transfer info, skipping deploy to production',
+      );
+    }
+
+    // Step 3: Merge GitHub branch to main
     let mergeResult: { sha: string } | null = null;
     try {
       this.logger.log(`Merging GitHub branch ${sandbox.githubBranch} to main`);
@@ -2586,6 +2656,63 @@ export class SandboxesService {
         throw new BadRequestException(
           'Sandbox is not linked to an app. Cannot submit for review.',
         );
+      }
+
+      // Check if this is a PowerApps sandbox - use different sync flow
+      if (app.platform === 'POWERAPPS') {
+        this.logger.log(
+          'PowerApps sandbox - using PowerApps sync flow for submission',
+        );
+
+        // Use PowerApps-specific sync to export and commit changes
+        const syncResult = await this.syncPowerAppsSandbox(
+          sandboxId,
+          userId,
+          organizationId,
+          'Submitted for review',
+        );
+
+        if (!syncResult.success) {
+          // Reset status on failure
+          await this.prisma.sandbox.update({
+            where: { id: sandboxId },
+            data: { status: SandboxStatus.ACTIVE },
+          });
+          throw new BadRequestException(syncResult.message);
+        }
+
+        // Update sandbox status to PENDING_REVIEW
+        const updatedSandbox = await this.prisma.sandbox.update({
+          where: { id: sandboxId },
+          data: {
+            status: SandboxStatus.PENDING_REVIEW,
+            submittedAt: new Date(),
+          },
+          include: {
+            createdBy: { select: { id: true, email: true, name: true } },
+            app: true,
+          },
+        });
+
+        // Create audit log
+        await this.auditService.createAuditLog({
+          userId,
+          organizationId,
+          action: 'UPDATE',
+          entityType: 'SANDBOX',
+          entityId: sandboxId,
+          details: {
+            sandboxName: sandbox.name,
+            platform: 'POWERAPPS',
+            changesDetected: syncResult.changesDetected,
+          },
+        });
+
+        this.logger.log(
+          `PowerApps sandbox ${sandboxId} submitted for review with ${syncResult.changesDetected} changes`,
+        );
+
+        return this.toResponseDto(updatedSandbox);
       }
 
       // Get user's Mendix PAT for API calls

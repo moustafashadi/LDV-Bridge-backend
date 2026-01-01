@@ -10,6 +10,7 @@ import {
 import { PrismaService } from '../prisma/prisma.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { GitHubService } from '../github/github.service';
+import { SandboxesService } from '../sandboxes/sandboxes.service';
 import { ReviewStatus, UserRole } from '@prisma/client';
 import { CreateReviewDto } from './dto/create-review.dto';
 import { SubmitForReviewDto } from './dto/submit-for-review.dto';
@@ -37,6 +38,8 @@ export class ReviewsService {
     private readonly notificationsService: NotificationsService,
     @Inject(forwardRef(() => GitHubService))
     private readonly githubService: GitHubService,
+    @Inject(forwardRef(() => SandboxesService))
+    private readonly sandboxesService: SandboxesService,
   ) {}
 
   /**
@@ -464,7 +467,7 @@ export class ReviewsService {
       try {
         const change = await this.prisma.change.findUnique({
           where: { id: review.changeId },
-          include: { app: true },
+          include: { app: true, sandbox: true },
         });
 
         if (change?.app) {
@@ -479,6 +482,28 @@ export class ReviewsService {
           this.logger.log(
             `Successfully merged staging branch for change ${review.changeId}`,
           );
+        }
+
+        // For PowerApps sandboxes, deploy changes to production
+        if (change?.sandbox && change?.app?.platform === 'POWERAPPS') {
+          try {
+            this.logger.log(
+              `Deploying PowerApps sandbox ${change.sandbox.id} to production`,
+            );
+            await this.sandboxesService.mergePowerAppsSandbox(
+              change.sandbox.id,
+              userId,
+              organizationId,
+            );
+            this.logger.log(
+              `Successfully deployed PowerApps sandbox to production`,
+            );
+          } catch (deployError) {
+            this.logger.error(
+              `Failed to deploy PowerApps to production: ${deployError.message}`,
+            );
+            // Don't fail approval - can retry manually
+          }
         }
       } catch (mergeError) {
         this.logger.error(
