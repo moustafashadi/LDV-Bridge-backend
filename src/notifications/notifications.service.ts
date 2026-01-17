@@ -32,7 +32,7 @@ export class NotificationsService {
   ) {}
 
   /**
-   * Create in-app notification
+   * Create in-app notification and push via WebSocket
    */
   async create(
     createNotificationDto: CreateNotificationDto,
@@ -55,6 +55,27 @@ export class NotificationsService {
       });
 
       this.logger.log(`Notification created: ${notification.id}`);
+
+      // Also push via WebSocket for real-time delivery
+      try {
+        await this.notificationsGateway.sendNotificationToUser(
+          createNotificationDto.userId,
+          {
+            id: notification.id,
+            type: notification.type,
+            title: notification.title,
+            message: notification.message,
+            data: notification.data,
+            createdAt: notification.createdAt,
+          },
+        );
+      } catch (wsError) {
+        this.logger.warn(
+          `Failed to push notification via WebSocket: ${wsError.message}`,
+        );
+        // Don't fail the request if WebSocket push fails
+      }
+
       return this.mapToResponseDto(notification);
     } catch (error) {
       this.logger.error(`Failed to create notification: ${error.message}`);

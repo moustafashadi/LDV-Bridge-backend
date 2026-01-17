@@ -16,7 +16,10 @@ export interface DiffSummary {
   added: number;
   modified: number;
   deleted: number;
-  categories: Record<string, { added: number; modified: number; deleted: number }>;
+  categories: Record<
+    string,
+    { added: number; modified: number; deleted: number }
+  >;
   operations: DiffOperation[];
   [key: string]: any; // Index signature for Prisma JSON compatibility
 }
@@ -76,7 +79,10 @@ export class JsonDiffService {
         operations: enrichedOperations,
       };
     } catch (error) {
-      this.logger.error(`Failed to calculate diff: ${error.message}`, error.stack);
+      this.logger.error(
+        `Failed to calculate diff: ${error.message}`,
+        error.stack,
+      );
       throw error;
     }
   }
@@ -154,7 +160,10 @@ export class JsonDiffService {
   /**
    * Get all operations for a specific path
    */
-  getOperationsForPath(operations: DiffOperation[], path: string): DiffOperation[] {
+  getOperationsForPath(
+    operations: DiffOperation[],
+    path: string,
+  ): DiffOperation[] {
     return operations.filter((op) => op.path.startsWith(path));
   }
 
@@ -174,9 +183,53 @@ export class JsonDiffService {
   }
 
   /**
-   * Extract category from path (e.g., /screens/LoginScreen -> "screens")
+   * Extract category from path using semantic path-based heuristics
+   * - Paths with dataSources, connections → DATA_LAYER (high impact)
+   * - Paths with OnSelect, OnChange, formulas → BEHAVIOR (logic changes)
+   * - Paths with Fill, Color, Font, Size → STYLING (low impact)
+   * - Paths with screens/controls → UI_STRUCTURE
    */
   private extractCategory(path: string): string {
+    const lowerPath = path.toLowerCase();
+
+    // High-impact data layer changes
+    if (
+      lowerPath.includes('/datasources/') ||
+      lowerPath.includes('/connections/') ||
+      lowerPath.includes('/dataconnections/')
+    ) {
+      return 'DATA_LAYER';
+    }
+
+    // Behavior/logic changes
+    if (
+      lowerPath.includes('/onselect') ||
+      lowerPath.includes('/onchange') ||
+      lowerPath.includes('/onvisible') ||
+      lowerPath.includes('/onstart') ||
+      lowerPath.includes('/formula')
+    ) {
+      return 'BEHAVIOR';
+    }
+
+    // Styling changes (low impact)
+    if (
+      lowerPath.includes('/fill') ||
+      lowerPath.includes('/color') ||
+      lowerPath.includes('/font') ||
+      lowerPath.includes('/size') ||
+      lowerPath.includes('/bordercolor') ||
+      lowerPath.includes('/backgroundcolor')
+    ) {
+      return 'STYLING';
+    }
+
+    // UI structure changes
+    if (lowerPath.includes('/screens/') || lowerPath.includes('/controls/')) {
+      return 'UI_STRUCTURE';
+    }
+
+    // Fallback to first path segment
     const parts = path.split('/').filter((p) => p);
     return parts[0] || 'general';
   }
@@ -184,7 +237,9 @@ export class JsonDiffService {
   /**
    * Assess impact of a change
    */
-  private assessImpact(operation: Operation): 'low' | 'medium' | 'high' | 'critical' {
+  private assessImpact(
+    operation: Operation,
+  ): 'low' | 'medium' | 'high' | 'critical' {
     // Deletions are higher impact
     if (operation.op === 'remove') {
       // Check if it's a critical component (data source, authentication, etc.)
@@ -238,7 +293,10 @@ export class JsonDiffService {
   private groupByCategory(
     operations: DiffOperation[],
   ): Record<string, { added: number; modified: number; deleted: number }> {
-    const categories: Record<string, { added: number; modified: number; deleted: number }> = {};
+    const categories: Record<
+      string,
+      { added: number; modified: number; deleted: number }
+    > = {};
 
     for (const op of operations) {
       const category = op.category || 'general';

@@ -30,6 +30,12 @@ export class SandboxResponseDto {
   })
   createdById: string;
 
+  @ApiPropertyOptional({
+    description: 'ID of the app this sandbox is forked from',
+    example: '550e8400-e29b-41d4-a716-446655440003',
+  })
+  appId?: string;
+
   @ApiProperty({
     description: 'Sandbox name',
     example: 'My Development Sandbox',

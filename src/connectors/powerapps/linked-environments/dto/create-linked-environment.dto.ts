@@ -3,6 +3,7 @@ import {
   IsNotEmpty,
   IsOptional,
   IsString,
+  IsUrl,
   MaxLength,
 } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
@@ -45,4 +46,22 @@ export class CreateLinkedEnvironmentDto {
   @IsString()
   @IsNotEmpty()
   environmentId: string;
+
+  @ApiPropertyOptional({
+    description: 'Environment URL (Dataverse instance URL)',
+    example: 'https://org12345.crm4.dynamics.com/',
+  })
+  @IsString()
+  @IsOptional()
+  @IsUrl({}, { message: 'environmentUrl must be a valid URL' })
+  environmentUrl?: string;
+
+  @ApiPropertyOptional({
+    description: 'Region where the environment is hosted',
+    example: 'europe',
+  })
+  @IsString()
+  @IsOptional()
+  @MaxLength(50)
+  region?: string;
 }

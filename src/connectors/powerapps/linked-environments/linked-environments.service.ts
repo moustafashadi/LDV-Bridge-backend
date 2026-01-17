@@ -88,9 +88,11 @@ export class LinkedEnvironmentsService {
         platform: dto.platform,
         environmentId: dto.environmentId,
         environmentUrl:
+          dto.environmentUrl ||
           environmentDetails?.properties?.linkedEnvironmentMetadata
-            ?.instanceUrl || null,
-        region: environmentDetails?.location || null,
+            ?.instanceUrl ||
+          null,
+        region: dto.region || environmentDetails?.location || null,
         metadata: {
           originalName:
             environmentDetails?.properties?.displayName ||

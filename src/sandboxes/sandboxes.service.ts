@@ -1521,6 +1521,7 @@ export class SandboxesService {
       id: sandbox.id,
       organizationId: sandbox.organizationId,
       createdById: sandbox.createdById,
+      appId: sandbox.appId,
       name: sandbox.name,
       description: sandbox.description,
       platform: env?.platform || SandboxPlatform.POWERAPPS,
